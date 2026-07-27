@@ -11,6 +11,10 @@ from rclpy.node import Node
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import JointState
 from rclpy.executors import MultiThreadedExecutor
+
+# Added imports for torque management
+from ros_robot_controller_msgs.msg import SetBusServoState, BusServoState
+
 from servo_controller.servo_controller import ServoManager
 from servo_controller.joint_position_controller import JointPositionController
 from servo_controller_msgs.msg import ServosPosition, ServoState, ServoStateList
@@ -56,13 +60,61 @@ class ControllerManager(Node):
         namespace = self.get_namespace()
         if namespace == '/':
             namespace = ''
+            
+        # Torque management publisher
+        self.torque_enable_pub = self.create_publisher(SetBusServoState, namespace + '/ros_robot_controller/bus_servo/set_state', 1)
+        
         self.client = self.create_client(Trigger, namespace + '/ros_robot_controller/init_finish')
         self.client.wait_for_service()
 
         threading.Thread(target=self.publish_joint_states, daemon=True).start()
+        
+        # Existing init service
         self.create_service(Trigger, '~/init_finish', self.get_node_state)
+        
+        # New Wake and Sleep services
+        self.create_service(Trigger, '~/wake', self.wake_callback)
+        self.create_service(Trigger, '~/sleep', self.sleep_callback)
 
         self.get_logger().info('\033[1;32m%s\033[0m' % 'start')
+        
+        # Disable torques on startup after a brief delay
+        threading.Thread(target=self.delayed_startup_sleep, daemon=True).start()
+
+    def delayed_startup_sleep(self):
+        time.sleep(5)
+        self.set_all_torques(enable=False)
+
+    def wake_callback(self, request, response):
+        self.set_all_torques(enable=True)
+        # TODO: Add specific joint commands here to stand up if needed
+        response.success = True
+        response.message = "Robot awake and torques enabled."
+        return response
+
+    def sleep_callback(self, request, response):
+        # TODO: Add specific joint commands here to sit down BEFORE disabling torque
+        # time.sleep(1.5) # Wait for movement to finish
+        self.set_all_torques(enable=False)
+        response.success = True
+        response.message = "Robot sleeping and torques disabled."
+        return response
+
+    def set_all_torques(self, enable=True):
+        self.get_logger().info("Enabling All Servo Torques" if enable else "Disabling All Servo Torques")
+        servo_ids = [i for i in range(1, 25)]
+
+        msg = SetBusServoState()
+        msg.duration = 0.0
+        msg.state = []
+
+        for sid in servo_ids:
+            servo_state = BusServoState()
+            servo_state.present_id = [1, sid]
+            servo_state.enable_torque = [1, 0 if enable else 1] # 0 = Torque On
+            msg.state.append(servo_state)
+            
+        self.torque_enable_pub.publish(msg)
 
     def get_node_state(self, request, response):
         response.success = True
