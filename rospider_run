@@ -2,15 +2,31 @@
 
 # Function to clean up background processes on exit
 cleanup() {
+
+    # Prevent double-execution
+    if [[ -n "$CLEANUP_RAN" ]]; then
+        return
+    fi
+    CLEANUP_RAN=1
+    
     echo -e "\n[Rospider] Shutting down payload and sensors..."
     
-    # 1. Kill the sensor launch process if it was started
+    # 1. Kill the ENTIRE process group of the sensor launch
     if [[ -n "$SENSOR_PID" ]]; then
-        kill -INT "$SENSOR_PID" 2>/dev/null
+        # Extract the Process Group ID (PGID) of the ros2 launch command
+        PGID=$(ps -o pgid= -p "$SENSOR_PID" | grep -o '[0-9]*')
+        
+        if [[ -n "$PGID" ]]; then
+            # The negative sign before PGID tells kill to target the whole group
+            kill -INT -"$PGID" 2>/dev/null
+            
+            # Give the nodes 1 second to cleanly close their hardware connections
+            sleep 1.0 
+        fi
     fi
 
     # 2. Command the robot to sit and disable torque
-    ros2 service call /controller_manager/sleep std_srvs/srv/Empty {}
+    ros2 service call /controller_manager/sleep std_srvs/srv/Trigger {}
     exit
 }
 
@@ -18,11 +34,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[Rospider] Waking up the robot..."
-ros2 service call /controller_manager/wake std_srvs/srv/Empty {}
+ros2 service call /controller_manager/wake std_srvs/srv/Trigger {}
 
 echo "[Rospider] Starting sensor pipeline..."
 # Run sensor launch in the background (&) and suppress verbose stdout if desired
-ros2 launch rospider_bringup bringup_sensors.launch.py > /dev/null 2>&1 &
+ros2 launch bringup bringup_sensors.launch.py > /dev/null 2>&1 &
 SENSOR_PID=$!
 
 # Give sensors a second to initialize their ROS 2 nodes/publishers
