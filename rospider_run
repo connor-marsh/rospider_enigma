@@ -22,7 +22,7 @@ ros2 service call /controller_manager/wake std_srvs/srv/Empty {}
 
 echo "[Rospider] Starting sensor pipeline..."
 # Run sensor launch in the background (&) and suppress verbose stdout if desired
-ros2 launch rospider_bringup sensors.launch.py > /dev/null 2>&1 &
+ros2 launch rospider_bringup bringup_sensors.launch.py > /dev/null 2>&1 &
 SENSOR_PID=$!
 
 # Give sensors a second to initialize their ROS 2 nodes/publishers

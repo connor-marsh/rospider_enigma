@@ -26,8 +26,8 @@ def launch_setup(context):
     )
 
     return [
-            startup_check_node,
-            controller_launch
+            controller_launch,
+            startup_check_node
             ]
 
 def generate_launch_description():

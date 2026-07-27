@@ -83,7 +83,9 @@ class ControllerManager(Node):
 
     def delayed_startup_sleep(self):
         time.sleep(5)
-        self.set_all_torques(enable=False)
+        request = Trigger().Request()
+        response = Trigger().Response()
+        self.sleep_callback(request, response)
 
     def wake_callback(self, request, response):
         self.set_all_torques(enable=True)
