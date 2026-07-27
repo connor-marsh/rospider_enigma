@@ -83,21 +83,25 @@ class ControllerManager(Node):
 
     def delayed_startup_sleep(self):
         time.sleep(5)
-        request = Trigger().Request()
-        response = Trigger().Response()
-        self.sleep_callback(request, response)
+        self.sleep_robot()
 
-    def wake_callback(self, request, response):
+    def wake_robot(self):
         self.set_all_torques(enable=True)
         # TODO: Add specific joint commands here to stand up if needed
+
+    def sleep_robot(self):
+        # TODO: Add specific joint commands here to sit down BEFORE disabling torque
+        # time.sleep(1.5) # Wait for movement to finish
+        self.set_all_torques(enable=False)
+
+    def wake_callback(self, request, response):
+        self.wake_robot()
         response.success = True
         response.message = "Robot awake and torques enabled."
         return response
 
     def sleep_callback(self, request, response):
-        # TODO: Add specific joint commands here to sit down BEFORE disabling torque
-        # time.sleep(1.5) # Wait for movement to finish
-        self.set_all_torques(enable=False)
+        self.sleep_robot()
         response.success = True
         response.message = "Robot sleeping and torques disabled."
         return response
