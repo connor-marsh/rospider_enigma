@@ -37,7 +37,7 @@ class ControllerManager(Node):
         self.arm_ids = [19, 20, 21, 22, 23, 24]
         self.arm_init_pose = [0.0, 0.92, -1.549, -1.466, 0.0, 0.0]
         self.servo_ids = self.leg_ids + self.arm_ids
-        self.pose_duration = 0.02
+        self.pose_duration = 1.0
 
         # 读取配置参数
         self.base_frame = self.get_parameter('base_frame').value
@@ -115,6 +115,7 @@ class ControllerManager(Node):
 
     def sleep_robot(self):
         self._move_robot_to_pose(self.legs_sleep_pose + self.arm_init_pose)
+        time.sleep(0.5)
         self.set_all_torques(enable=False)
 
     def wake_callback(self, request, response):

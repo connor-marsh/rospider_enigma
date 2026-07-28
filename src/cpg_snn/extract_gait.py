@@ -3,6 +3,7 @@
 # @Author: Aiden
 # @Date: 2023/11/10
 import os
+import sys
 import time
 import math
 import rclpy
@@ -64,7 +65,10 @@ class GaitExtractor(Node):
 
 
 def main():
-    import sys
+    current_file_dir = os.path.dirname(os.path.abspath(__file__))
+    print(current_file_dir)
+    print(os.getcwd())
+
     node = GaitExtractor('gait_extractor')
     try:
         rclpy.spin(node)
@@ -73,7 +77,9 @@ def main():
     finally:
         print("Extracted movements")
         print(node.gait)
+        #TODO ask for user input
         if len(sys.argv) == 2:
+            
             toSave = np.array(node.gait)
             filename = sys.argv[1] + '.csv'
             np.savetxt(filename, toSave, delimiter=',')
