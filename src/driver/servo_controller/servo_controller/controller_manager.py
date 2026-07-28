@@ -2,6 +2,7 @@
 # encoding: utf-8
 # @Author: Aiden
 # @Date: 2023/11/10
+import cmd
 import os
 import time
 import math
@@ -17,7 +18,7 @@ from ros_robot_controller_msgs.msg import SetBusServoState, BusServoState
 
 from servo_controller.servo_controller import ServoManager
 from servo_controller.joint_position_controller import JointPositionController
-from servo_controller_msgs.msg import ServosPosition, ServoState, ServoStateList
+from servo_controller_msgs.msg import ServoPosition, ServosPosition, ServoState, ServoStateList
 from servo_controller.joint_trajectory_action_controller import JointTrajectoryActionController
 
 class ControllerManager(Node):
@@ -27,7 +28,16 @@ class ControllerManager(Node):
         self.joints = ['coxa_LF_joint', 'femur_LF_joint', 'tibla_LF_joint', 'coxa_LM_joint', 'femur_LM_joint', 'tibla_LM_joint', 
                        'coxa_LR_joint', 'femur_LR_joint', 'tibla_LR_joint', 'coxa_RF_joint', 'femur_RF_joint', 'tibla_RF_joint', 
                        'coxa_RM_joint', 'femur_RM_joint', 'tibla_RM_joint', 'coxa_RR_joint', 'femur_RR_joint', 'tibla_RR_joint', 
-                       'joint1', 'joint2', 'joint3','joint4','joint5','r_joint']       
+                       'joint1', 'joint2', 'joint3','joint4','joint5','r_joint']
+             
+        self.leg_ids = [5, 3, 1, 11, 9, 7, 17, 15, 13, 18, 16, 14, 12, 10, 8, 6, 4, 2]
+        self.legs_sleep_pose = [0.2471, 1.9, -1.2, 0.0, 1.9, -1.2, -0.251, 1.9, -1.2, 0.255, 1.9, -1.2, 0.0, 1.9, -1.2, -0.263, 1.9, -1.2]
+        self.legs_wake_pose = [0.2471,0.816,-0.552,0.0,0.904,-0.678,-0.251,0.821,-0.4733,0.255,0.808,-0.485,0.0,0.90,-0.678,-0.263,0.8,-0.477]
+
+        self.arm_ids = [19, 20, 21, 22, 23, 24]
+        self.arm_init_pose = [0.0, 0.92, -1.549, -1.466, 0.0, 0.0]
+        self.servo_ids = self.leg_ids + self.arm_ids
+        self.pose_duration = 0.02
 
         # 读取配置参数
         self.base_frame = self.get_parameter('base_frame').value
@@ -85,13 +95,26 @@ class ControllerManager(Node):
         time.sleep(5)
         self.sleep_robot()
 
+    def _build_servo_message(self, servo_rads, duration=None):
+        msg = ServosPosition()
+        msg.position_unit = "rad"
+        msg.duration = self.pose_duration if duration is None else duration
+        for servo_id, position in zip(self.servo_ids, servo_rads):
+            data = ServoPosition()
+            data.id = servo_id
+            data.position = position
+            msg.position.append(data)
+        return msg
+
+    def _move_robot_to_pose(self, servo_rads):
+        self._servo_controller(self._build_servo_message(servo_rads))
+
     def wake_robot(self):
         self.set_all_torques(enable=True)
-        # TODO: Add specific joint commands here to stand up if needed
+        self._move_robot_to_pose(self.legs_wake_pose + self.arm_init_pose)
 
     def sleep_robot(self):
-        # TODO: Add specific joint commands here to sit down BEFORE disabling torque
-        # time.sleep(1.5) # Wait for movement to finish
+        self._move_robot_to_pose(self.legs_sleep_pose + self.arm_init_pose)
         self.set_all_torques(enable=False)
 
     def wake_callback(self, request, response):
@@ -125,10 +148,8 @@ class ControllerManager(Node):
     def get_node_state(self, request, response):
         response.success = True
         return response
-
-    def servo_controller_callback(self, msg):
-        # self.get_logger().info('\033[1;32m%s\033[0m' % str(msg))
-
+    
+    def _servo_controller(self, msg):
         data = ServosPosition()
         positions = self.servo_manager.get_position()
         if msg.position_unit == 'pulse':
@@ -148,6 +169,10 @@ class ControllerManager(Node):
                     i.position = self.controllers[positions[str(i.id)].name].pos_rad_to_pulse(math.radians(i.position))
                     data.position.append(i)
             self.servo_manager.set_position(msg.duration, data.position)
+
+    def servo_controller_callback(self, msg):
+        # self.get_logger().info('\033[1;32m%s\033[0m' % str(msg))
+        self._servo_controller(msg)
 
     def joint_controller_callback(self, msg):
         for name, position in zip(msg.name, msg.position):
