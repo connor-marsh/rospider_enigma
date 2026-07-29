@@ -61,14 +61,15 @@ def main():
 
     # 机器人按正方形运动的各个方向（单位：角度）
     # 90 goes left, 270 goes right, 0 goes forward
-    direction_angles = [0]
+    # direction_angles = [0, 90, 180, 270]
+    direction_angles = [270]
 
     try:
         # 按顺序执行每个方向的运动
         for angle in direction_angles:
             node.get_logger().info('\033[1;32m%s\033[0m' % f'Moving in direction: {angle}°')
             # 转换角度为弧度后发送运动指令
-            node.move(gait=1, stride=10, height=7, direction=math.radians(angle))
+            node.move(gait=2, stride=60, height=40, steps=1, direction=math.radians(angle))
             time.sleep(2)  # 等待一段时间后换下一个方向
 
     except KeyboardInterrupt:

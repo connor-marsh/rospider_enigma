@@ -43,31 +43,10 @@ class GaitExtractor(Node):
         print(indices)
         self.gait.append(positions)
         return
-        data = ServosPosition()
-        positions = self.servo_manager.get_position()
-        if msg.position_unit == 'pulse':
-            for i in msg.position:
-                if str(i.id) in positions:
-                    data.position.append(i)
-            self.servo_manager.set_position(msg.duration, data.position)
-        elif msg.position_unit == 'rad':
-            for i in msg.position:
-                if str(i.id) in positions:
-                    i.position = self.controllers[positions[str(i.id)].name].pos_rad_to_pulse(i.position)
-                    data.position.append(i)
-            self.servo_manager.set_position(msg.duration, data.position)
-        elif msg.position_unit == 'deg':
-            for i in msg.position:
-                if str(i.id) in positions:
-                    i.position = self.controllers[positions[str(i.id)].name].pos_rad_to_pulse(math.radians(i.position))
-                    data.position.append(i)
-            self.servo_manager.set_position(msg.duration, data.position)
 
 
 def main():
     current_file_dir = os.path.dirname(os.path.abspath(__file__))
-    print(current_file_dir)
-    print(os.getcwd())
 
     node = GaitExtractor('gait_extractor')
     try:
@@ -77,11 +56,11 @@ def main():
     finally:
         print("Extracted movements")
         print(node.gait)
-        #TODO ask for user input
-        if len(sys.argv) == 2:
-            
+        
+        if input("do you want to save this gait?") == 'y':
+            gaitName = input("enter the gaits name:")
             toSave = np.array(node.gait)
-            filename = sys.argv[1] + '.csv'
+            filename = current_file_dir + '/gaits/'+gaitName + '.csv'
             np.savetxt(filename, toSave, delimiter=',')
         node.destroy_node()
 if __name__ == "__main__":
