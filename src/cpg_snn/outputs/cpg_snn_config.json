@@ -1,0 +1,24 @@
+{
+  "gait_period": 352.0,
+  "burst_threshold": 36.34637832389534,
+  "global_min": 53.0,
+  "global_max": 986.0,
+  "seq_len": 3.0,
+  "n_gaits": 8.0,
+  "n_joints": 18.0,
+  "gait_names": [
+    "tripod",
+    "tripod_huge",
+    "tripod_right",
+    "tripod_huge_right",
+    "ripple",
+    "ripple_tiny",
+    "ripple_right",
+    "ripple_tiny_right"
+  ],
+  "chunk_size": 1,
+  "spike_thresh": -2.0,
+  "cpg_start_time": 90.0,
+  "target_rows": 55.0,
+  "n_in": 16.0
+}

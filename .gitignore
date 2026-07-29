@@ -60,3 +60,5 @@ CATKIN_IGNORE
 
 # Model files
 *.pt
+
+src/cpg_snn/outputs/*.png
