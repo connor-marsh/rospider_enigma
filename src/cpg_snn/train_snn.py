@@ -745,7 +745,7 @@ def build_dataset(base_feats, event_phases, gait_tables,
     print(f"  Transition windows : {(~pure_mask).sum():>8,}"
           f"  (actual frac = {actual_frac:.2f})")
     print(f"  Total              : {len(X):>8,}")
-    print(f"  Feature dim        : {X.shape[2]}  (one-hot + 4 phase + {n_gaits} gait flag)")
+    print(f"  Feature dim        : {X.shape[2]}  (one-hot + 2 phase + {n_gaits} gait flag)")
 
     return X, y, (tgt_min, tgt_max), pure_mask, labels
 
@@ -992,11 +992,7 @@ def run_training(model, train_loader, val_pure_loader, val_trans_loader,
     best_path = out_dir / "best_model.pt"
     history   = {"train": [], "val_pure": [], "val_trans": []}
 
-    print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val-Pure':>10}"
-          f"  {'Val-Trans':>10}  {'LR':>8}")
-    print("  " + "-" * 58)
-
-    for epoch in range(1, epochs + 1):
+    def run_epoch(epoch):
         tl = train_epoch(model, train_loader, optimizer, criterion,
                          device, weighted=weighted)
         vp = eval_epoch(model, val_pure_loader,  criterion, device,
@@ -1024,6 +1020,16 @@ def run_training(model, train_loader, val_pure_loader, val_trans_loader,
             print(f"  {epoch:>6}  {tl:>10.6f}  {vp_s:>10}"
                   f"  {vt_s:>10}"
                   f"  {optimizer.param_groups[0]['lr']:>8.2e}{flag}")
+
+    print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val-Pure':>10}"
+          f"  {'Val-Trans':>10}  {'LR':>8}")
+    print("  " + "-" * 58)
+
+    try:
+        for epoch in range(1, epochs + 1):
+            run_epoch(epoch)
+    except KeyboardInterrupt:
+        print("\n  [interrupt] Ctrl+C received; stopping.")
 
     print("  " + "-" * 58)
     return best_val, history
@@ -1326,7 +1332,7 @@ def plot_gait_reconstruction(model, X, y, pure_mask, labels,
             plt.suptitle(f"{name} — {wtype} ({len(idx)} samples)",
                          fontsize=11, fontweight="bold")
             plt.tight_layout()
-            p = out_dir / f"recon_{name}_{suffix}.png"
+            p = out_dir / f"/recons/recon_{name}_{suffix}.png"
             plt.savefig(p, dpi=150, bbox_inches="tight"); plt.close()
             print(f"  [saved] {p}")
 
