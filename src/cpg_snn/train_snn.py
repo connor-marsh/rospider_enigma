@@ -1334,7 +1334,7 @@ def plot_gait_reconstruction(model, X, y, pure_mask, labels,
             plt.suptitle(f"{name} — {wtype} ({len(idx)} samples)",
                          fontsize=11, fontweight="bold")
             plt.tight_layout()
-            p = out_dir / f"/recons/recon_{name}_{suffix}.png"
+            p = out_dir / f"recons/recon_{name}_{suffix}.png"
             plt.savefig(p, dpi=150, bbox_inches="tight"); plt.close()
             print(f"  [saved] {p}")
 
@@ -1464,7 +1464,7 @@ def main():
         "ripple_backwards", "ripple_tiny_backwards", "ripple_left", "ripple_tiny_left",
     ]
     gait_names = base_gait_names + mirrored_gait_names
-    gait_names = gait_names[0:4]
+    gait_names = ["tripod", "ripple"]
 
     gait_tables_orig = []
     for name in base_gait_names:
