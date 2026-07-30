@@ -13,3 +13,6 @@ We have included a script `rospider_run` which is used as an execution wrapper a
 The rospider_run script will start by calling the controller_managers wake service, and then calling a launch file `bringup_sensors.launch.py` which starts the sensor suite, it then runs whatever command you put in, so in this case the `ros2 launch` command, and then it has a cleanup process which runs when this terminal is completed, so either on CTRL+C or when it completes naturally. The cleanup process searches for the process ID's of the sensor code, and kills those processes, and then it calls the sleep service of the controller_manager.
 
 This system is highly convenient as it no longer requires you to start and stop the controller nodes everytime you want to run your code.
+
+#### Troubleshooting
+If the wake and sleep poses don't seem to be working. Simply restart the systemd service by running `sudo systemctl restart rospider_enigma.service`
