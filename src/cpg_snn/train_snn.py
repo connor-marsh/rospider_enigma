@@ -67,401 +67,39 @@ import argparse
 import itertools
 import os
 import numpy as np
-from scipy.stats import gaussian_kde
-from scipy.signal import argrelmin
-from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import snntorch as snn
 from snntorch import surrogate
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from pathlib import Path
 
+from cpg_utils import CPG_SNN, encode_spike_events, estimate_gait_period, run_blif_cpg, sigmoid, neuron_eqs, make_network
+from plotting_utils import (
+    plot_burst_gait_overlay,
+    plot_cpg_vm,
+    plot_gait_reconstruction,
+    plot_inference,
+    plot_spike_events,
+    plot_training_curves,
+)
 
-class LIFGeneralArray:
-	def __init__(self,N,vth,du,dv,bias,u=0,v=0,ufloor=0,vfloor=0,refractory_period=0):
-		# To get the SW CFG Model Comment out the left shift and multiplications
-		self.vth = vth
-		self.du = du
-		self.dv = dv
-		self.bias = bias
-		self.u = np.ones(N)*u
-		self.v = np.ones(N)*v
-		self.ufloor = ufloor
-		self.vfloor = vfloor
-		self.refractory_period = refractory_period
-		self.time_since_last_spike = np.zeros(N)
-		self.N = N
 
-	def next_step(self, current):
-		self.u = self.u * (1 - self.du) + current
-		self.v = self.v * (1 - self.dv) + self.u + self.bias
-		
-		refractory_mask = self.time_since_last_spike > 0
-		self.v[refractory_mask] = 0
-		self.time_since_last_spike = np.clip(self.time_since_last_spike - 1, 0, None)
-
-		# self.u = np.clip(self.u,self.ufloor,None)
-		# self.v = np.clip(self.v,self.vfloor,None)
-
-		spike = self.v >= self.vth
-		self.v[spike] = 0
-		self.time_since_last_spike[spike] = self.refractory_period
-		return spike.astype(np.float32)
-
-	def reset(self, u=0, v=0):
-		self.u.fill(u)
-		self.v.fill(v)
-
-class BurstingLIF:
-	def __init__(self,N,vth_main,du_main,dv_main,refrac_main,
-			  vth_fb,du_fb,dv_fb,refrac_fb,from_fb_weight,to_fb_weight):
-		self.n_main = LIFGeneralArray(N,vth_main,du_main,dv_main,bias=0,u=0,v=0,ufloor=-vth_main*100,vfloor=-vth_main*100,refractory_period=refrac_main)
-		self.n_fb = LIFGeneralArray(N,vth_fb,du_fb,dv_fb,bias=0,u=0,v=0,ufloor=-vth_fb*100,vfloor=-vth_fb*100,refractory_period=refrac_fb)
-		
-		self.input_2_feedback_neuron_weight = to_fb_weight
-		self.feedback_2_input_neuron_weight = from_fb_weight
-
-		self.fb_current = np.zeros(N)
-
-	def forward(self,current):
-		input_neuron_current = current + self.fb_current
-		input_neuron_spike = self.n_main.next_step(input_neuron_current)
-
-		to_fb_current = input_neuron_spike*self.input_2_feedback_neuron_weight
-
-		fb_neuron_spike = self.n_fb.next_step(to_fb_current)
-
-		self.fb_current = fb_neuron_spike*self.feedback_2_input_neuron_weight
-
-		return input_neuron_spike, fb_neuron_spike
-	
-	def reset(self):
-		self.n_main.reset()
-		self.n_fb.reset()
-
-class BLIF_CPG:
-    def __init__(self, N=4, t_max=2000):
-        # Input Neuron Params
-        vth_main = 100
-        du_main = 0.1
-        dv_main = 0.3
-        refrac_main = 1
-
-        # Feedback Neuron Params
-        vth_fb = 100
-        du_fb = 1.0
-        dv_fb = 0.
-        refrac_fb = 1
-
-        # Weight Params
-        from_fb_weight = -1000000
-        to_fb_weight = 10
-
-        # Number of CPG Neurons
-
-        self.burstingNeuron1 = BurstingLIF(N,vth_main,du_main,dv_main,refrac_main,vth_fb,du_fb,dv_fb,refrac_fb,from_fb_weight,to_fb_weight)
-        self.weight_matrix = []
-        # Weight initialization
-
-        ############# This configuration works best for 3 neuron CPG
-        if N == 3:
-            self.weight_matrix = np.asarray([[   0.         ,-523.65135942 ,-593.28982051],
-                                        [-696.81822016  ,  0.         ,-632.34680962],
-                                        [-687.56816569 ,-577.5693762   ,  0.        ]])
-
-        ############# This configuration works best for 4 neuron CPG
-        elif N==4:
-            self.weight_matrix = np.asarray([[   0.         ,-648.52905924 ,-449.60304695 ,-413.48426163],
-                                        [-369.91504928 ,   0.         ,-592.29635234 ,-568.0712858 ],
-                                        [-412.08729881 ,-391.54918498 ,   0.         ,-618.03381552],
-                                        [-498.16458351 ,-655.01105883 ,-345.38277449 ,   0.        ]])
-
-        ############# This configuration works best for 6 neuron CPG
-        elif N==6:
-            self.weight_matrix = np.asarray([[   0.,         -375.86210512, -518.18703523, -371.82375498, -399.74231244,
-                                        -487.45119873],
-                                        [-531.99480471,    0.,         -489.1139223,  -128.33470562, -404.33117771,
-                                        -628.03347932],
-                                        [-529.89653583, -418.34662835,    0.,         -543.37143674, -336.83773596,
-                                        -679.12224243],
-                                        [-674.09562904, -130.56007131, -297.35360394,    0.,         -363.1208234,
-                                        -425.10847629],
-                                        [-486.03391005, -386.7920052,  -412.91478912, -437.7646991,     0.,
-                                        -288.47748806],
-                                        [-112.97808475, -510.59115452, -367.63412082, -374.83106147, -393.86103887,
-                                            0.        ]])
-
-        # Run the system
-
-        i_scale = 8.
-
-        self.i_app = np.ones((N,t_max))*i_scale
-
-        self.bn_spikes = np.zeros((N,t_max))
-
-        self.inter_neuron_current = np.zeros(N)
-
-        self.currents = np.zeros((N,t_max))
-
-        self.t = 0
-
-    def step(self):
-        c_in = self.inter_neuron_current + self.i_app[:,self.t]
-
-        self.currents[:,self.t] = c_in
-
-        n_main,_ = self.burstingNeuron1.forward(c_in)
-
-        self.bn_spikes[:,self.t] = n_main
-
-        self.inter_neuron_current = self.weight_matrix @ n_main
-
-        self.t += 1
-
-        return n_main, self.burstingNeuron1.n_main.v, self.t
-    
-def run_blif_cpg(t_max=2000, N=4, cpg_start_time=100):
-    network = BLIF_CPG(N=N, t_max=t_max)
-
-    for t in range(cpg_start_time):
-        _, _, _ = network.step()
-
-    bn_spikes = []
-    v_ms = []
-    for t in range(cpg_start_time, t_max):
-        spikes, v_m, _ = network.step()
-        bn_spikes.append(spikes)
-        v_ms.append(v_m)
-
-    
-    bn_spikes = np.array(bn_spikes).T
-    print(bn_spikes.shape)
-
-    fig, axes = plt.subplots(1, 1)
-    for i in range(N):
-        axes.plot(bn_spikes[i], label=f"Neuron {i+1} spikes")
-    axes.legend()
-    plt.tight_layout()
-
-    fig2, axes2 = plt.subplots(N, 2)
-    for i in range(N):
-        axes2[i,0].plot(v_ms[i])
-        axes2[i,0].set_title(f"Input Current to Neuron {i+1}")
-
-        axes2[i,1].plot(bn_spikes[i])
-        axes2[i,1].set_title(f"Neuron {i+1} spikes")
-
-    plt.tight_layout()
-    plt.show()
-    plt.close(fig)
-    plt.close(fig2)
-
-    spike_times = []
-    spike_neurons = []
-    for t in range(cpg_start_time, t_max):
-        for i in range(N):
-            if bn_spikes[i][t-cpg_start_time]:
-                spike_times.append(t)
-                spike_neurons.append(i)
-    return np.array(spike_times), np.array(spike_neurons)
+# Shared CPG definitions now live in cpg_utils.py.
 
 # ═══════════════════════════════════════════════════════════════════
 # 1.  CPG Dynamics (shared by both integrators)
 # ═══════════════════════════════════════════════════════════════════
 
-def sigmoid(x, b=5.0, dsyn=-1.0):
-    return 1.0 / (1.0 + np.exp(-b * (x - dsyn)))
-
-
-def neuron_eqs(S, I, alpha, delta, Tf, Ts, Tus):
-    vm, vf, vs, vus = S
-    dvm = (-vm
-           - alpha[0] * np.tanh(vf  - delta[0])
-           - alpha[1] * np.tanh(vs  - delta[1])
-           - alpha[2] * np.tanh(vs  - delta[2])
-           - alpha[3] * np.tanh(vus - delta[3])
-           + I)
-    dvf  = (vm - vf)  / Tf
-    dvs  = (vm - vs)  / Ts
-    dvus = (vm - vus) / Tus
-    return [dvm, dvf, dvs, dvus]
-
-
-def make_network(N, alpha, delta, g_inh, Iapp):
-    asyn = g_inh * np.ones((N, N))
-    np.fill_diagonal(asyn, 0.0)
-
-    def network(t, S):
-        dS   = []
-        Vs   = np.array([S[i * 4 + 2] for i in range(N)])
-        Isyn = asyn @ sigmoid(Vs)
-        for i in range(N):
-            dS.extend(neuron_eqs(
-                S[i * 4:(i + 1) * 4], Iapp + Isyn[i],
-                alpha, delta, 1.0, 50.0, 2500.0))
-        return dS
-
-    return network
-
-
-
+# Shared CPG helper functions now live in cpg_utils.py.
 
 # ═══════════════════════════════════════════════════════════════════
 # 3.  Burst detection + gait period estimation
 # ═══════════════════════════════════════════════════════════════════
 
-def detect_burst_threshold(spike_times_n0, out_dir, bw_method=0.3):
-    """
-    Find the ISI threshold that separates within-burst spikes from
-    between-burst gaps using the antimode of the log-ISI KDE.
-    """
-    isis     = np.diff(spike_times_n0)
-    log_isis = np.log(isis + 1e-6)
 
-    kde      = gaussian_kde(log_isis, bw_method=bw_method)
-    x_eval   = np.linspace(log_isis.min(), log_isis.max(), 2000)
-    density  = kde(x_eval)
-
-    local_min_idx = argrelmin(density, order=20)[0]
-
-    if len(local_min_idx) == 0:
-        threshold = float(np.exp(np.median(log_isis)))
-        print(f"  WARNING: no antimode found in log-ISI KDE; "
-              f"using fallback threshold = {threshold:.1f}")
-    else:
-        mid      = (log_isis.min() + log_isis.max()) / 2.0
-        best_idx = local_min_idx[np.argmin(np.abs(x_eval[local_min_idx] - mid))]
-        threshold = float(np.exp(x_eval[best_idx]))
-        print(f"  Burst ISI threshold (antimode) : {threshold:.1f} steps"
-              f"  (log-ISI = {x_eval[best_idx]:.3f})")
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].hist(log_isis, bins=80, density=True,
-                 color="#457b9d", alpha=0.6, label="log-ISI histogram")
-    axes[0].plot(x_eval, density, color="#e63946", lw=2, label="KDE")
-    axes[0].axvline(np.log(threshold), color="#f4a261", lw=2, ls="--",
-                    label=f"threshold = {threshold:.1f}")
-    axes[0].set_xlabel("log(ISI)")
-    axes[0].set_ylabel("Density")
-    axes[0].set_title("Neuron 0 — log-ISI distribution & burst threshold")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].hist(isis, bins=100, density=True,
-                 color="#2a9d8f", alpha=0.6, label="ISI histogram")
-    axes[1].axvline(threshold, color="#f4a261", lw=2, ls="--",
-                    label=f"threshold = {threshold:.1f}")
-    axes[1].set_xlabel("ISI (steps)")
-    axes[1].set_ylabel("Density")
-    axes[1].set_title("Neuron 0 — raw ISI distribution")
-    axes[1].legend(fontsize=8)
-    axes[1].grid(True, alpha=0.3)
-    axes[1].set_xlim(0, np.percentile(isis, 99))
-
-    plt.tight_layout()
-    p = out_dir / "burst_threshold.png"
-    plt.savefig(p, dpi=150); plt.close()
-    print(f"  [saved] {p}")
-
-    return threshold
-
-
-def get_burst_first_spikes(spike_times_n0, threshold, burnin_bursts=5):
-    burst_starts = [spike_times_n0[0]]
-    for i in range(1, len(spike_times_n0)):
-        if spike_times_n0[i] - spike_times_n0[i - 1] > threshold:
-            burst_starts.append(spike_times_n0[i])
-
-    burst_starts = np.array(burst_starts, dtype=np.float32)
-    print(f"  Neuron-0 bursts detected : {len(burst_starts)}"
-          f"  (skipping first {burnin_bursts} for burn-in)")
-
-    if len(burst_starts) <= burnin_bursts + 1:
-        raise ValueError(
-            f"Only {len(burst_starts)} bursts detected — increase tmax "
-            f"or reduce burnin_bursts ({burnin_bursts}).")
-
-    return burst_starts[burnin_bursts:]
-
-
-def estimate_gait_period(spike_times, spike_neurons, out_dir,
-                          N=4, burnin_bursts=5, kde_bw=0.3):
-    t0        = spike_times[spike_neurons == 0]
-    threshold = detect_burst_threshold(t0, out_dir, bw_method=kde_bw)
-    burst_starts = get_burst_first_spikes(t0, threshold,
-                                           burnin_bursts=burnin_bursts)
-    inter_burst = np.diff(burst_starts)
-    gait_period = float(np.median(inter_burst)) * 1.0
-
-    print(f"  Inter-burst intervals  : {len(inter_burst)}")
-    print(f"  Median gait period     : {gait_period:.1f} steps"
-          f"  (= median inter-burst interval of neuron 0)")
-    return gait_period, threshold
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 4.  Phase encoding
-# ═══════════════════════════════════════════════════════════════════
-
-def encode_spike_events(spike_times, spike_neurons, gait_period, N=4):
-    """
-    Per event → [one_hot_neuron(N), sin(φ_abs), cos(φ_abs),
-                                    sin(φ_rel), cos(φ_rel)]  (N+4 dims).
-
-    φ_abs = 2π · (t mod gait_period) / gait_period   — absolute phase
-    φ_rel = 2π · ISI / gait_period                    — relative (ISI) phase
-
-    Why two phase channels?
-    -----------------------
-    Within a burst, consecutive spikes arrive ~50 steps apart.
-    Over the full gait_period (~4500 steps), 50 steps is only ~1% of a
-    cycle, so φ_abs barely changes within a burst and gives the SNN
-    almost no discriminative information between consecutive windows.
-
-    φ_rel (ISI-based) varies strongly between within-burst events (~4°)
-    and between-burst events (~56°), giving the SNN a clear signal for
-    where in the burst structure each event falls — independent of when
-    the trajectory started.  The combination of both channels gives full
-    context: φ_abs says where we are in the global cycle; φ_rel says
-    how densely spikes are arriving.
-
-    The first event's ISI is set to gait_period (one full cycle) so its
-    φ_rel = 2π, which maps to sin=0, cos=1 — a neutral initialisation.
-
-    Gait flags are NOT added here — injected per-event during dataset
-    construction so transition windows can mix flags freely.
-    """
-    # ── Absolute phase ────────────────────────────────────────────
-    abs_phase = (2.0 * np.pi
-                 * (spike_times % gait_period) / gait_period
-                 ).astype(np.float32)
-
-    # ── Relative phase (ISI-based) ────────────────────────────────
-    isis = np.empty(len(spike_times), dtype=np.float32)
-    isis[0]  = gait_period          # neutral: first event has no predecessor
-    isis[1:] = np.diff(spike_times)
-    rel_phase = (2.0 * np.pi * isis / gait_period).astype(np.float32)
-
-    one_hot = np.zeros((len(spike_times), N), dtype=np.float32)
-    one_hot[np.arange(len(spike_times)), spike_neurons] = 1.0
-
-    base_feats = np.concatenate(
-        [one_hot,
-         np.sin(abs_phase)[:, None],
-         np.cos(abs_phase)[:, None],
-         #np.sin(rel_phase)[:, None],
-         #np.cos(rel_phase)[:, None]
-         ], axis=1)   # (E, N+4)
-
-    print(f"  Base feature matrix : {base_feats.shape}"
-          f"  ({N} one-hot + sin/cos abs-phase + sin/cos rel-phase)"
-          f"  [gait flag added per-event in build_dataset]")
-    return base_feats, abs_phase
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -524,66 +162,6 @@ def upsample_gait_tables(gait_tables, gait_names, target_rows=None):
 # ═══════════════════════════════════════════════════════════════════
 # 5.  Diagnostic: burst boundaries vs gait table
 # ═══════════════════════════════════════════════════════════════════
-
-def plot_burst_gait_overlay(spike_times, spike_neurons, gait_period,
-                             threshold, gait_tables, gait_names, out_dir,
-                             n_cycles=6, N=4):
-    t0           = spike_times[spike_neurons == 0]
-    isis_n0      = np.diff(t0)
-    burst_starts = [t0[0]]
-    for i in range(1, len(t0)):
-        if isis_n0[i - 1] > threshold:
-            burst_starts.append(t0[i])
-    burst_starts = np.array(burst_starts)
-
-    if len(burst_starts) < n_cycles + 1:
-        n_cycles = len(burst_starts) - 1
-    bs = burst_starts[:n_cycles + 1]
-
-    colors_n  = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261", "#6a0572", "#8ecae6"]
-    colors_gt = ["#e63946", "#f4a261", "#2a9d8f", "#6a0572", "#8ecae6", "#ffb703"]
-
-    fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=False)
-
-    t_end = bs[-1] + gait_period * 0.1
-    ax0   = axes[0]
-    for i in range(N):
-        mask = (spike_times >= bs[0]) & (spike_times <= t_end) & (spike_neurons == i)
-        ax0.scatter(spike_times[mask], np.full(mask.sum(), i),
-                    marker="|", s=120, lw=1.6, color=colors_n[i],
-                    label=f"Neuron {i}")
-    for b in bs:
-        ax0.axvline(b, color="k", lw=1.0, alpha=0.5, ls="--")
-    ax0.set_yticks(range(N))
-    ax0.set_yticklabels([f"N{i}" for i in range(N)])
-    ax0.set_title(f"Spike raster — first {n_cycles} gait cycles"
-                  f"  (dashed = neuron-0 burst start)")
-    ax0.legend(loc="upper right", fontsize=8, ncol=4)
-    ax0.grid(True, axis="x", alpha=0.2)
-
-    ax1 = axes[1]
-    t_fine  = np.linspace(bs[0], bs[-1], 500)
-    phase_f = (2.0 * np.pi * (t_fine % gait_period) / gait_period)
-
-    for g_idx, (gt, name) in enumerate(zip(gait_tables, gait_names)):
-        n_rows  = gt.shape[0]
-        row_idx = (phase_f / (2.0 * np.pi) * n_rows).astype(int) % n_rows
-        ax1.plot(t_fine, gt[row_idx, 0],
-                 color=colors_gt[g_idx % len(colors_gt)],
-                 lw=1.5, label=f"{name} J1")
-    for b in bs:
-        ax1.axvline(b, color="k", lw=1.0, alpha=0.5, ls="--")
-    ax1.set_xlabel("Simulation time (steps)")
-    ax1.set_ylabel("Joint 1 angle (°)")
-    ax1.set_title("Gait-table joint 1 angle phase-indexed over gait cycles")
-    ax1.legend(fontsize=8, ncol=4)
-    ax1.grid(True, alpha=0.25)
-
-    plt.tight_layout()
-    p = out_dir / "burst_gait_overlay.png"
-    plt.savefig(p, dpi=150, bbox_inches="tight"); plt.close()
-    print(f"  [saved] {p}")
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 6.  Helper: phase → gait-table row
@@ -775,11 +353,19 @@ def snn_collate(batch):
     return torch.stack(X).permute(1, 0, 2), torch.stack(y), torch.stack(lbl)
 
 
-def make_loader(ds, batch_size, shuffle):
+def make_loader(ds, batch_size, shuffle, num_workers=4, pin_memory=True):
     if len(ds) == 0:
         return []
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                      collate_fn=snn_collate, num_workers=0)
+    
+    return DataLoader(
+        ds, 
+        batch_size=batch_size, 
+        shuffle=shuffle,
+        collate_fn=snn_collate, 
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0) # Keeps workers alive between epochs
+    )
 
 
 def train_val_test_split(X, y, pure_mask, labels,
@@ -820,96 +406,6 @@ def train_val_test_split(X, y, pure_mask, labels,
 # 9.  SNN Model
 # ═══════════════════════════════════════════════════════════════════
 
-class CPG_SNN(nn.Module):
-    """
-    Single-network SNN with gait flag in input, gated by LayerNorm.
-
-    The original multi-gait design (gait one-hot concatenated per event)
-    was correct in principle but failed because a constant per-step input
-    saturates the LIF membrane: for any fc weight w > threshold*(1-beta)
-    the neuron fires at every timestep regardless of which gait is active,
-    making all four flags produce identical spike patterns.
-
-    The fix is LayerNorm applied to the fc output BEFORE thresholding.
-    LN zero-centres activations across the hidden dimension at each step.
-    The four one-hot gait flags produce four different fc projections;
-    after LN each is normalised relative to the others in that timestep,
-    landing at different pre-threshold values and producing different
-    firing patterns.  At inference (batch=1) LN uses per-sample stats
-    over the hidden dimension — still effective, unlike BatchNorm which
-    would collapse to running stats at batch=1.
-
-    Architecture
-    ------------
-    Input  : (seq_len, B, n_in)
-             n_in = N + 4 + n_gaits
-                  = 4  one-hot neuron identity
-                  + 2  sin/cos absolute phase
-                  + 2  sin/cos relative (ISI) phase
-                  + 4  one-hot gait flag   ← LN prevents saturation
-    Layer 1: Linear(n_in, hidden)    → LayerNorm → Leaky LIF
-    Layer 2: Linear(hidden, hidden)  → LayerNorm → Leaky LIF
-    Layer 3: Linear(hidden, hidden)  → LayerNorm → Leaky LIF
-    Readout: Linear(hidden, hidden)  → Leaky (threshold=1e9, analog)
-             read at LAST timestep  → fc_out → (B, n_joints)
-
-    Parameters
-    ----------
-    n_in    : int   N + 4 + n_gaits  (from build_dataset)
-    hidden  : int   hidden layer width
-    n_out   : int   number of joints
-    n_gaits : int   kept for API / ONNX compatibility; not used in forward
-    beta    : float LIF membrane decay
-    """
-
-    def __init__(self, n_in, hidden=128, n_out=8, n_gaits=4,
-                 beta=0.9, spike_grad=None):
-        super().__init__()
-        spike_grad   = spike_grad or surrogate.fast_sigmoid(slope=25)
-
-        self.fc1     = nn.Linear(n_in,   hidden)
-        self.ln1     = nn.LayerNorm(hidden)
-        self.lif1    = snn.Leaky(beta=beta, spike_grad=spike_grad)
-
-        self.fc2     = nn.Linear(hidden, hidden)
-        self.ln2     = nn.LayerNorm(hidden)
-        self.lif2    = snn.Leaky(beta=beta, spike_grad=spike_grad)
-
-        self.fc3     = nn.Linear(hidden, hidden)
-        self.ln3     = nn.LayerNorm(hidden)
-        self.lif3    = snn.Leaky(beta=beta, spike_grad=spike_grad)
-
-        self.fc_read = nn.Linear(hidden, hidden)
-        self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad,
-                                  threshold=1e9)
-        self.fc_out  = nn.Linear(hidden, n_out)
-
-    def forward(self, x, gait_idx=None, return_recordings=False):
-        """
-        x        : (seq_len, B, n_in)  includes gait one-hot flag
-        gait_idx : (B,) LongTensor  kept for API/ONNX compatibility;
-                   the gait info is already inside x via the one-hot flag
-        """
-        m1 = self.lif1.init_leaky()
-        m2 = self.lif2.init_leaky()
-        m3 = self.lif3.init_leaky()
-        mo = self.lif_out.init_leaky()
-        spk1_rec, spk2_rec = [], []
-
-        for t in range(x.shape[0]):
-            s1, m1 = self.lif1(self.ln1(self.fc1(x[t])),  m1)
-            s2, m2 = self.lif2(self.ln2(self.fc2(s1)),     m2)
-            s3, m3 = self.lif3(self.ln3(self.fc3(s2)),     m3)
-            _,  mo = self.lif_out(self.fc_read(s3),         mo)
-            if return_recordings:
-                spk1_rec.append(s1.detach())
-                spk2_rec.append(s2.detach())
-
-        output = self.fc_out(mo)
-
-        if return_recordings:
-            return output, torch.stack(spk1_rec), torch.stack(spk2_rec)
-        return output
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -953,36 +449,74 @@ def make_gait_weighted_criterion(gait_tables_orig, device):
     return weighted_criterion
 
 
-def train_epoch(model, loader, optimizer, criterion, device,
-                weighted=False):
+# def train_epoch(model, loader, optimizer, criterion, device,
+#                 weighted=False):
+#     model.train()
+#     total = 0.0
+#     for batch in loader:
+#         X, y, glbl = batch
+#         X, y, glbl = X.to(device), y.to(device), glbl.to(device)
+#         optimizer.zero_grad()
+#         pred = model(X, glbl)                  # FiLM: pass gait index
+#         loss = criterion(pred, y, glbl) if weighted else criterion(pred, y)
+#         loss.backward()
+#         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#         optimizer.step()
+#         total += loss.item()
+#     return total / len(loader)
+
+
+# @torch.no_grad()
+# def eval_epoch(model, loader, criterion, device, weighted=False):
+#     model.eval()
+#     if not loader:
+#         return float("nan")
+#     total = 0.0
+#     for batch in loader:
+#         X, y, glbl = batch
+#         X, y, glbl = X.to(device), y.to(device), glbl.to(device)
+#         pred  = model(X, glbl)                 # FiLM: pass gait index
+#         loss  = criterion(pred, y, glbl) if weighted else criterion(pred, y)
+#         total += loss.item()
+#     return total / len(loader)
+def train_epoch(model, loader, optimizer, criterion, device, weighted=False):
     model.train()
-    total = 0.0
+    total_loss = 0.0  # Or keep as 0.0 scalar float
+
     for batch in loader:
         X, y, glbl = batch
-        X, y, glbl = X.to(device), y.to(device), glbl.to(device)
+        X, y, glbl = X.to(device, non_blocking=True), y.to(device, non_blocking=True), glbl.to(device, non_blocking=True)
+        
         optimizer.zero_grad()
-        pred = model(X, glbl)                  # FiLM: pass gait index
+        pred = model(X, glbl)
         loss = criterion(pred, y, glbl) if weighted else criterion(pred, y)
         loss.backward()
+        
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        total += loss.item()
-    return total / len(loader)
 
+        # Detach loss so it doesn't hold memory, but stay on GPU/scalar float sum
+        total_loss += loss.detach()
 
+    # Convert to standard Python float ONCE per epoch
+    return (total_loss / len(loader)).item()
 @torch.no_grad()
 def eval_epoch(model, loader, criterion, device, weighted=False):
     model.eval()
     if not loader:
         return float("nan")
-    total = 0.0
+    
+    total_loss = 0.0
     for batch in loader:
         X, y, glbl = batch
-        X, y, glbl = X.to(device), y.to(device), glbl.to(device)
-        pred  = model(X, glbl)                 # FiLM: pass gait index
-        loss  = criterion(pred, y, glbl) if weighted else criterion(pred, y)
-        total += loss.item()
-    return total / len(loader)
+        X, y, glbl = X.to(device, non_blocking=True), y.to(device, non_blocking=True), glbl.to(device, non_blocking=True)
+        
+        pred = model(X, glbl)
+        loss = criterion(pred, y, glbl) if weighted else criterion(pred, y)
+        
+        total_loss += loss
+
+    return (total_loss / len(loader)).item()
 
 
 def run_training(model, train_loader, val_pure_loader, val_trans_loader,
@@ -1030,6 +564,22 @@ def run_training(model, train_loader, val_pure_loader, val_trans_loader,
     try:
         for epoch in range(1, epochs + 1):
             best_val = run_epoch(epoch, best_val)
+
+        #### Wrap above for loop in below profiler code if you want
+        # import torch.profiler
+
+        # with torch.profiler.profile(
+        #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        #     record_shapes=True
+        # ) as prof:
+            
+        #     # RUN JUST 2 BATCHES HERE
+        #     # for i, batch in enumerate(train_loader):
+        #     #     if i >= 2: break
+        #     #     # ... your train loop body ...
+
+        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        
     except KeyboardInterrupt:
         print("\n  [interrupt] Ctrl+C received; stopping.")
 
@@ -1094,279 +644,6 @@ def export_to_onnx(model, seq_len, n_in, out_dir, device,
               f"{clean.get('global_max', 0):.1f}")
 
     return onnx_path
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 12.  Visualisation
-# ═══════════════════════════════════════════════════════════════════
-
-def plot_cpg_vm(vm_record, out_dir, n_show=30_000):
-    """
-    Plot CPG membrane potentials.
-
-    Accepts either a scipy OdeSolution object (legacy) or a dict with
-    keys 't' and 'y' as returned by run_cpg_chunked.
-    """
-    # Support both scipy sol objects and our vm_record dict
-    t_axis = vm_record["t"] if isinstance(vm_record, dict) else vm_record.t
-    y_mat  = vm_record["y"] if isinstance(vm_record, dict) else vm_record.y
-    N      = y_mat.shape[0] // 4
-
-    # Clip to n_show points
-    n_pts  = min(n_show, t_axis.shape[0])
-    t_plot = t_axis[:n_pts]
-    y_plot = y_mat[:, :n_pts]
-
-    fig, axes = plt.subplots(N, 1, figsize=(14, 8), sharex=True)
-    colors    = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261", "#6a0572", "#8ecae6"]
-    if N == 1:
-        axes = [axes]
-    for i in range(N):
-        axes[i].plot(t_plot, y_plot[i * 4, :],
-                     color=colors[i], lw=0.9)
-        axes[i].set_ylabel(f"CPG {i}\n$v_m$", fontsize=9)
-        axes[i].axhline(-2.0, color="k", ls="--", lw=0.7, alpha=0.5,
-                         label="threshold")
-        axes[i].grid(True, alpha=0.2)
-    axes[0].legend(fontsize=8, loc="upper right")
-    axes[-1].set_xlabel(f"Time (first {n_pts} steps)")
-    plt.suptitle("CPG Membrane Potentials — chunk-based integrator", fontsize=12)
-    plt.tight_layout()
-    p = out_dir / "cpg_vm.png"
-    plt.savefig(p, dpi=150); plt.close()
-    print(f"  [saved] {p}")
-
-
-def plot_spike_events(spike_times, spike_neurons, gait_period,
-                      out_dir, n_show=3_000, N=4):
-    mask   = spike_times <= spike_times[0] + n_show
-    colors = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261", "#6a0572", "#8ecae6"]
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 6),
-                                    sharex=True, height_ratios=[3, 1])
-    for i in range(N):
-        idx = np.where((spike_neurons == i) & mask)[0]
-        ax1.scatter(spike_times[idx], np.full(len(idx), i),
-                    marker="|", s=150, lw=1.8,
-                    color=colors[i], label=f"Neuron {i}")
-    ax1.set_yticks(range(N))
-    ax1.set_yticklabels([f"CPG {i}" for i in range(N)])
-    ax1.set_title(f"Spike Events  (gait_period ≈ {gait_period:.0f} steps)")
-    ax1.legend(loc="upper right", fontsize=8)
-    ax1.grid(True, axis="x", alpha=0.2)
-    t_show = spike_times[mask]
-    phase  = np.degrees(2.0 * np.pi * (t_show % gait_period) / gait_period)
-    ax2.plot(t_show, phase, color="#6a0572", lw=1.2)
-    ax2.set_ylabel("Phase (°)"); ax2.set_xlabel("Time")
-    ax2.set_title("Gait phase at each spike event")
-    ax2.grid(True, alpha=0.2)
-    plt.tight_layout()
-    p = out_dir / "spike_events.png"
-    plt.savefig(p, dpi=150); plt.close()
-    print(f"  [saved] {p}")
-
-
-def plot_training_curves(history, out_dir):
-    fig, ax = plt.subplots(figsize=(10, 4))
-    epochs  = range(1, len(history["train"]) + 1)
-    ax.plot(epochs, history["train"],     label="Train",       lw=2,
-            color="#457b9d")
-    ax.plot(epochs, history["val_pure"],  label="Val (pure)",  lw=2,
-            color="#2a9d8f", ls="--")
-    ax.plot(epochs, history["val_trans"], label="Val (trans)", lw=2,
-            color="#e63946", ls=":")
-    ax.set_xlabel("Epoch"); ax.set_ylabel("MSE Loss")
-    ax.set_title("Training — pure vs transition validation loss")
-    ax.legend(); ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    p = out_dir / "training_curves.png"
-    plt.savefig(p, dpi=150); plt.close()
-    print(f"  [saved] {p}")
-
-
-def plot_inference(model, dataset, device, out_dir, n_joints, n_gaits,
-                   sample_idx=0):
-    model.eval()
-    X_np, y_np, lbl = dataset[sample_idx]
-    gait_idx_t = lbl.unsqueeze(0).to(device)          # (1,)
-    X_in       = X_np.unsqueeze(1).to(device)          # (seq_len, 1, n_in)
-    with torch.no_grad():
-        pred, spk1, spk2 = model(X_in, gait_idx_t,
-                                  return_recordings=True)
-    pred_np = pred.squeeze(0).cpu().numpy()
-    y_np    = y_np.numpy()
-    spk1_np = spk1[:, 0, :].cpu().numpy()
-    spk2_np = spk2[:, 0, :].cpu().numpy()
-    N       = 4
-    onehot  = X_np[:, :N].numpy()
-    sin_ph  = X_np[:, N].numpy()
-    cos_ph  = X_np[:, N + 1].numpy()
-    #sin_rel = X_np[:, N + 2].numpy()
-    #cos_rel = X_np[:, N + 3].numpy()
-    gait_name = f"Gait {lbl.item()}"
-
-    T, hidden = spk1_np.shape
-    n_show    = min(24, hidden)
-    show_idx  = np.random.choice(hidden, n_show, replace=False)
-    colors    = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261", "#6a0572", "#8ecae6"]
-
-    fig = plt.figure(figsize=(18, 12))
-    gs  = gridspec.GridSpec(3, 2, hspace=0.5, wspace=0.35)
-
-    ax0 = fig.add_subplot(gs[0, 0])
-    for i in range(N):
-        t_ev = np.where(onehot[:, i] > 0.5)[0]
-        ax0.scatter(t_ev, np.full_like(t_ev, i),
-                    marker="|", s=120, color=colors[i % len(colors)])
-    ax0.set_yticks(range(N))
-    ax0.set_yticklabels([f"CPG {i}" for i in range(N)])
-    ax0.set_title(f"Input spike-event window (seq_len={T})  [{gait_name}]")
-    ax0.grid(True, axis="x", alpha=0.2)
-    ax0b = ax0.twinx()
-    ax0b.plot(sin_ph,  color="purple", lw=1.2, alpha=0.6, ls="--", label="sin(φ_abs)")
-    ax0b.plot(cos_ph,  color="gray",   lw=1.2, alpha=0.6, ls=":",  label="cos(φ_abs)")
-    #ax0b.plot(sin_rel, color="orange", lw=1.2, alpha=0.6, ls="-",  label="sin(φ_rel)")
-    ax0b.set_ylabel("Phase channels", fontsize=8)
-    ax0b.legend(fontsize=7, loc="upper right")
-
-    # FiLM weights for this gait
-    ax_gait = fig.add_subplot(gs[0, 1])
-    N_feat  = N + 2 #Its 2 now caused rmeoved relative phase # 4   # one-hot + 4 phase channels
-    gait_fl = X_np[:, N_feat:].numpy()  # (seq_len, n_gaits)
-    for g in range(n_gaits):
-        ax_gait.plot(gait_fl[:, g], label=f"Gait {g}", lw=1.5,
-                     color=colors[g % len(colors)])
-    ax_gait.set_title(f"Per-event gait flag — {gait_name}")
-    ax_gait.set_xlabel("Event index"); ax_gait.set_ylabel("Flag value")
-    ax_gait.set_ylim(-0.1, 1.1); ax_gait.legend(fontsize=7)
-    ax_gait.grid(True, alpha=0.2)
-
-    ax1 = fig.add_subplot(gs[1, 0])
-    for row, nid in enumerate(show_idx):
-        t_spk = np.where(spk1_np[:, nid] > 0.5)[0]
-        ax1.scatter(t_spk, np.full_like(t_spk, row),
-                    marker="|", s=60, color="#457b9d")
-    ax1.set_title(f"Hidden Layer 1 ({n_show}/{hidden} neurons)")
-    ax1.set_xlabel("Event index"); ax1.set_ylabel("Neuron")
-    ax1.grid(True, axis="x", alpha=0.2)
-
-    ax2 = fig.add_subplot(gs[1, 1])
-    for row, nid in enumerate(show_idx):
-        t_spk = np.where(spk2_np[:, nid] > 0.5)[0]
-        ax2.scatter(t_spk, np.full_like(t_spk, row),
-                    marker="|", s=60, color="#f4a261")
-    ax2.set_title(f"Hidden Layer 2 ({n_show}/{hidden} neurons)")
-    ax2.set_xlabel("Event index"); ax2.set_ylabel("Neuron")
-    ax2.grid(True, axis="x", alpha=0.2)
-
-    ax3 = fig.add_subplot(gs[2, :])
-    x = np.arange(n_joints); w = 0.35
-    ax3.bar(x - w / 2, y_np,    w, label="True",      color="#457b9d", alpha=0.85)
-    ax3.bar(x + w / 2, pred_np, w, label="Predicted", color="#f4a261", alpha=0.85)
-    ax3.set_xticks(x)
-    ax3.set_xticklabels([f"J{i+1}" for i in range(n_joints)],
-                         rotation=45, ha="right")
-    ax3.set_ylabel("Angle (normalised)")
-    ax3.set_title("True vs Predicted Joint Angles")
-    ax3.legend(); ax3.grid(True, axis="y", alpha=0.3)
-
-    plt.suptitle(f"SNN Inference — Sample #{sample_idx}  ({gait_name})",
-                 fontsize=13)
-    p = out_dir / "snn_inference.png"
-    plt.savefig(p, dpi=150, bbox_inches="tight"); plt.close()
-    print(f"  [saved] {p}")
-
-
-def plot_gait_reconstruction(model, X, y, pure_mask, labels,
-                              device, out_dir, n_joints, tgt_range,
-                              gait_names, n_samples=300):
-    model.eval()
-    tgt_min, tgt_max = tgt_range
-    scale   = (tgt_max - tgt_min) / 2.0
-    shift   = (tgt_max + tgt_min) / 2.0
-    n_gaits = len(gait_names)
-    colors  = ["#e63946", "#f4a261", "#2a9d8f", "#6a0572", "#8ecae6", "#ffb703"]
-    TRUE_C  = "#457b9d"
-
-    def predict_batch(indices):
-        X_t   = torch.tensor(X[indices]).permute(1, 0, 2).to(device)
-        lbl_t = torch.tensor(labels[indices], dtype=torch.long).to(device)
-        with torch.no_grad():
-            pred = model(X_t, lbl_t).cpu().numpy()
-        return y[indices] * scale + shift, pred * scale + shift
-
-    rmse_pure  = np.full((n_gaits, n_joints), np.nan)
-    rmse_trans = np.full((n_gaits, n_joints), np.nan)
-
-    for g, name in enumerate(gait_names):
-        for wtype, mask_cond, suffix, color, rmse_arr in [
-            ("pure",  pure_mask,  "pure",  TRUE_C,        rmse_pure),
-            ("trans", ~pure_mask, "trans", colors[g % len(colors)], rmse_trans),
-        ]:
-            idx = np.where((labels == g) & mask_cond)[0]
-            if len(idx) == 0:
-                continue
-            idx = idx[:n_samples]
-            true_arr, pred_arr = predict_batch(idx)
-
-            cols = min(4, n_joints)
-            rows = int(np.ceil(n_joints / cols))
-            fig, axes = plt.subplots(rows, cols,
-                                      figsize=(5 * cols, 3 * rows),
-                                      squeeze=False)
-            for j in range(n_joints):
-                ax   = axes[j // cols][j % cols]
-                rmse = np.sqrt(np.mean((pred_arr[:, j] - true_arr[:, j]) ** 2))
-                rmse_arr[g, j] = rmse
-                ax.plot(true_arr[:, j], label="GT",   color=TRUE_C, lw=1.8)
-                ax.plot(pred_arr[:, j], label="Pred", color=color,
-                        lw=1.5, ls="--", alpha=0.9)
-                err = np.abs(pred_arr[:, j] - true_arr[:, j])
-                ax.fill_between(range(len(idx)),
-                                pred_arr[:, j] - err,
-                                pred_arr[:, j] + err,
-                                color=color, alpha=0.12)
-                ax.set_title(f"J{j+1}  RMSE={rmse:.2f}°", fontsize=9)
-                ax.set_xlabel("Window", fontsize=8)
-                ax.set_ylabel("Angle (°)", fontsize=8)
-                ax.legend(fontsize=7); ax.grid(True, alpha=0.25)
-            for j in range(n_joints, rows * cols):
-                axes[j // cols][j % cols].set_visible(False)
-            plt.suptitle(f"{name} — {wtype} ({len(idx)} samples)",
-                         fontsize=11, fontweight="bold")
-            plt.tight_layout()
-            p = out_dir / f"recons/recon_{name}_{suffix}.png"
-            plt.savefig(p, dpi=150, bbox_inches="tight"); plt.close()
-            print(f"  [saved] {p}")
-
-    vmax = np.nanmax(np.stack([rmse_pure, rmse_trans]))
-    fig, axes = plt.subplots(1, 2,
-                              figsize=(max(8, n_joints * 1.2),
-                                       n_gaits + 2.0))
-    for ax, rmse_mat, title in zip(
-            axes,
-            [rmse_pure, rmse_trans],
-            ["RMSE — Pure windows (°)", "RMSE — Transition windows (°)"]):
-        im = ax.imshow(rmse_mat, aspect="auto", cmap="YlOrRd",
-                       vmin=0, vmax=vmax)
-        plt.colorbar(im, ax=ax, label="RMSE (°)")
-        ax.set_xticks(range(n_joints))
-        ax.set_xticklabels([f"J{j+1}" for j in range(n_joints)], fontsize=9)
-        ax.set_yticks(range(n_gaits))
-        ax.set_yticklabels(gait_names, fontsize=9)
-        ax.set_title(title, fontsize=10)
-        for g in range(n_gaits):
-            for j in range(n_joints):
-                v = rmse_mat[g, j]
-                if not np.isnan(v):
-                    ax.text(j, g, f"{v:.1f}", ha="center", va="center",
-                            fontsize=8,
-                            color="white" if v > vmax * 0.6 else "black")
-    plt.suptitle("Per-Joint RMSE: Pure vs Transition Windows",
-                 fontsize=12, fontweight="bold")
-    plt.tight_layout()
-    p = out_dir / "rmse_heatmap.png"
-    plt.savefig(p, dpi=150, bbox_inches="tight"); plt.close()
-    print(f"  [saved] {p}")
 
 
 
@@ -1514,9 +791,7 @@ def main():
         X, y, pure_mask, labels,
         val_frac=args.val, test_frac=args.test, seed=args.seed)
 
-    kw           = dict(collate_fn=snn_collate, num_workers=0)
-    train_loader = DataLoader(train_ds, batch_size=args.batch,
-                              shuffle=True, **kw)
+    train_loader = make_loader(train_ds,      args.batch, shuffle=True)
     vp_loader    = make_loader(val_pure_ds,   args.batch, False)
     vt_loader    = make_loader(val_trans_ds,  args.batch, False)
     tp_loader    = make_loader(test_pure_ds,  args.batch, False)
@@ -1527,6 +802,7 @@ def main():
     model = CPG_SNN(n_in=n_in, hidden=args.hidden,
                     n_out=n_joints, n_gaits=len(gait_tables),
                     beta=args.beta).to(device)
+    model = torch.compile(model)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"      Parameters : {n_params:,}")
     print(f"      n_in={n_in}  hidden={args.hidden}  "
