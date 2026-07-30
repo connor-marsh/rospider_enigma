@@ -39,6 +39,7 @@ Changes vs original
 
 import argparse
 import json
+import os
 import time
 import numpy as np
 import onnxruntime as ort
@@ -48,6 +49,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from pathlib import Path
+from servo_controller_msgs.msg import ServoPosition, ServosPosition
+import rclpy
+from rclpy.node import Node
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -927,6 +931,41 @@ def plot_latency(latencies, out_dir):
 # 8.  Main inference loop
 # ═══════════════════════════════════════════════════════════════════
 
+test_gait = np.array([[424.0, 316.0, 682.0, 580.0, 320.0, 649.0, 492.0, 329.0, 616.0, 393.0, 682.0, 306.0, 553.0, 680.0, 341.0, 476.0, 661.0, 409.0],
+[421.0, 316.0, 684.0, 578.0, 320.0, 650.0, 491.0, 330.0, 613.0, 395.0, 682.0, 307.0, 556.0, 680.0, 342.0, 478.0, 661.0, 407.0],
+[418.0, 316.0, 685.0, 576.0, 320.0, 651.0, 489.0, 331.0, 611.0, 398.0, 682.0, 308.0, 558.0, 680.0, 343.0, 479.0, 662.0, 405.0],
+[416.0, 316.0, 686.0, 573.0, 320.0, 652.0, 488.0, 332.0, 609.0, 402.0, 683.0, 309.0, 560.0, 680.0, 343.0, 480.0, 663.0, 402.0],
+[414.0, 316.0, 686.0, 570.0, 319.0, 653.0, 487.0, 332.0, 608.0, 405.0, 683.0, 310.0, 562.0, 680.0, 344.0, 482.0, 664.0, 399.0],
+[413.0, 316.0, 686.0, 567.0, 319.0, 654.0, 486.0, 332.0, 607.0, 409.0, 683.0, 311.0, 563.0, 680.0, 344.0, 484.0, 665.0, 396.0],
+[413.0, 316.0, 687.0, 563.0, 319.0, 655.0, 486.0, 332.0, 607.0, 413.0, 683.0, 312.0, 563.0, 680.0, 344.0, 486.0, 667.0, 392.0],
+[414.0, 305.0, 693.0, 560.0, 319.0, 656.0, 487.0, 324.0, 612.0, 417.0, 683.0, 314.0, 562.0, 690.0, 338.0, 488.0, 668.0, 389.0],
+[416.0, 293.0, 698.0, 556.0, 319.0, 657.0, 488.0, 314.0, 619.0, 420.0, 683.0, 315.0, 561.0, 700.0, 332.0, 490.0, 669.0, 386.0],
+[419.0, 282.0, 703.0, 553.0, 319.0, 658.0, 489.0, 305.0, 626.0, 424.0, 683.0, 317.0, 558.0, 710.0, 326.0, 492.0, 670.0, 383.0],
+[423.0, 273.0, 706.0, 550.0, 319.0, 658.0, 492.0, 296.0, 633.0, 427.0, 683.0, 318.0, 554.0, 719.0, 321.0, 494.0, 670.0, 381.0],
+[428.0, 264.0, 708.0, 547.0, 318.0, 659.0, 495.0, 288.0, 641.0, 429.0, 683.0, 319.0, 548.0, 727.0, 316.0, 496.0, 671.0, 379.0],
+[434.0, 258.0, 708.0, 545.0, 318.0, 659.0, 499.0, 280.0, 649.0, 431.0, 683.0, 320.0, 542.0, 734.0, 312.0, 497.0, 672.0, 377.0],
+[440.0, 254.0, 707.0, 544.0, 318.0, 659.0, 503.0, 274.0, 657.0, 433.0, 683.0, 321.0, 536.0, 740.0, 308.0, 498.0, 672.0, 376.0],
+[447.0, 252.0, 704.0, 543.0, 318.0, 660.0, 508.0, 268.0, 664.0, 434.0, 683.0, 321.0, 529.0, 743.0, 306.0, 499.0, 672.0, 375.0],
+[453.0, 253.0, 700.0, 542.0, 318.0, 660.0, 513.0, 265.0, 670.0, 434.0, 683.0, 321.0, 521.0, 744.0, 304.0, 499.0, 672.0, 375.0],
+[460.0, 256.0, 695.0, 542.0, 318.0, 660.0, 518.0, 263.0, 675.0, 434.0, 683.0, 321.0, 514.0, 744.0, 304.0, 499.0, 672.0, 374.0],
+[465.0, 260.0, 689.0, 541.0, 318.0, 660.0, 523.0, 264.0, 679.0, 435.0, 683.0, 322.0, 506.0, 741.0, 305.0, 500.0, 673.0, 374.0],
+[471.0, 267.0, 682.0, 540.0, 318.0, 660.0, 528.0, 267.0, 682.0, 437.0, 683.0, 322.0, 500.0, 736.0, 307.0, 501.0, 673.0, 372.0], 
+[475.0, 275.0, 675.0, 538.0, 318.0, 661.0, 533.0, 272.0, 683.0, 439.0, 683.0, 323.0, 493.0, 729.0, 310.0, 502.0, 673.0, 371.0],
+[479.0, 283.0, 667.0, 535.0, 318.0, 661.0, 537.0, 278.0, 683.0, 441.0, 682.0, 325.0, 488.0, 721.0, 315.0, 504.0, 674.0, 369.0],
+[482.0, 293.0, 660.0, 532.0, 318.0, 661.0, 541.0, 287.0, 681.0, 444.0, 682.0, 326.0, 484.0, 712.0, 319.0, 506.0, 675.0, 366.0],
+[484.0, 303.0, 653.0, 528.0, 318.0, 662.0, 543.0, 296.0, 677.0, 447.0, 682.0, 328.0, 480.0, 702.0, 325.0, 508.0, 675.0, 364.0],
+[486.0, 312.0, 646.0, 525.0, 318.0, 662.0, 545.0, 307.0, 673.0, 450.0, 682.0, 330.0, 479.0, 692.0, 331.0, 510.0, 676.0, 361.0],
+[486.0, 322.0, 640.0, 521.0, 318.0, 663.0, 546.0, 317.0, 667.0, 453.0, 682.0, 332.0, 478.0, 681.0, 336.0, 513.0, 677.0, 359.0],
+[486.0, 322.0, 641.0, 517.0, 318.0, 663.0, 545.0, 317.0, 667.0, 456.0, 682.0, 334.0, 478.0, 681.0, 336.0, 515.0, 677.0, 356.0], 
+[485.0, 322.0, 641.0, 514.0, 318.0, 663.0, 545.0, 317.0, 666.0, 459.0, 681.0, 336.0, 479.0, 681.0, 336.0, 518.0, 678.0, 354.0],
+[484.0, 322.0, 642.0, 510.0, 318.0, 663.0, 543.0, 317.0, 666.0, 462.0, 681.0, 338.0, 481.0, 681.0, 336.0, 520.0, 678.0, 351.0], 
+[483.0, 321.0, 644.0, 507.0, 318.0, 663.0, 541.0, 318.0, 664.0, 465.0, 681.0, 340.0, 483.0, 681.0, 336.0, 523.0, 679.0, 349.0],
+[481.0, 321.0, 646.0, 505.0, 318.0, 663.0, 539.0, 318.0, 663.0, 467.0, 680.0, 341.0, 486.0, 681.0, 336.0, 525.0, 679.0, 348.0], 
+[479.0, 321.0, 648.0, 502.0, 318.0, 663.0, 537.0, 318.0, 661.0, 468.0, 680.0, 343.0, 489.0, 681.0, 336.0, 526.0, 680.0, 346.0], 
+[476.0, 320.0, 650.0, 501.0, 318.0, 664.0, 534.0, 318.0, 659.0, 470.0, 680.0, 344.0, 492.0, 681.0, 336.0, 527.0, 680.0, 345.0], 
+[474.0, 320.0, 652.0, 500.0, 318.0, 664.0, 531.0, 319.0, 657.0, 470.0, 680.0, 344.0, 496.0, 681.0, 336.0, 528.0, 680.0, 345.0], 
+[471.0, 319.0, 655.0, 500.0, 318.0, 664.0, 528.0, 319.0, 655.0, 471.0, 680.0, 344.0, 500.0, 681.0, 335.0, 528.0, 680.0, 344.0]])
+
 def run_inference(cfg, onnx_path, out_dir,
                   t_max=50_000,
                   gait_schedule=None,
@@ -990,7 +1029,6 @@ def run_inference(cfg, onnx_path, out_dir,
     predictor = ONNXGaitPredictor(onnx_path)
     # cpg       = CPGChunkStepper(spike_thresh=spike_thresh, chunk_size=chunk_size)
     cpg = BLIF_CPG(N=6, t_max=t_max)
-    print("AOWIDJOAWIDJ", t_max)
 
     if gait_schedule:
         schedule = sorted(gait_schedule, key=lambda x: x[0])
@@ -1034,9 +1072,10 @@ def run_inference(cfg, onnx_path, out_dir,
     print(f"Running inference: {t_max} steps")
     sched_ptr  = 0
     steps_done = 0
-
-    for _ in range(t_max):
-
+    test_count = 0
+    for current_time in range(t_max):
+        #print(current_time)
+        active_gait = 0
         while (sched_ptr < len(schedule)
                 and steps_done >= schedule[sched_ptr][0]):
             active_gait = schedule[sched_ptr][1]
@@ -1058,9 +1097,10 @@ def run_inference(cfg, onnx_path, out_dir,
 
         if not spike_events:
             continue
-        print(spike_events)
+
         for (t_now, neuron_id) in spike_events:
             
+
             # Use the FIXED gait_period from config for ALL phase
             # computations.  Do NOT use an online estimator here —
             # a 2% period error causes modulo wraparound at the wrong
@@ -1082,18 +1122,20 @@ def run_inference(cfg, onnx_path, out_dir,
             latencies.append(lat_ms)
 
             # PUBLISH TO ROS TOPIC HERE
-            # msg = ServosPosition
-            # msg.duration = 0.8 / PUBLISH_RATE
-            # position_msgs = []
-            # for i in range(len(pred)):
-            #     position = ServoPosition
-            #     position.id = i+1
-            #     position.position = float(pred[i])
-            #     position_msgs.append(position)
-            # msg.position = position_msgs
-            # msg.position_unit = "pulse"
-            # publishers.publish(msg)
-            print(pred)
+            servo_id = [5, 3, 1, 11, 9, 7, 17, 15, 13, 18, 16, 14, 12, 10, 8, 6, 4, 2]
+            #print(pred)
+            msg = ServosPosition()
+            msg.duration = 0.02
+            position_msgs = []
+            for i in range(len(pred)):
+                position = ServoPosition()
+                position.id = servo_id[i]
+                position.position = float(pred[i])
+                position_msgs.append(position)
+            msg.position = position_msgs
+            msg.position_unit = "pulse"
+            publishers.publish(msg)
+            test_count+=1
 
             # from std_msgs.msg import Float64
             # for i, joint_name in enumerate(command_topics[:8]):
@@ -1128,7 +1170,8 @@ def run_inference(cfg, onnx_path, out_dir,
                 rec_pred.append(pred.copy())
                 rec_true.append(
                     gait_table[row_idx].astype(np.float32))
-        rate.sleep()
+        
+        time.sleep(0.07)
 
     if latencies:
         lat = np.array(latencies)
@@ -1166,15 +1209,18 @@ def run_inference(cfg, onnx_path, out_dir,
 def main():
     parser = argparse.ArgumentParser(
         description="CPG-SNN multi-gait inference (ONNX Runtime)")
-    parser.add_argument("--out_dir",   type=str,  default="cpg_snn/outputs",
+    parser.add_argument("--out_dir",   type=str,  default="outputs",
                         help="Directory containing cpg_snn.onnx and "
                              "cpg_snn_config.json")
-    parser.add_argument("--t_max",    type=int,  default=20_000,
+    parser.add_argument("--t_max",    type=int,  default=50_000,
                         help="Inference steps after warm-up")
     parser.add_argument("--robot_mode", type=str, default="rospider", help="Options: no_robot, bittle, bittle_sim, unitree_sim")
     args = parser.parse_args()
 
-    out_dir   = Path(args.out_dir)
+    this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = Path(this_file_dir + "/" + args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     onnx_path = out_dir / "cpg_snn.onnx"
 
     if not onnx_path.exists():
@@ -1245,12 +1291,11 @@ def main():
             publishers[topic_name] = rospy.Publisher(topic_name, Float64, queue_size=1)
 
     elif args.robot_mode == "rospider":
-        import rospy
-        from std_msgs.msg import Float64
         PUBLISH_RATE = 10.0 # Hz (Control frequency)
-        rospy.init_node('gait_decoder_commander_node', anonymous=True)
-        rate = rospy.Rate(PUBLISH_RATE)
-        # publishers = node.create_publisher(ServosPosition, 'servo_controller', 1)
+        rclpy.init()
+        node = Node("run_inference")
+        rate = node.create_rate(PUBLISH_RATE)
+        publishers = node.create_publisher(ServosPosition, 'servo_controller', 1)
         
 
         
@@ -1261,13 +1306,9 @@ def main():
     # ── Scripted gait schedule ───────────────────────────────────
     # Uncomment and edit to test scripted gait transitions:
     t = args.t_max
-    gait_schedule = [
-        (0,          0),   # wkF from start
-        (t // 5,     1),   # → bk
-        (2 * t // 5, 2),   # → wkL
-        (3 * t // 5, 3),   # → wkR
-        (4 * t // 5, 0),
-    ]
+    num_gaits = 5
+    gait_times = [i*t//num_gaits for i in range(num_gaits)]
+    gait_schedule = [(gait_times[i], i%(num_gaits-1)) for i in range(num_gaits)]
 
     data = run_inference(
         cfg, onnx_path, out_dir,
