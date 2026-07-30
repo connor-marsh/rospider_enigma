@@ -35,7 +35,9 @@ class ControllerManager(Node):
         self.legs_wake_pose = [0.2471,0.816,-0.552,0.0,0.904,-0.678,-0.251,0.821,-0.4733,0.255,0.808,-0.485,0.0,0.90,-0.678,-0.263,0.8,-0.477]
 
         self.arm_ids = [19, 20, 21, 22, 23, 24]
-        self.arm_init_pose = [0.0, 0.92, -1.549, -1.466, 0.0, 0.0]
+        # Leaving arm wake pose unused for now because not using arm. Also the sleep pose is good enough as a starting pose
+        self.arm_wake_pose = [0.0, 0.92, -1.549, -1.466, 0.0, 0.0]
+        self.arm_sleep_pose = [0.0,1.365,-1.9,-1.7,0.0,0.0]
         self.servo_ids = self.leg_ids + self.arm_ids
         self.pose_duration = 1.0
 
@@ -111,10 +113,10 @@ class ControllerManager(Node):
 
     def wake_robot(self):
         self.set_all_torques(enable=True)
-        self._move_robot_to_pose(self.legs_wake_pose + self.arm_init_pose)
+        self._move_robot_to_pose(self.legs_wake_pose + self.arm_sleep_pose)
 
     def sleep_robot(self):
-        self._move_robot_to_pose(self.legs_sleep_pose + self.arm_init_pose)
+        self._move_robot_to_pose(self.legs_sleep_pose + self.arm_sleep_pose)
         time.sleep(0.5)
         self.set_all_torques(enable=False)
 
