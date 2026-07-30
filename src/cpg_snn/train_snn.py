@@ -1029,7 +1029,7 @@ def run_training(model, train_loader, val_pure_loader, val_trans_loader,
 
     try:
         for epoch in range(1, epochs + 1):
-            best_val = run_epoch(epoch)
+            best_val = run_epoch(epoch, best_val)
     except KeyboardInterrupt:
         print("\n  [interrupt] Ctrl+C received; stopping.")
 
