@@ -91,98 +91,6 @@ def load_config(out_dir):
 # 2.  Gait tables  (must match training exactly)
 # ═══════════════════════════════════════════════════════════════════
 
-wkF = np.array([
-    [9,49,67,38,24,20,27,14],[8,50,68,39,28,21,22,14],
-    [10,51,70,41,26,22,18,14],[12,52,69,42,24,24,11,14],
-    [14,52,63,44,22,26,1,15],[16,53,53,45,21,27,-2,15],
-    [18,53,41,46,20,29,-1,15],[21,54,26,47,18,30,6,16],
-    [22,54,23,48,18,32,9,17],[25,54,20,49,16,34,12,18],
-    [26,54,17,51,16,37,17,18],[28,54,14,52,15,39,22,19],
-    [30,52,11,54,14,45,27,19],[32,54,11,54,14,44,29,20],
-    [33,58,13,55,15,36,27,21],[34,61,16,56,15,31,24,23],
-    [36,64,18,56,14,24,23,24],[38,66,20,57,14,20,22,26],
-    [39,67,22,57,14,16,21,28],[41,64,24,57,14,5,20,30],
-    [42,55,26,57,14,-1,19,32],[44,44,28,57,15,-3,18,35],
-    [45,30,29,57,15,1,18,38],[46,21,31,57,15,5,17,40],
-    [47,19,32,56,16,9,17,43],[48,16,35,57,17,12,16,44],
-    [49,12,37,62,18,17,14,35],[49,9,39,66,20,24,14,29],
-    [50,8,40,68,21,28,14,23],[51,10,42,70,22,26,14,19],
-    [52,12,43,70,24,24,15,17],[52,14,44,67,26,22,15,5],
-    [53,16,46,59,27,21,15,-2],[53,18,47,47,29,20,16,-2],
-    [54,21,48,34,30,18,16,1],[54,22,49,24,32,18,17,6],
-    [54,25,50,21,34,16,18,10],[54,26,51,19,37,16,19,12],
-    [54,28,52,15,39,15,20,19],[52,30,54,12,45,14,19,24],
-    [54,32,55,12,44,14,20,27],[58,33,55,11,36,15,22,29],
-    [61,34,56,14,31,15,24,26],[64,36,56,17,24,14,25,24],
-    [66,38,57,18,20,14,27,23],[67,39,57,21,16,14,29,21],
-    [64,41,57,23,5,14,31,20],[55,42,57,24,-1,14,33,20],
-    [44,44,57,26,-3,15,36,19],[30,45,57,28,1,15,39,18],
-    [21,46,56,30,5,15,42,17],[19,47,56,32,9,16,45,17],
-    [16,48,59,33,12,17,41,17],[12,49,64,35,17,18,33,16],
-], dtype=np.float32)
-
-bk = np.array([
-    [36,40,36,62,6,-3,6,1],[34,47,32,63,7,-4,7,4],
-    [30,53,28,59,8,-3,9,9],[26,58,25,57,10,-2,10,10],
-    [22,57,26,55,12,2,6,8],[18,51,29,52,14,8,2,7],
-    [15,51,36,50,15,6,-2,6],[17,48,43,47,9,5,-3,5],
-    [21,45,49,44,5,5,-4,5],[29,43,55,42,2,5,-3,5],
-    [35,39,60,38,-1,6,-1,6],[42,36,63,35,-3,6,1,6],
-    [49,32,62,31,-4,7,6,8],[54,28,58,28,-3,9,10,9],
-    [57,26,57,24,0,10,9,11],[56,21,54,26,3,12,8,4],
-    [51,17,52,31,8,15,6,1],[50,15,49,38,6,14,6,-2],
-    [47,18,47,44,5,8,5,-3],[45,24,44,51,5,4,5,-4],
-    [42,30,41,56,5,1,5,-3],[38,37,37,60,6,-2,6,-1],
-], dtype=np.float32)
-
-wkL = np.array([
-    [47,54,58,51,-2,13,-2,2],[45,56,52,52,0,14,-3,2],
-    [45,57,46,52,1,15,-4,2],[45,58,38,53,1,17,-2,2],
-    [46,59,31,54,1,19,1,2],[47,59,24,54,1,22,6,3],
-    [48,60,21,55,2,24,12,3],[49,58,23,56,1,30,16,3],
-    [49,61,25,57,1,30,13,3],[50,67,28,57,1,23,12,4],
-    [51,69,31,58,2,15,11,5],[52,68,34,58,2,8,10,5],
-    [52,65,36,59,2,3,9,6],[53,60,39,61,2,-1,9,5],
-    [54,55,41,62,2,-3,9,3],[54,50,43,62,2,-5,9,2],
-    [54,43,47,60,3,-5,7,1],[55,35,48,58,3,-3,8,1],
-    [56,28,51,57,3,1,8,-1],[57,18,52,55,3,7,9,-1],
-    [57,15,54,53,4,10,10,-2],[58,13,55,50,5,16,11,-2],
-    [58,16,57,49,5,16,12,-2],[59,18,58,46,6,14,14,-2],
-    [59,21,60,44,6,12,14,-2],[60,25,61,43,7,10,16,0],
-    [60,28,62,42,7,9,18,1],[60,31,63,42,10,8,20,3],
-    [62,32,63,42,6,7,24,3],[62,35,63,44,6,6,27,1],
-    [63,38,63,44,3,6,31,1],[61,40,62,45,2,7,35,1],
-    [60,42,65,46,1,7,37,1],[58,45,70,47,0,7,27,1],
-    [57,47,71,48,-1,7,23,2],[54,48,71,49,-1,8,14,1],
-    [53,51,69,49,-2,8,8,1],[50,52,66,50,-2,9,2,1],
-    [49,53,63,51,-2,12,-2,2],
-], dtype=np.float32)
-
-wkR = -(np.array([
-    [-54,-47,-51,-58,-13,2,-2,2],[-56,-45,-52,-52,-14,0,-2,3],
-    [-57,-45,-52,-46,-15,-1,-2,4],[-58,-45,-53,-38,-17,-1,-2,2],
-    [-59,-46,-54,-31,-19,-1,-2,-1],[-59,-47,-54,-24,-22,-1,-3,-6],
-    [-60,-48,-55,-21,-24,-2,-3,-12],[-58,-49,-56,-23,-30,-1,-3,-16],
-    [-61,-49,-57,-25,-30,-1,-3,-13],[-67,-50,-57,-28,-23,-1,-4,-12],
-    [-69,-51,-58,-31,-15,-2,-5,-11],[-68,-52,-58,-34,-8,-2,-5,-10],
-    [-65,-52,-59,-36,-3,-2,-6,-9],[-60,-53,-61,-39,1,-2,-5,-9],
-    [-55,-54,-62,-41,3,-2,-3,-9],[-50,-54,-62,-43,5,-2,-2,-9],
-    [-43,-54,-60,-47,5,-3,-1,-7],[-35,-55,-58,-48,3,-3,-1,-8],
-    [-28,-56,-57,-51,-1,-3,1,-8],[-18,-57,-55,-52,-7,-3,1,-9],
-    [-15,-57,-53,-54,-10,-4,2,-10],[-13,-58,-50,-55,-16,-5,2,-11],
-    [-16,-58,-49,-57,-16,-5,2,-12],[-18,-59,-46,-58,-14,-6,2,-14],
-    [-21,-59,-44,-60,-12,-6,2,-14],[-25,-60,-43,-61,-10,-7,0,-16],
-    [-28,-60,-42,-62,-9,-7,-1,-18],[-31,-60,-42,-63,-8,-10,-3,-20],
-    [-32,-62,-42,-63,-7,-6,-3,-24],[-35,-62,-44,-63,-6,-6,-1,-27],
-    [-38,-63,-44,-63,-6,-3,-1,-31],[-40,-61,-45,-62,-7,-2,-1,-35],
-    [-42,-60,-46,-65,-7,-1,-1,-37],[-45,-58,-47,-70,-7,0,-1,-27],
-    [-47,-57,-48,-71,-7,1,-2,-23],[-48,-54,-49,-71,-8,1,-1,-14],
-    [-51,-53,-49,-69,-8,2,-1,-8],[-52,-50,-50,-66,-9,2,-1,-2],
-    [-53,-49,-51,-63,-12,2,-2,2],
-], dtype=np.float32))
-
-GAIT_TABLES_ORIG = [wkF, bk, wkL, wkR]   # original row counts
-
 # ── Runtime upsampling ───────────────────────────────────────────
 # Applied after config is loaded; target_rows comes from config.
 # Defined here so it can be called in run_inference.
@@ -1004,7 +912,30 @@ def run_inference(cfg, onnx_path, out_dir,
           f"chunk_size={chunk_size}  spike_thresh={spike_thresh}  "
           f"cpg_start_time={cpg_start_time}")
 
+    this_file_dir = os.path.dirname(os.path.abspath(__file__))
     # Upsample gait tables to match training target resolution
+    base_gait_names = [
+            "tripod", "tripod_huge", "tripod_right", "tripod_huge_right",
+            "ripple", "ripple_tiny", "ripple_right", "ripple_tiny_right",
+        ]
+    mirrored_gait_names = [
+        "tripod_backwards", "tripod_huge_backwards", "tripod_left", "tripod_huge_left",
+        "ripple_backwards", "ripple_tiny_backwards", "ripple_left", "ripple_tiny_left",
+    ]
+    gait_names = base_gait_names + mirrored_gait_names
+
+    GAIT_TABLES_ORIG = []
+    for name in base_gait_names:
+        gait_table = np.loadtxt(f"{this_file_dir}/gaits/{name}.csv",
+                                delimiter=",", dtype=np.float32)
+        GAIT_TABLES_ORIG.append(gait_table)
+
+    # for name in mirrored_gait_names:
+    #     base_name = name.replace("_backwards", "").replace("_left", "_right")
+    #     gait_table = np.loadtxt(f"{this_file_dir}/gaits/{base_name}.csv",
+    #                             delimiter=",", dtype=np.float32)
+    #     GAIT_TABLES_ORIG.append(np.flip(gait_table, axis=0).copy())
+
     GAIT_TABLES = upsample_gait_tables(
         GAIT_TABLES_ORIG, gait_names, target_rows)
 
@@ -1072,10 +1003,10 @@ def run_inference(cfg, onnx_path, out_dir,
     print(f"Running inference: {t_max} steps")
     sched_ptr  = 0
     steps_done = 0
-    test_count = 0
-    for current_time in range(t_max):
-        #print(current_time)
-        active_gait = 0
+    active_gait = 0
+    print(schedule)
+    for current_time in range(cpg_start_time, t_max):
+        
         while (sched_ptr < len(schedule)
                 and steps_done >= schedule[sched_ptr][0]):
             active_gait = schedule[sched_ptr][1]
@@ -1123,7 +1054,7 @@ def run_inference(cfg, onnx_path, out_dir,
 
             # PUBLISH TO ROS TOPIC HERE
             servo_id = [5, 3, 1, 11, 9, 7, 17, 15, 13, 18, 16, 14, 12, 10, 8, 6, 4, 2]
-            #print(pred)
+
             msg = ServosPosition()
             msg.duration = 0.02
             position_msgs = []
@@ -1135,28 +1066,7 @@ def run_inference(cfg, onnx_path, out_dir,
             msg.position = position_msgs
             msg.position_unit = "pulse"
             publishers.publish(msg)
-            test_count+=1
 
-            # from std_msgs.msg import Float64
-            # for i, joint_name in enumerate(command_topics[:8]):
-            #     msg = Float64(data=JOINT_DIRECTIONS[i]*(cmd[i]+JOINT_OFFSETS[i]))
-            #     publishers[joint_name].publish(msg)
-
-            # # Hand off command (no-op if no serial thread)
-            
-            # if robot_mode=="bittle":
-            #     cmd_flat = sum(
-            #         [[j + 8, int(np.clip(pred[j], -124, 124))]
-            #             for j in range(n_joints)], [])
-            #     shared.set_cmd(['I', cmd_flat, 0.0])
-            # elif robot_mode=="bittle_sim":
-            #     cmd = [int(np.clip(pred[j], -124, 124)) for j in range(n_joints)]
-            #     cmd = np.radians(np.array(cmd))
-            #     shared.set_cmd(cmd)
-            # elif robot_mode=="unitree_sim":
-            #     cmd = [int(pred[j]) for j in range(n_joints)]
-            #     cmd = np.radians(np.array(cmd))
-            #     shared.set_cmd(cmd)
 
             if record:
                 gait_table = GAIT_TABLES[active_gait]
@@ -1171,7 +1081,7 @@ def run_inference(cfg, onnx_path, out_dir,
                 rec_true.append(
                     gait_table[row_idx].astype(np.float32))
         
-        time.sleep(0.07)
+        time.sleep(0.03)
 
     if latencies:
         lat = np.array(latencies)
@@ -1212,7 +1122,7 @@ def main():
     parser.add_argument("--out_dir",   type=str,  default="outputs",
                         help="Directory containing cpg_snn.onnx and "
                              "cpg_snn_config.json")
-    parser.add_argument("--t_max",    type=int,  default=50_000,
+    parser.add_argument("--t_max",    type=int,  default=10_000,
                         help="Inference steps after warm-up")
     parser.add_argument("--robot_mode", type=str, default="rospider", help="Options: no_robot, bittle, bittle_sim, unitree_sim")
     args = parser.parse_args()
@@ -1306,7 +1216,7 @@ def main():
     # ── Scripted gait schedule ───────────────────────────────────
     # Uncomment and edit to test scripted gait transitions:
     t = args.t_max
-    num_gaits = 5
+    num_gaits = 9
     gait_times = [i*t//num_gaits for i in range(num_gaits)]
     gait_schedule = [(gait_times[i], i%(num_gaits-1)) for i in range(num_gaits)]
 
