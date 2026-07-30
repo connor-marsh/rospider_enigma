@@ -992,7 +992,7 @@ def run_training(model, train_loader, val_pure_loader, val_trans_loader,
     best_path = out_dir / "best_model.pt"
     history   = {"train": [], "val_pure": [], "val_trans": []}
 
-    def run_epoch(epoch):
+    def run_epoch(epoch, best_val):
         tl = train_epoch(model, train_loader, optimizer, criterion,
                          device, weighted=weighted)
         vp = eval_epoch(model, val_pure_loader,  criterion, device,
@@ -1020,6 +1020,8 @@ def run_training(model, train_loader, val_pure_loader, val_trans_loader,
             print(f"  {epoch:>6}  {tl:>10.6f}  {vp_s:>10}"
                   f"  {vt_s:>10}"
                   f"  {optimizer.param_groups[0]['lr']:>8.2e}{flag}")
+            
+        return best_val
 
     print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val-Pure':>10}"
           f"  {'Val-Trans':>10}  {'LR':>8}")
@@ -1027,7 +1029,7 @@ def run_training(model, train_loader, val_pure_loader, val_trans_loader,
 
     try:
         for epoch in range(1, epochs + 1):
-            run_epoch(epoch)
+            best_val = run_epoch(epoch)
     except KeyboardInterrupt:
         print("\n  [interrupt] Ctrl+C received; stopping.")
 
@@ -1462,6 +1464,7 @@ def main():
         "ripple_backwards", "ripple_tiny_backwards", "ripple_left", "ripple_tiny_left",
     ]
     gait_names = base_gait_names + mirrored_gait_names
+    gait_names = gait_names[0:4]
 
     gait_tables_orig = []
     for name in base_gait_names:
