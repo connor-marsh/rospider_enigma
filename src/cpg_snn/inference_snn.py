@@ -22,16 +22,15 @@ Gait switching:
 Changes vs original
 -------------------
 1. OnlineBurstPeriodEstimator removed entirely.  Training and inference
-   use the same CPGChunkStepper with the same initial conditions, producing
+   use the same BLIF_CPG stepper with the same initial conditions, producing
    bit-identical spike times.  The gait_period from cpg_snn_config.json
    is used directly for all phase computations — no estimation, no EMA lag.
    The estimator caused sin/cos phase errors up to ±1.07 due to modulo
    wraparound at a slightly wrong period boundary.
 
-2. CPGChunkStepper is instantiated from config values
-   (chunk_size, spike_thresh, cpg_start_time) instead of hardcoded
-   constants, so training and inference always use identical stepper
-   parameters.
+2. BLIF_CPG is run one step at a time with the same warm-up schedule
+   from config, so training and inference always use the same stepper
+   behaviour.
 
 3. --no_robot flag suppresses autoConnect() and the serial thread so
    the script can be run offline for testing / analysis.
@@ -41,9 +40,9 @@ import argparse
 import json
 import os
 import time
+from collections import deque
 import numpy as np
 import onnxruntime as ort
-from scipy.integrate import solve_ivp
 from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
@@ -52,7 +51,7 @@ from servo_controller_msgs.msg import ServoPosition, ServosPosition # type: igno
 import rclpy
 from rclpy.node import Node
 
-from cpg_utils import BLIF_CPG, make_network
+from cpg_utils import BLIF_CPG
 from plotting_utils import (
     plot_cpg_vm,
     plot_inference_summary as plot_gait_reconstruction,
@@ -72,8 +71,7 @@ def load_config(out_dir):
 
     Returns a dict with keys:
         gait_period, burst_threshold, global_min, global_max,
-        seq_len, n_gaits, n_joints, gait_names,
-        chunk_size, spike_thresh, cpg_start_time
+        seq_len, n_gaits, n_joints, gait_names, cpg_start_time
     """
     cfg_path = Path(out_dir) / "cpg_snn_config.json"
     if not cfg_path.exists():
@@ -87,8 +85,6 @@ def load_config(out_dir):
     print(f"    burst_threshold = {cfg['burst_threshold']:.1f} steps")
     print(f"    global_min/max  = {cfg['global_min']:.1f} / {cfg['global_max']:.1f}")
     print(f"    seq_len         = {cfg['seq_len']}")
-    print(f"    chunk_size      = {cfg.get('chunk_size', 50)}")
-    print(f"    spike_thresh    = {cfg.get('spike_thresh', -2.0)}")
     print(f"    cpg_start_time  = {cfg.get('cpg_start_time', 5000)}")
     print(f"    target_rows     = {cfg.get('target_rows', 'not set (no upsampling)')}")
     print(f"    n_in            = {cfg.get('n_in', 'not set')}")
@@ -127,92 +123,8 @@ TRUE_COLOR  = "#457b9d"
 
 # Shared BLIF CPG helpers now live in cpg_utils.py.
 
-class CPGChunkStepper:
-    """
-    Chunk-based BDF integrator — identical to the one used in training.
-    Parameters are loaded from cpg_snn_config.json so training and
-    inference always use the same chunk_size and spike_thresh.
-    """
-
-    def __init__(self, N=4, dt=1.0, chunk_size=50, spike_thresh=-2.0):
-        self.N            = N
-        self.dt           = dt
-        self.chunk_size   = chunk_size
-        self.spike_thresh = spike_thresh
-        self.t            = 0.0
-        alpha             = [-2.0,  2.0, -1.5,  1.5]
-        delta             = [ 0.0,  0.0, -1.5, -1.5]
-        g_inh, Iapp       = -0.3, -1.6
-        self.network      = make_network(N, alpha, delta, g_inh, Iapp)
-        self.S            = np.zeros(N * 4)
-        self.S[::4]       = -1.0
-        self.prev_vm      = self.S[::4].copy()
-
-    def step_chunk(self):
-        t_start = self.t
-        t_end   = self.t + self.chunk_size * self.dt
-        t_eval  = np.arange(t_start + self.dt,
-                             t_end   + self.dt * 0.5, self.dt)
-        sol = solve_ivp(self.network,
-                        (t_start, t_end), self.S,
-                        method="BDF", t_eval=t_eval,
-                        dense_output=False)
-        vm_all = sol.y[::4, :]   # (N, chunk_size)
-
-        spike_events = []
-        prev = self.prev_vm.copy()
-        for k in range(vm_all.shape[1]):
-            curr    = vm_all[:, k]
-            crossed = (curr > self.spike_thresh) & (prev <= self.spike_thresh)
-            for neuron_id in np.where(crossed)[0]:
-                spike_events.append((float(sol.t[k]), int(neuron_id)))
-            prev = curr
-
-        self.S       = sol.y[:, -1]
-        self.t       = float(sol.t[-1])
-        self.prev_vm = vm_all[:, -1].copy()
-        return spike_events, vm_all[:, -1].astype(np.float32), vm_all.T
-
-
 # ═══════════════════════════════════════════════════════════════════
-# 4.  Spike-event sliding window buffer
-# ═══════════════════════════════════════════════════════════════════
-
-class SpikeWindowBuffer:
-    """Simple rolling buffer of spike-event feature vectors."""
-
-    def __init__(self, seq_len, N=4, n_gaits=4):
-        self.seq_len = seq_len
-        self.N = N
-        self.n_gaits = n_gaits
-        self.n_in = N + 2 + n_gaits
-        self.buf = np.zeros((seq_len, self.n_in), dtype=np.float32)
-        self.count = 0
-
-    def push(self, neuron_id, abs_phase_rad, gait_idx):
-        feat = np.zeros(self.n_in, dtype=np.float32)
-        feat[neuron_id] = 1.0
-        feat[self.N] = float(np.sin(abs_phase_rad))
-        feat[self.N + 1] = float(np.cos(abs_phase_rad))
-        feat[self.N + 2 + gait_idx] = 1.0
-
-        if self.count < self.seq_len:
-            self.buf[self.count] = feat
-            self.count += 1
-        else:
-            self.buf[:-1] = self.buf[1:]
-            self.buf[-1] = feat
-
-    def get(self):
-        return self.buf.copy()
-
-    @property
-    def is_primed(self):
-        return self.count >= self.seq_len
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 5.  ONNX predictor
+# 4.  ONNX predictor
 # ═══════════════════════════════════════════════════════════════════
 
 class ONNXGaitPredictor:
@@ -251,61 +163,11 @@ class ONNXGaitPredictor:
             {self.input_name: self._x})[0].squeeze(0)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 6.  Shared state + serial thread
-# ═══════════════════════════════════════════════════════════════════
-
-# The old threading-based serial bridge is no longer needed for the
-# simplified inference loop. Gait updates are handled directly in the
-# main loop below.
-
-        
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 7.  Visualisation
-# ═══════════════════════════════════════════════════════════════════
-
-# Shared plotting helpers now live in plotting_utils.py.
 
 # ═══════════════════════════════════════════════════════════════════
 # 8.  Main inference loop
 # ═══════════════════════════════════════════════════════════════════
 
-test_gait = np.array([[424.0, 316.0, 682.0, 580.0, 320.0, 649.0, 492.0, 329.0, 616.0, 393.0, 682.0, 306.0, 553.0, 680.0, 341.0, 476.0, 661.0, 409.0],
-[421.0, 316.0, 684.0, 578.0, 320.0, 650.0, 491.0, 330.0, 613.0, 395.0, 682.0, 307.0, 556.0, 680.0, 342.0, 478.0, 661.0, 407.0],
-[418.0, 316.0, 685.0, 576.0, 320.0, 651.0, 489.0, 331.0, 611.0, 398.0, 682.0, 308.0, 558.0, 680.0, 343.0, 479.0, 662.0, 405.0],
-[416.0, 316.0, 686.0, 573.0, 320.0, 652.0, 488.0, 332.0, 609.0, 402.0, 683.0, 309.0, 560.0, 680.0, 343.0, 480.0, 663.0, 402.0],
-[414.0, 316.0, 686.0, 570.0, 319.0, 653.0, 487.0, 332.0, 608.0, 405.0, 683.0, 310.0, 562.0, 680.0, 344.0, 482.0, 664.0, 399.0],
-[413.0, 316.0, 686.0, 567.0, 319.0, 654.0, 486.0, 332.0, 607.0, 409.0, 683.0, 311.0, 563.0, 680.0, 344.0, 484.0, 665.0, 396.0],
-[413.0, 316.0, 687.0, 563.0, 319.0, 655.0, 486.0, 332.0, 607.0, 413.0, 683.0, 312.0, 563.0, 680.0, 344.0, 486.0, 667.0, 392.0],
-[414.0, 305.0, 693.0, 560.0, 319.0, 656.0, 487.0, 324.0, 612.0, 417.0, 683.0, 314.0, 562.0, 690.0, 338.0, 488.0, 668.0, 389.0],
-[416.0, 293.0, 698.0, 556.0, 319.0, 657.0, 488.0, 314.0, 619.0, 420.0, 683.0, 315.0, 561.0, 700.0, 332.0, 490.0, 669.0, 386.0],
-[419.0, 282.0, 703.0, 553.0, 319.0, 658.0, 489.0, 305.0, 626.0, 424.0, 683.0, 317.0, 558.0, 710.0, 326.0, 492.0, 670.0, 383.0],
-[423.0, 273.0, 706.0, 550.0, 319.0, 658.0, 492.0, 296.0, 633.0, 427.0, 683.0, 318.0, 554.0, 719.0, 321.0, 494.0, 670.0, 381.0],
-[428.0, 264.0, 708.0, 547.0, 318.0, 659.0, 495.0, 288.0, 641.0, 429.0, 683.0, 319.0, 548.0, 727.0, 316.0, 496.0, 671.0, 379.0],
-[434.0, 258.0, 708.0, 545.0, 318.0, 659.0, 499.0, 280.0, 649.0, 431.0, 683.0, 320.0, 542.0, 734.0, 312.0, 497.0, 672.0, 377.0],
-[440.0, 254.0, 707.0, 544.0, 318.0, 659.0, 503.0, 274.0, 657.0, 433.0, 683.0, 321.0, 536.0, 740.0, 308.0, 498.0, 672.0, 376.0],
-[447.0, 252.0, 704.0, 543.0, 318.0, 660.0, 508.0, 268.0, 664.0, 434.0, 683.0, 321.0, 529.0, 743.0, 306.0, 499.0, 672.0, 375.0],
-[453.0, 253.0, 700.0, 542.0, 318.0, 660.0, 513.0, 265.0, 670.0, 434.0, 683.0, 321.0, 521.0, 744.0, 304.0, 499.0, 672.0, 375.0],
-[460.0, 256.0, 695.0, 542.0, 318.0, 660.0, 518.0, 263.0, 675.0, 434.0, 683.0, 321.0, 514.0, 744.0, 304.0, 499.0, 672.0, 374.0],
-[465.0, 260.0, 689.0, 541.0, 318.0, 660.0, 523.0, 264.0, 679.0, 435.0, 683.0, 322.0, 506.0, 741.0, 305.0, 500.0, 673.0, 374.0],
-[471.0, 267.0, 682.0, 540.0, 318.0, 660.0, 528.0, 267.0, 682.0, 437.0, 683.0, 322.0, 500.0, 736.0, 307.0, 501.0, 673.0, 372.0], 
-[475.0, 275.0, 675.0, 538.0, 318.0, 661.0, 533.0, 272.0, 683.0, 439.0, 683.0, 323.0, 493.0, 729.0, 310.0, 502.0, 673.0, 371.0],
-[479.0, 283.0, 667.0, 535.0, 318.0, 661.0, 537.0, 278.0, 683.0, 441.0, 682.0, 325.0, 488.0, 721.0, 315.0, 504.0, 674.0, 369.0],
-[482.0, 293.0, 660.0, 532.0, 318.0, 661.0, 541.0, 287.0, 681.0, 444.0, 682.0, 326.0, 484.0, 712.0, 319.0, 506.0, 675.0, 366.0],
-[484.0, 303.0, 653.0, 528.0, 318.0, 662.0, 543.0, 296.0, 677.0, 447.0, 682.0, 328.0, 480.0, 702.0, 325.0, 508.0, 675.0, 364.0],
-[486.0, 312.0, 646.0, 525.0, 318.0, 662.0, 545.0, 307.0, 673.0, 450.0, 682.0, 330.0, 479.0, 692.0, 331.0, 510.0, 676.0, 361.0],
-[486.0, 322.0, 640.0, 521.0, 318.0, 663.0, 546.0, 317.0, 667.0, 453.0, 682.0, 332.0, 478.0, 681.0, 336.0, 513.0, 677.0, 359.0],
-[486.0, 322.0, 641.0, 517.0, 318.0, 663.0, 545.0, 317.0, 667.0, 456.0, 682.0, 334.0, 478.0, 681.0, 336.0, 515.0, 677.0, 356.0], 
-[485.0, 322.0, 641.0, 514.0, 318.0, 663.0, 545.0, 317.0, 666.0, 459.0, 681.0, 336.0, 479.0, 681.0, 336.0, 518.0, 678.0, 354.0],
-[484.0, 322.0, 642.0, 510.0, 318.0, 663.0, 543.0, 317.0, 666.0, 462.0, 681.0, 338.0, 481.0, 681.0, 336.0, 520.0, 678.0, 351.0], 
-[483.0, 321.0, 644.0, 507.0, 318.0, 663.0, 541.0, 318.0, 664.0, 465.0, 681.0, 340.0, 483.0, 681.0, 336.0, 523.0, 679.0, 349.0],
-[481.0, 321.0, 646.0, 505.0, 318.0, 663.0, 539.0, 318.0, 663.0, 467.0, 680.0, 341.0, 486.0, 681.0, 336.0, 525.0, 679.0, 348.0], 
-[479.0, 321.0, 648.0, 502.0, 318.0, 663.0, 537.0, 318.0, 661.0, 468.0, 680.0, 343.0, 489.0, 681.0, 336.0, 526.0, 680.0, 346.0], 
-[476.0, 320.0, 650.0, 501.0, 318.0, 664.0, 534.0, 318.0, 659.0, 470.0, 680.0, 344.0, 492.0, 681.0, 336.0, 527.0, 680.0, 345.0], 
-[474.0, 320.0, 652.0, 500.0, 318.0, 664.0, 531.0, 319.0, 657.0, 470.0, 680.0, 344.0, 496.0, 681.0, 336.0, 528.0, 680.0, 345.0], 
-[471.0, 319.0, 655.0, 500.0, 318.0, 664.0, 528.0, 319.0, 655.0, 471.0, 680.0, 344.0, 500.0, 681.0, 335.0, 528.0, 680.0, 344.0]])
 
 def run_inference(cfg, onnx_path, out_dir,
                   t_max=50_000,
@@ -334,16 +196,12 @@ def run_inference(cfg, onnx_path, out_dir,
     n_gaits         = int(cfg["n_gaits"])
     n_joints        = int(cfg["n_joints"])
     gait_names      = cfg["gait_names"]
-    chunk_size      = int(cfg.get("chunk_size",     50))
-    spike_thresh    = float(cfg.get("spike_thresh", -2.0))
     cpg_start_time  = int(cfg.get("cpg_start_time", 5000))
     target_rows     = int(cfg.get("target_rows",    54))
     scale           = (global_max - global_min) / 2.0
     shift           = (global_max + global_min) / 2.0
 
-    print(f"  Stepper params from config: "
-          f"chunk_size={chunk_size}  spike_thresh={spike_thresh}  "
-          f"cpg_start_time={cpg_start_time}")
+    print(f"  Stepper params from config: cpg_start_time={cpg_start_time}")
 
     this_file_dir = os.path.dirname(os.path.abspath(__file__))
     # Upsample gait tables to match training target resolution
@@ -372,22 +230,6 @@ def run_inference(cfg, onnx_path, out_dir,
     GAIT_TABLES = upsample_gait_tables(
         GAIT_TABLES_ORIG, gait_names, target_rows)
 
-    # # ── Shared state ─────────────────────────────────────────────
-    # shared     = SharedState()
-    # stop_event = _threading.Event()
-
-    # # ── Serial thread (only when robot is connected) ─────────────
-    # if robot_mode != "no_robot":
-    #     ser_thread = _threading.Thread(
-    #         target=serial_worker,
-    #         args=(shared, n_joints, stop_event),
-    #         daemon=True,
-    #         name="serial-worker")
-    #     ser_thread.start()
-    #     print("  Serial thread started.")
-    # else:
-    #     ser_thread = None
-    #     print("  No robot: serial thread suppressed.")
 
     # ── Inference components ─────────────────────────────────────
     predictor = ONNXGaitPredictor(onnx_path)
@@ -400,15 +242,15 @@ def run_inference(cfg, onnx_path, out_dir,
 
     # ── Boot sequence: identical to training ─────────────────────
     # Training does:
-    #   1. Warm up CPGChunkStepper for cpg_start_time steps
+    #   1. Warm up BLIF_CPG for cpg_start_time steps
     #   2. Collect spikes for tmax - cpg_start_time steps
     #   3. Run estimate_gait_period on those spikes -> gait_period
     #   4. Use that fixed gait_period for ALL phase computations
     #
     # Inference does EXACTLY the same thing.  The config stores the
     # gait_period computed during training, so we can simply read it
-    # without re-estimating.  The CPGChunkStepper produces bit-identical
-    # spike times (same ICs, same chunk_size, same integrator), so
+    # without re-estimating.  BLIF_CPG produces bit-identical
+    # spike times (same ICs, same integrator), so
     # t % gait_period gives identical phase values to training.
     #
     # There is NO online period estimator. There never was a reason for
@@ -419,7 +261,8 @@ def run_inference(cfg, onnx_path, out_dir,
         cpg.step()
     print(f"  CPG settled.  Using fixed gait_period = {gait_period:.1f} steps\n")
 
-    event_buf = SpikeWindowBuffer(seq_len, N=6, n_gaits=n_gaits)
+    feature_history = deque(maxlen=seq_len)
+    n_in = 6 + 2 + n_gaits
 
     # ── Recording buffers ─────────────────────────────────────────
     rec_t, rec_neuron  = [], []
@@ -445,24 +288,29 @@ def run_inference(cfg, onnx_path, out_dir,
             sched_ptr += 1
 
         spikes, _, t_now = cpg.step()
-        spike_events = []
-        for neuron_id in range(len(spikes)):
-            if spikes[neuron_id]:
-                spike_events.append((t_now, neuron_id))
-
         steps_done += 1
 
-        for (t_now, neuron_id) in spike_events:
+        n_neurons = len(spikes)
+
+        for neuron_id in range(len(n_neurons)):
+            if not spikes[neuron_id]:
+                continue
+
             abs_phase_rad = float(
                 2.0 * np.pi * (t_now % gait_period) / gait_period)
 
-            event_buf.push(neuron_id, abs_phase_rad, active_gait)
+            feat = np.zeros(n_in, dtype=np.float32)
+            feat[neuron_id] = 1.0
+            feat[n_neurons] = float(np.sin(abs_phase_rad))
+            feat[n_neurons+1] = float(np.cos(abs_phase_rad))
+            feat[n_neurons+2 + active_gait] = 1.0
+            feature_history.append(feat)
 
-            if not event_buf.is_primed:
+            if len(feature_history) < seq_len:
                 continue
 
+            window = np.stack(list(feature_history), axis=0)
             t0 = time.perf_counter()
-            window = event_buf.get()
             pred_norm = predictor.predict(window, active_gait)
             pred = pred_norm * scale + shift
             lat_ms = (time.perf_counter() - t0) * 1000
@@ -547,7 +395,7 @@ def main():
     if not onnx_path.exists():
         raise FileNotFoundError(
             f"ONNX model not found: {onnx_path}\n"
-            "Run cpg_snn_chunked.py (training) first.")
+            "Run train_snn.py (training) first.")
 
     print("Loading config ...")
     cfg = load_config(out_dir)
