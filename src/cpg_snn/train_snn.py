@@ -674,7 +674,7 @@ def main():
     parser.add_argument("--beta",            type=float, default=0.9)
 
     # ── Training ─────────────────────────────────────────────────
-    parser.add_argument("--epochs",          type=int,   default=400)
+    parser.add_argument("--epochs",          type=int,   default=100)
     parser.add_argument("--lr",              type=float, default=1e-3)
     parser.add_argument("--batch",           type=int,   default=256)
     parser.add_argument("--val",             type=float, default=0.15)
@@ -742,6 +742,7 @@ def main():
     ]
     gait_names = base_gait_names + mirrored_gait_names
     gait_names = ["tripod", "ripple"]
+    gait_names = gait_names[0:8:2]
 
     gait_tables_orig = []
     for name in base_gait_names:
@@ -802,7 +803,8 @@ def main():
     model = CPG_SNN(n_in=n_in, hidden=args.hidden,
                     n_out=n_joints, n_gaits=len(gait_tables),
                     beta=args.beta).to(device)
-    model = torch.compile(model)
+    if device.type == "cuda":
+        model = torch.compile(model, mode="reduce_overhead")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"      Parameters : {n_params:,}")
     print(f"      n_in={n_in}  hidden={args.hidden}  "

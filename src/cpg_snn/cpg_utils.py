@@ -7,11 +7,103 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+torch.set_float32_matmul_precision('high')
 import snntorch as snn
 from snntorch import surrogate
 from scipy.stats import gaussian_kde
 from scipy.signal import argrelmin
 from scipy.integrate import solve_ivp
+
+class CPG_SNN(nn.Module):
+    """
+    Single-network SNN with gait flag in input, gated by LayerNorm.
+
+    The original multi-gait design (gait one-hot concatenated per event)
+    was correct in principle but failed because a constant per-step input
+    saturates the LIF membrane: for any fc weight w > threshold*(1-beta)
+    the neuron fires at every timestep regardless of which gait is active,
+    making all four flags produce identical spike patterns.
+
+    The fix is LayerNorm applied to the fc output BEFORE thresholding.
+    LN zero-centres activations across the hidden dimension at each step.
+    The four one-hot gait flags produce four different fc projections;
+    after LN each is normalised relative to the others in that timestep,
+    landing at different pre-threshold values and producing different
+    firing patterns.  At inference (batch=1) LN uses per-sample stats
+    over the hidden dimension — still effective, unlike BatchNorm which
+    would collapse to running stats at batch=1.
+
+    Architecture
+    ------------
+    Input  : (seq_len, B, n_in)
+             n_in = N + 4 + n_gaits
+                  = 4  one-hot neuron identity
+                  + 2  sin/cos absolute phase
+                  + 2  sin/cos relative (ISI) phase
+                  + 4  one-hot gait flag   ← LN prevents saturation
+    Layer 1: Linear(n_in, hidden)    → LayerNorm → Leaky LIF
+    Layer 2: Linear(hidden, hidden)  → LayerNorm → Leaky LIF
+    Layer 3: Linear(hidden, hidden)  → LayerNorm → Leaky LIF
+    Readout: Linear(hidden, hidden)  → Leaky (threshold=1e9, analog)
+             read at LAST timestep  → fc_out → (B, n_joints)
+
+    Parameters
+    ----------
+    n_in    : int   N + 4 + n_gaits  (from build_dataset)
+    hidden  : int   hidden layer width
+    n_out   : int   number of joints
+    n_gaits : int   kept for API / ONNX compatibility; not used in forward
+    beta    : float LIF membrane decay
+    """
+
+    def __init__(self, n_in, hidden=128, n_out=8, n_gaits=4,
+                 beta=0.9, spike_grad=None):
+        super().__init__()
+        spike_grad   = spike_grad or surrogate.fast_sigmoid(slope=25)
+
+        self.fc1     = nn.Linear(n_in,   hidden)
+        self.ln1     = nn.LayerNorm(hidden)
+        self.lif1    = snn.Leaky(beta=beta, spike_grad=spike_grad)
+
+        self.fc2     = nn.Linear(hidden, hidden)
+        self.ln2     = nn.LayerNorm(hidden)
+        self.lif2    = snn.Leaky(beta=beta, spike_grad=spike_grad)
+
+        self.fc3     = nn.Linear(hidden, hidden)
+        self.ln3     = nn.LayerNorm(hidden)
+        self.lif3    = snn.Leaky(beta=beta, spike_grad=spike_grad)
+
+        self.fc_read = nn.Linear(hidden, hidden)
+        self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad,
+                                  threshold=1e9)
+        self.fc_out  = nn.Linear(hidden, n_out)
+
+    def forward(self, x, gait_idx=None, return_recordings=False):
+        """
+        x        : (seq_len, B, n_in)  includes gait one-hot flag
+        gait_idx : (B,) LongTensor  kept for API/ONNX compatibility;
+                   the gait info is already inside x via the one-hot flag
+        """
+        m1 = self.lif1.init_leaky()
+        m2 = self.lif2.init_leaky()
+        m3 = self.lif3.init_leaky()
+        mo = self.lif_out.init_leaky()
+        spk1_rec, spk2_rec = [], []
+
+        for t in range(x.shape[0]):
+            s1, m1 = self.lif1(self.ln1(self.fc1(x[t])),  m1)
+            s2, m2 = self.lif2(self.ln2(self.fc2(s1)),     m2)
+            s3, m3 = self.lif3(self.ln3(self.fc3(s2)),     m3)
+            _,  mo = self.lif_out(self.fc_read(s3),         mo)
+            if return_recordings:
+                spk1_rec.append(s1.detach())
+                spk2_rec.append(s2.detach())
+
+        output = self.fc_out(mo)
+
+        if return_recordings:
+            return output, torch.stack(spk1_rec), torch.stack(spk2_rec)
+        return output
 
 
 class LIFGeneralArray:
@@ -338,95 +430,3 @@ def encode_spike_events(spike_times, spike_neurons, gait_period, N=4):
           f"  ({N} one-hot + sin/cos abs-phase + sin/cos rel-phase)"
           f"  [gait flag added per-event in build_dataset]")
     return base_feats, abs_phase
-
-
-class CPG_SNN(nn.Module):
-    """
-    Single-network SNN with gait flag in input, gated by LayerNorm.
-
-    The original multi-gait design (gait one-hot concatenated per event)
-    was correct in principle but failed because a constant per-step input
-    saturates the LIF membrane: for any fc weight w > threshold*(1-beta)
-    the neuron fires at every timestep regardless of which gait is active,
-    making all four flags produce identical spike patterns.
-
-    The fix is LayerNorm applied to the fc output BEFORE thresholding.
-    LN zero-centres activations across the hidden dimension at each step.
-    The four one-hot gait flags produce four different fc projections;
-    after LN each is normalised relative to the others in that timestep,
-    landing at different pre-threshold values and producing different
-    firing patterns.  At inference (batch=1) LN uses per-sample stats
-    over the hidden dimension — still effective, unlike BatchNorm which
-    would collapse to running stats at batch=1.
-
-    Architecture
-    ------------
-    Input  : (seq_len, B, n_in)
-             n_in = N + 4 + n_gaits
-                  = 4  one-hot neuron identity
-                  + 2  sin/cos absolute phase
-                  + 2  sin/cos relative (ISI) phase
-                  + 4  one-hot gait flag   ← LN prevents saturation
-    Layer 1: Linear(n_in, hidden)    → LayerNorm → Leaky LIF
-    Layer 2: Linear(hidden, hidden)  → LayerNorm → Leaky LIF
-    Layer 3: Linear(hidden, hidden)  → LayerNorm → Leaky LIF
-    Readout: Linear(hidden, hidden)  → Leaky (threshold=1e9, analog)
-             read at LAST timestep  → fc_out → (B, n_joints)
-
-    Parameters
-    ----------
-    n_in    : int   N + 4 + n_gaits  (from build_dataset)
-    hidden  : int   hidden layer width
-    n_out   : int   number of joints
-    n_gaits : int   kept for API / ONNX compatibility; not used in forward
-    beta    : float LIF membrane decay
-    """
-
-    def __init__(self, n_in, hidden=128, n_out=8, n_gaits=4,
-                 beta=0.9, spike_grad=None):
-        super().__init__()
-        spike_grad   = spike_grad or surrogate.fast_sigmoid(slope=25)
-
-        self.fc1     = nn.Linear(n_in,   hidden)
-        self.ln1     = nn.LayerNorm(hidden)
-        self.lif1    = snn.Leaky(beta=beta, spike_grad=spike_grad)
-
-        self.fc2     = nn.Linear(hidden, hidden)
-        self.ln2     = nn.LayerNorm(hidden)
-        self.lif2    = snn.Leaky(beta=beta, spike_grad=spike_grad)
-
-        self.fc3     = nn.Linear(hidden, hidden)
-        self.ln3     = nn.LayerNorm(hidden)
-        self.lif3    = snn.Leaky(beta=beta, spike_grad=spike_grad)
-
-        self.fc_read = nn.Linear(hidden, hidden)
-        self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad,
-                                  threshold=1e9)
-        self.fc_out  = nn.Linear(hidden, n_out)
-
-    def forward(self, x, gait_idx=None, return_recordings=False):
-        """
-        x        : (seq_len, B, n_in)  includes gait one-hot flag
-        gait_idx : (B,) LongTensor  kept for API/ONNX compatibility;
-                   the gait info is already inside x via the one-hot flag
-        """
-        m1 = self.lif1.init_leaky()
-        m2 = self.lif2.init_leaky()
-        m3 = self.lif3.init_leaky()
-        mo = self.lif_out.init_leaky()
-        spk1_rec, spk2_rec = [], []
-
-        for t in range(x.shape[0]):
-            s1, m1 = self.lif1(self.ln1(self.fc1(x[t])),  m1)
-            s2, m2 = self.lif2(self.ln2(self.fc2(s1)),     m2)
-            s3, m3 = self.lif3(self.ln3(self.fc3(s2)),     m3)
-            _,  mo = self.lif_out(self.fc_read(s3),         mo)
-            if return_recordings:
-                spk1_rec.append(s1.detach())
-                spk2_rec.append(s2.detach())
-
-        output = self.fc_out(mo)
-
-        if return_recordings:
-            return output, torch.stack(spk1_rec), torch.stack(spk2_rec)
-        return output
