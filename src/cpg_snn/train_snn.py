@@ -742,7 +742,7 @@ def main():
     ]
     gait_names = base_gait_names + mirrored_gait_names
     gait_names = ["tripod", "ripple"]
-    gait_names = gait_names[0:8:2]
+    gait_names = gait_names[0:2:8]
 
     gait_tables_orig = []
     for name in base_gait_names:
