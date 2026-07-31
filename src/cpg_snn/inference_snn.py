@@ -47,7 +47,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from servo_controller_msgs.msg import ServoPosition, ServosPosition # type: ignore
+# from servo_controller_msgs.msg import ServoPosition, ServosPosition # type: ignore
 import rclpy
 from rclpy.node import Node
 
@@ -169,11 +169,9 @@ class ONNXGaitPredictor:
 # ═══════════════════════════════════════════════════════════════════
 
 
-def run_inference(cfg, onnx_path, out_dir,
-                  t_max=50_000,
+def run_inference(cfg, onnx_path, out_dir, args,
                   gait_schedule=None,
-                  record=True,
-                  robot_mode="no_robot"):
+                  record=True):
     """
     Two-thread inference loop.
 
@@ -182,10 +180,9 @@ def run_inference(cfg, onnx_path, out_dir,
     cfg           : dict from cpg_snn_config.json
     onnx_path     : Path to cpg_snn.onnx
     out_dir       : Path for output plots
-    t_max         : CPG integration steps after warm-up
+    args          : argparse.Namespace with t_max, robot_mode, run_on_spikes_only
     gait_schedule : list of (step, gait_idx) for scripted switching
     record        : store data for plots if True
-    robot         : if False, skip serial thread and robot commands
     """
     # ── Read all stepper params from config ──────────────────────
     gait_period     = float(cfg["gait_period"])
@@ -195,11 +192,17 @@ def run_inference(cfg, onnx_path, out_dir,
     seq_len         = int(cfg["seq_len"])
     n_gaits         = int(cfg["n_gaits"])
     n_joints        = int(cfg["n_joints"])
+    n_in            = int(cfg["n_in"])
     gait_names      = cfg["gait_names"]
     cpg_start_time  = int(cfg.get("cpg_start_time", 5000))
     target_rows     = int(cfg.get("target_rows",    54))
     scale           = (global_max - global_min) / 2.0
     shift           = (global_max + global_min) / 2.0
+
+    # Read args
+    t_max      = int(args.t_max)
+    robot_mode = str(args.robot_mode)
+    run_on_spikes_only = bool(args.run_on_spikes_only)
 
     print(f"  Stepper params from config: cpg_start_time={cpg_start_time}")
 
@@ -221,11 +224,14 @@ def run_inference(cfg, onnx_path, out_dir,
                                 delimiter=",", dtype=np.float32)
         GAIT_TABLES_ORIG.append(gait_table)
 
-    # for name in mirrored_gait_names:
-    #     base_name = name.replace("_backwards", "").replace("_left", "_right")
-    #     gait_table = np.loadtxt(f"{this_file_dir}/gaits/{base_name}.csv",
-    #                             delimiter=",", dtype=np.float32)
-    #     GAIT_TABLES_ORIG.append(np.flip(gait_table, axis=0).copy())
+    for name in mirrored_gait_names:
+        base_name = name.replace("_backwards", "").replace("_left", "_right")
+        gait_table = np.loadtxt(f"{this_file_dir}/gaits/{base_name}.csv",
+                                delimiter=",", dtype=np.float32)
+        GAIT_TABLES_ORIG.append(np.flip(gait_table, axis=0).copy())
+
+    gait_names = gait_names[0:8:2]
+    GAIT_TABLES_ORIG = GAIT_TABLES_ORIG[0:8:2]
 
     GAIT_TABLES = upsample_gait_tables(
         GAIT_TABLES_ORIG, gait_names, target_rows)
@@ -262,7 +268,6 @@ def run_inference(cfg, onnx_path, out_dir,
     print(f"  CPG settled.  Using fixed gait_period = {gait_period:.1f} steps\n")
 
     feature_history = deque(maxlen=seq_len)
-    n_in = 6 + 2 + n_gaits
 
     # ── Recording buffers ─────────────────────────────────────────
     rec_t, rec_neuron  = [], []
@@ -278,13 +283,14 @@ def run_inference(cfg, onnx_path, out_dir,
     steps_done = 0
     active_gait = 0
     print(schedule)
-    for current_time in range(cpg_start_time, t_max):
+
+    for _ in range(cpg_start_time, t_max):
         
         while (sched_ptr < len(schedule)
                 and steps_done >= schedule[sched_ptr][0]):
             active_gait = schedule[sched_ptr][1]
             print(f"  step {steps_done:>6d}: gait → "
-                    f"{gait_names[schedule[sched_ptr][1]]}")
+                    f"{gait_names[active_gait]}")
             sched_ptr += 1
 
         spikes, _, t_now = cpg.step()
@@ -292,53 +298,64 @@ def run_inference(cfg, onnx_path, out_dir,
 
         n_neurons = len(spikes)
 
-        for neuron_id in range(len(n_neurons)):
-            if not spikes[neuron_id]:
-                continue
 
-            abs_phase_rad = float(
-                2.0 * np.pi * (t_now % gait_period) / gait_period)
+        abs_phase_rad = float(
+            2.0 * np.pi * (t_now % gait_period) / gait_period)
 
-            feat = np.zeros(n_in, dtype=np.float32)
-            feat[neuron_id] = 1.0
+        # If there are no spikes and we are running on spikes only, skip this timestep.
+        if run_on_spikes_only and not np.any(spikes):
+            continue
+
+        # Create network input vector for this timestep.
+        feat = np.zeros(n_in, dtype=np.float32)
+
+        for neuron_id in range(n_neurons):
+            if spikes[neuron_id]:
+                feat[neuron_id] = 1.0
+
+        # This if statement allows for both phase and non-phase included versions of the model
+        if n_in - n_neurons - n_gaits == 2:
             feat[n_neurons] = float(np.sin(abs_phase_rad))
             feat[n_neurons+1] = float(np.cos(abs_phase_rad))
             feat[n_neurons+2 + active_gait] = 1.0
-            feature_history.append(feat)
+        else:
+            feat[n_neurons + active_gait] = 1.0
 
-            if len(feature_history) < seq_len:
-                continue
+        feature_history.append(feat)
 
-            window = np.stack(list(feature_history), axis=0)
-            t0 = time.perf_counter()
-            pred_norm = predictor.predict(window, active_gait)
-            pred = pred_norm * scale + shift
-            lat_ms = (time.perf_counter() - t0) * 1000
-            latencies.append(lat_ms)
+        if len(feature_history) < seq_len:
+            continue
 
-            if robot_mode != "no_robot":
-                servo_id = [5, 3, 1, 11, 9, 7, 17, 15, 13, 18, 16, 14, 12, 10, 8, 6, 4, 2]
-                msg = ServosPosition()
-                msg.duration = 0.02
-                position_msgs = []
-                for i in range(len(pred)):
-                    position = ServoPosition()
-                    position.id = servo_id[i]
-                    position.position = float(pred[i])
-                    position_msgs.append(position)
-                msg.position = position_msgs
-                msg.position_unit = "pulse"
-                publishers.publish(msg)
+        window = np.stack(list(feature_history), axis=0)
+        t0 = time.perf_counter()
+        pred_norm = predictor.predict(window, active_gait)
+        pred = pred_norm * scale + shift
+        lat_ms = (time.perf_counter() - t0) * 1000
+        latencies.append(lat_ms)
 
-            if record:
-                gait_table = GAIT_TABLES[active_gait]
-                row_idx = (int(abs_phase_rad / (2.0 * np.pi) * gait_table.shape[0]) % gait_table.shape[0])
-                rec_t.append(t_now)
-                rec_neuron.append(neuron_id)
-                rec_phase_deg.append(float(np.degrees(abs_phase_rad)))
-                rec_gait_idx.append(active_gait)
-                rec_pred.append(pred.copy())
-                rec_true.append(gait_table[row_idx].astype(np.float32))
+        if robot_mode != "no_robot":
+            servo_id = [5, 3, 1, 11, 9, 7, 17, 15, 13, 18, 16, 14, 12, 10, 8, 6, 4, 2]
+            msg = ServosPosition()
+            msg.duration = 0.02
+            position_msgs = []
+            for i in range(len(pred)):
+                position = ServoPosition()
+                position.id = servo_id[i]
+                position.position = float(pred[i])
+                position_msgs.append(position)
+            msg.position = position_msgs
+            msg.position_unit = "pulse"
+            publishers.publish(msg)
+
+        if record:
+            gait_table = GAIT_TABLES[active_gait]
+            row_idx = (int(abs_phase_rad / (2.0 * np.pi) * gait_table.shape[0]) % gait_table.shape[0])
+            rec_t.append(t_now)
+            rec_neuron.append(neuron_id)
+            rec_phase_deg.append(float(np.degrees(abs_phase_rad)))
+            rec_gait_idx.append(active_gait)
+            rec_pred.append(pred.copy())
+            rec_true.append(gait_table[row_idx].astype(np.float32))
 
         time.sleep(0.03)
 
@@ -381,9 +398,10 @@ def main():
     parser.add_argument("--out_dir",   type=str,  default="outputs",
                         help="Directory containing cpg_snn.onnx and "
                              "cpg_snn_config.json")
-    parser.add_argument("--t_max",    type=int,  default=10_000,
+    parser.add_argument("--t_max",    type=int,  default=5000,
                         help="Inference steps after warm-up")
-    parser.add_argument("--robot_mode", type=str, default="rospider", help="Options: no_robot, bittle, bittle_sim, unitree_sim")
+    parser.add_argument("--robot_mode", type=str, default="no_robot", help="Options: no_robot, bittle, bittle_sim, unitree_sim, rospider")
+    parser.add_argument("--run_on_spikes_only", type=bool, default=True, help="If True, only predict outputs on a timestep with a spike")
     args = parser.parse_args()
 
     this_file_dir = os.path.dirname(os.path.abspath(__file__))
@@ -468,16 +486,14 @@ def main():
     # ── Scripted gait schedule ───────────────────────────────────
     # Uncomment and edit to test scripted gait transitions:
     t = args.t_max
-    num_gaits = 9
-    gait_times = [i*t//num_gaits for i in range(num_gaits)]
-    gait_schedule = [(gait_times[i], i%(num_gaits-1)) for i in range(num_gaits)]
+    n_gaits = min(int(cfg["n_gaits"]), 8)
+    gait_times = [i*t//(n_gaits+1) for i in range(n_gaits+1)]
+    gait_schedule = [(gait_times[i], i%(n_gaits)) for i in range(n_gaits+1)]
 
     data = run_inference(
-        cfg, onnx_path, out_dir,
-        t_max=args.t_max,
+        cfg, onnx_path, out_dir, args,
         gait_schedule=(None if args.robot_mode=="bittle" else gait_schedule),
-        record=True,
-        robot_mode=args.robot_mode)
+        record=True)
 
     if data is None or len(data["rec_t"]) == 0:
         print("No spike events recorded — check CPG parameters.")
