@@ -741,8 +741,6 @@ def main():
         "ripple_backwards", "ripple_tiny_backwards", "ripple_left", "ripple_tiny_left",
     ]
     gait_names = base_gait_names + mirrored_gait_names
-    gait_names = ["tripod", "ripple"]
-    gait_names = gait_names[0:2:8]
 
     gait_tables_orig = []
     for name in base_gait_names:
@@ -758,6 +756,9 @@ def main():
 
     # gait_tables_orig = [wkF, bk, wkL, wkR]
     # gait_names       = ["wkF", "bk", "wkL", "wkR"]
+
+    gait_names = gait_names[0:8:2]
+    gait_tables_orig = gait_tables_orig[0:8:2]
 
     for name, g in zip(gait_names, gait_tables_orig):
         print(f"      {name:>4s} : {g.shape[0]} rows × {g.shape[1]} joints (original)")
@@ -804,7 +805,7 @@ def main():
                     n_out=n_joints, n_gaits=len(gait_tables),
                     beta=args.beta).to(device)
     if device.type == "cuda":
-        model = torch.compile(model, mode="reduce_overhead")
+        model = torch.compile(model, mode="reduce-overhead")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"      Parameters : {n_params:,}")
     print(f"      n_in={n_in}  hidden={args.hidden}  "
