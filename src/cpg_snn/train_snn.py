@@ -674,7 +674,7 @@ def main():
     parser.add_argument("--beta",            type=float, default=0.9)
 
     # ── Training ─────────────────────────────────────────────────
-    parser.add_argument("--epochs",          type=int,   default=100)
+    parser.add_argument("--epochs",          type=int,   default=200)
     parser.add_argument("--lr",              type=float, default=1e-3)
     parser.add_argument("--batch",           type=int,   default=256)
     parser.add_argument("--val",             type=float, default=0.15)
