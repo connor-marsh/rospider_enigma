@@ -154,7 +154,7 @@ def main():
         description="CPG-SNN robust multi-gait controller — chunk-based CPG")
 
     # ── CPG ─────────────────────────────────────────────────────
-    parser.add_argument("--tmax",            type=int,   default=10000)
+    parser.add_argument("--tmax",            type=int,   default=50000)
     parser.add_argument("--cpg_start_time",  type=int,   default=90)
     parser.add_argument("--chunk_size",      type=int,   default=1,
                         help="Steps per solve_ivp call in CPGChunkStepper. "
@@ -163,7 +163,7 @@ def main():
                         help="Upward vm crossing threshold for spike detection")
 
     # ── Network ──────────────────────────────────────────────────
-    parser.add_argument("--seq_len",         type=int,   default=20,
+    parser.add_argument("--seq_len",         type=int,   default=10,
                         help="Spike events per input window. "
                              "Needs to span ~1 full gait cycle (~32 spikes) "
                              "for reliable phase tracking.")
@@ -172,9 +172,9 @@ def main():
     parser.add_argument("--use_phase",       type=bool, default=False)
 
     # ── Training ─────────────────────────────────────────────────
-    parser.add_argument("--epochs",          type=int,   default=200)
+    parser.add_argument("--epochs",          type=int,   default=500)
     parser.add_argument("--lr",              type=float, default=1e-3)
-    parser.add_argument("--batch",           type=int,   default=256)
+    parser.add_argument("--batch",           type=int,   default=512)
     parser.add_argument("--val",             type=float, default=0.15)
     parser.add_argument("--test",            type=float, default=0.10)
     parser.add_argument("--transition_frac", type=float, default=0.30)
