@@ -217,7 +217,7 @@ def plot_burst_gait_overlay(spike_times, spike_neurons, gait_period, threshold, 
     savefig(fig, out_dir, "burst_gait_overlay.png")
 
 
-def plot_inference(model, dataset, device, out_dir, n_joints, n_gaits, sample_idx=0):
+def plot_inference(model, dataset, device, out_dir, n_joints, n_gaits, sample_idx=0, N=4):
     model.eval()
     X_np, y_np, lbl = dataset[sample_idx]
     gait_idx_t = lbl.unsqueeze(0).to(device)
@@ -228,7 +228,6 @@ def plot_inference(model, dataset, device, out_dir, n_joints, n_gaits, sample_id
     y_np = y_np.numpy()
     spk1_np = spk1[:, 0, :].cpu().numpy()
     spk2_np = spk2[:, 0, :].cpu().numpy()
-    N = 4
     onehot = X_np[:, :N].numpy()
     sin_ph = X_np[:, N].numpy()
     cos_ph = X_np[:, N + 1].numpy()

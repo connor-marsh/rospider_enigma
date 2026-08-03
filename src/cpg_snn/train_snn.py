@@ -675,6 +675,7 @@ def main():
                              "for reliable phase tracking.")
     parser.add_argument("--hidden",          type=int,   default=128)
     parser.add_argument("--beta",            type=float, default=0.9)
+    parser.add_argument("--use_phase",       type=bool, default=True)
 
     # ── Training ─────────────────────────────────────────────────
     parser.add_argument("--epochs",          type=int,   default=100)
@@ -707,7 +708,9 @@ def main():
     # ── 1. CPG — chunk-based (same integrator as deployment) ────
     print("[1/6] Running CPG via CPGChunkStepper ...")
     print(f"      chunk_size={args.chunk_size}  spike_thresh={args.spike_thresh}")
-    
+
+
+    ### Code for running MTF network
     # spike_times, spike_neurons, vm_record = run_cpg_chunked(
     #     N=N,
     #     tmax=args.tmax,
@@ -715,7 +718,7 @@ def main():
     #     chunk_size=args.chunk_size,
     #     spike_thresh=args.spike_thresh,
     # )
-    print(os.getcwd())
+    
     spike_times, spike_neurons = run_blif_cpg(N=N, t_max = args.tmax, cpg_start_time=args.cpg_start_time)
     
     print(f"      Collected {len(spike_times)} spike events "
@@ -729,7 +732,7 @@ def main():
         N=N, burnin_bursts=args.burnin_bursts, kde_bw=args.kde_bw)
 
     base_feats, event_phases = encode_spike_events(
-        spike_times, spike_neurons, gait_period, N=N)
+        spike_times, spike_neurons, gait_period, N=N, use_phase=args.use_phase)
     plot_spike_events(spike_times, spike_neurons, gait_period, out_dir, N=N)
 
     # ── 3. Gait tables ──────────────────────────────────────────
@@ -846,7 +849,7 @@ def main():
     plot_training_curves(history, out_dir)
     full_ds = GaitDataset(X, y, labels)
     plot_inference(model, full_ds, device, out_dir,
-                   n_joints=n_joints, n_gaits=len(gait_tables))
+                   n_joints=n_joints, n_gaits=len(gait_tables), N=N)
     plot_gait_reconstruction(
         model, X, y, pure_mask, labels, device, out_dir,
         n_joints=n_joints, tgt_range=tgt_range,

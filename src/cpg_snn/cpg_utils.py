@@ -376,7 +376,7 @@ def estimate_gait_period(spike_times, spike_neurons, out_dir,
 # 4.  Phase encoding
 # ═══════════════════════════════════════════════════════════════════
 
-def encode_spike_events(spike_times, spike_neurons, gait_period, N=4):
+def encode_spike_events(spike_times, spike_neurons, gait_period, N=4, use_phase=True):
     """
     Per event → [one_hot_neuron(N), sin(φ_abs), cos(φ_abs),
                                     sin(φ_rel), cos(φ_rel)]  (N+4 dims).
@@ -418,13 +418,16 @@ def encode_spike_events(spike_times, spike_neurons, gait_period, N=4):
     one_hot = np.zeros((len(spike_times), N), dtype=np.float32)
     one_hot[np.arange(len(spike_times)), spike_neurons] = 1.0
 
-    base_feats = np.concatenate(
-        [one_hot,
-         np.sin(abs_phase)[:, None],
-         np.cos(abs_phase)[:, None],
-         #np.sin(rel_phase)[:, None],
-         #np.cos(rel_phase)[:, None]
-         ], axis=1)   # (E, N+4)
+    if use_phase:
+        base_feats = np.concatenate(
+            [one_hot,
+            np.sin(abs_phase)[:, None],
+            np.cos(abs_phase)[:, None],
+            #np.sin(rel_phase)[:, None],
+            #np.cos(rel_phase)[:, None]
+            ], axis=1)   # (E, N+4)
+    else:
+        base_feats = one_hot
 
     print(f"  Base feature matrix : {base_feats.shape}"
           f"  ({N} one-hot + sin/cos abs-phase + sin/cos rel-phase)"
