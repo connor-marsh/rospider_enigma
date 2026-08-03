@@ -25,6 +25,17 @@ def savefig(fig, out_dir, name, dpi=150, bbox_inches=None):
     print(f"  [saved] {path}")
     return path
 
+def plot_blif_cpg(spikes, vms, out_dir, n_show=400):
+
+    fig, axes = plt.subplots(1, 1)
+    for i in range(spikes.shape[0]):
+        axes.plot(spikes[i, :n_show], label=f"Neuron {i+1} spikes")
+    axes.legend()
+
+
+    plt.suptitle("BLIF CPG Spikes", fontsize=12)
+    plt.tight_layout()
+    savefig(fig, out_dir, "blif_cpg.png")
 
 def plot_cpg_vm(vm_record, out_dir, n_show=30_000):
     t_axis = vm_record["t"] if isinstance(vm_record, dict) else vm_record.t
@@ -217,7 +228,7 @@ def plot_burst_gait_overlay(spike_times, spike_neurons, gait_period, threshold, 
     savefig(fig, out_dir, "burst_gait_overlay.png")
 
 
-def plot_inference(model, dataset, device, out_dir, n_joints, n_gaits, sample_idx=0, N=4):
+def plot_inference(model, dataset, device, out_dir, n_joints, n_gaits, sample_idx=0, N=4, use_phase=True):
     model.eval()
     X_np, y_np, lbl = dataset[sample_idx]
     gait_idx_t = lbl.unsqueeze(0).to(device)
@@ -256,7 +267,7 @@ def plot_inference(model, dataset, device, out_dir, n_joints, n_gaits, sample_id
     ax0b.legend(fontsize=7, loc="upper right")
 
     ax_gait = fig.add_subplot(gs[0, 1])
-    N_feat = N + 2
+    N_feat = N + 2 if use_phase else N
     gait_fl = X_np[:, N_feat:].numpy()
     for g in range(n_gaits):
         ax_gait.plot(gait_fl[:, g], label=f"Gait {g}", lw=1.5, color=colors[g % len(colors)])

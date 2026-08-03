@@ -78,7 +78,7 @@ from pathlib import Path
 
 from training_utils import GaitDataset, build_dataset, eval_epoch, export_to_onnx, make_gait_weighted_criterion, make_loader, train_epoch, train_val_test_split, upsample_gait_tables
 from cpg_utils import CPG_SNN, encode_spike_events, estimate_gait_period, run_blif_cpg, sigmoid, neuron_eqs, make_network
-from plotting_utils import plot_burst_gait_overlay, plot_cpg_vm, plot_gait_reconstruction, plot_inference, plot_spike_events, plot_training_curves
+from plotting_utils import plot_blif_cpg, plot_burst_gait_overlay, plot_cpg_vm, plot_gait_reconstruction, plot_inference, plot_spike_events, plot_training_curves
 
 
 def run_training(model, train_loader, val_pure_loader, val_trans_loader,
@@ -169,10 +169,10 @@ def main():
                              "for reliable phase tracking.")
     parser.add_argument("--hidden",          type=int,   default=128)
     parser.add_argument("--beta",            type=float, default=0.9)
-    parser.add_argument("--use_phase",       type=bool, default=True)
+    parser.add_argument("--use_phase",       type=bool, default=False)
 
     # ── Training ─────────────────────────────────────────────────
-    parser.add_argument("--epochs",          type=int,   default=100)
+    parser.add_argument("--epochs",          type=int,   default=30)
     parser.add_argument("--lr",              type=float, default=1e-3)
     parser.add_argument("--batch",           type=int,   default=256)
     parser.add_argument("--val",             type=float, default=0.15)
@@ -213,7 +213,8 @@ def main():
     #     spike_thresh=args.spike_thresh,
     # )
 
-    spike_times, spike_neurons = run_blif_cpg(N=N, t_max = args.tmax, cpg_start_time=args.cpg_start_time)
+    spike_times, spike_neurons, spike_array, vms = run_blif_cpg(N=N, t_max = args.tmax, cpg_start_time=args.cpg_start_time)
+    plot_blif_cpg(spike_array, vms, out_dir, n_show=400)
     
     print(f"      Collected {len(spike_times)} spike events "
           f"over t=[{spike_times[0]:.0f}, {spike_times[-1]:.0f}]")
@@ -240,7 +241,7 @@ def main():
     ]
     gait_names = gait_names[0:8:2]
     
-    # gait_names=["bittle_wkF", "bittle_bk", "bittle_wkL", "bittle_wkR"]
+    gait_names=["bittle_wkF", "bittle_bk", "bittle_wkL", "bittle_wkR"]
 
     gait_tables_orig = []
     for name in gait_names:
@@ -329,7 +330,7 @@ def main():
     plot_training_curves(history, out_dir)
     full_ds = GaitDataset(X, y, labels)
     plot_inference(model, full_ds, device, out_dir,
-                   n_joints=n_joints, n_gaits=len(gait_tables), N=N)
+                   n_joints=n_joints, n_gaits=len(gait_tables), N=N, use_phase=args.use_phase)
     plot_gait_reconstruction(
         model, X, y, pure_mask, labels, device, out_dir,
         n_joints=n_joints, tgt_range=tgt_range,

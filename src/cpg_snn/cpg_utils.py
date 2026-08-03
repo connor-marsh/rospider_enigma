@@ -245,7 +245,7 @@ def run_blif_cpg(t_max=2000, N=4, cpg_start_time=100):
             if bn_spikes[i][t - cpg_start_time]:
                 spike_times.append(t)
                 spike_neurons.append(i)
-    return np.array(spike_times), np.array(spike_neurons)
+    return np.array(spike_times), np.array(spike_neurons), bn_spikes, np.array(v_ms).T
 
 
 def sigmoid(x, b=5.0, dsyn=-1.0):
