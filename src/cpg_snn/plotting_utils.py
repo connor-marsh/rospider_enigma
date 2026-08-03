@@ -297,6 +297,7 @@ def plot_inference(model, dataset, device, out_dir, n_joints, n_gaits, sample_id
 
 
 def plot_inference_summary(rec_pred, rec_true, rec_gait_idx, n_joints, gait_names, out_dir, n_samples_per_gait=500):
+    out_dir = out_dir / "recons_inference"
     n_gaits = len(gait_names)
     all_true_denorm, all_pred_denorm = [], []
 
@@ -383,6 +384,7 @@ def plot_inference_summary(rec_pred, rec_true, rec_gait_idx, n_joints, gait_name
 
 
 def plot_gait_reconstruction(model, X, y, pure_mask, labels, device, out_dir, n_joints, tgt_range, gait_names, n_samples=300):
+    out_dir = out_dir / "recons_training"
     model.eval()
     tgt_min, tgt_max = tgt_range
     scale = (tgt_max - tgt_min) / 2.0
@@ -431,7 +433,7 @@ def plot_gait_reconstruction(model, X, y, pure_mask, labels, device, out_dir, n_
                 axes[j // cols][j % cols].set_visible(False)
             plt.suptitle(f"{name} — {wtype} ({len(idx)} samples)", fontsize=11, fontweight="bold")
             plt.tight_layout()
-            savefig(fig, out_dir, f"recons/recon_{name}_{suffix}.png")
+            savefig(fig, out_dir, f"recon_{name}_{suffix}.png")
 
     vmax = np.nanmax(np.stack([rmse_pure, rmse_trans]))
     fig, axes = plt.subplots(1, 2, figsize=(max(8, n_joints * 1.2), n_gaits + 2.0))
