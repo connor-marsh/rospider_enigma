@@ -598,14 +598,16 @@ def export_to_onnx(model, seq_len, n_in, out_dir, device,
     model.eval()
     dummy_x   = torch.zeros(seq_len, 1, n_in, device=device)
     onnx_path = out_dir / "cpg_snn.onnx"
+    model_to_export = model._orig_mod if hasattr(model, "_orig_mod") else model
     torch.onnx.export(
-        model, dummy_x, str(onnx_path),
-        export_params=True, opset_version=14,
+        model_to_export, dummy_x, str(onnx_path),
+        export_params=True, opset_version=18,
         do_constant_folding=True,
         input_names=["spike_window"],
         output_names=["joint_angles"],
         dynamic_axes={"spike_window": {1: "batch_size"},
-                      "joint_angles": {0: "batch_size"}})
+                      "joint_angles": {0: "batch_size"}},
+        dynamo=False)
     print(f"  [saved] ONNX → {onnx_path}")
 
     try:
@@ -694,7 +696,7 @@ def main():
     parser.add_argument("--beta",            type=float, default=0.9)
 
     # ── Training ─────────────────────────────────────────────────
-    parser.add_argument("--epochs",          type=int,   default=200)
+    parser.add_argument("--epochs",          type=int,   default=100)
     parser.add_argument("--lr",              type=float, default=1e-3)
     parser.add_argument("--batch",           type=int,   default=256)
     parser.add_argument("--val",             type=float, default=0.15)
@@ -709,7 +711,7 @@ def main():
     parser.add_argument("--seed",            type=int,   default=42)
     parser.add_argument("--out_dir",         type=str,   default="outputs")
 
-    N = 6
+    N = 4
 
     args = parser.parse_args()
 
@@ -762,6 +764,10 @@ def main():
     ]
     gait_names = base_gait_names + mirrored_gait_names
 
+    base_gait_names=["bittle_wkF", "bittle_bk", "bittle_wkL", "bittle_wkR"]
+    gait_names=base_gait_names
+    mirrored_gait_names=[]
+
     gait_tables_orig = []
     for name in base_gait_names:
         gait_table = np.loadtxt(f"{this_file_dir}/gaits/{name}.csv",
@@ -777,8 +783,8 @@ def main():
     # gait_tables_orig = [wkF, bk, wkL, wkR]
     # gait_names       = ["wkF", "bk", "wkL", "wkR"]
 
-    gait_names = gait_names[0:8:2]
-    gait_tables_orig = gait_tables_orig[0:8:2]
+    # gait_names = gait_names[0:8:2]
+    # gait_tables_orig = gait_tables_orig[0:8:2]
 
     for name, g in zip(gait_names, gait_tables_orig):
         print(f"      {name:>4s} : {g.shape[0]} rows × {g.shape[1]} joints (original)")
@@ -858,8 +864,8 @@ def main():
     print("\n[6/6] Generating plots and exporting ...")
     plot_training_curves(history, out_dir)
     full_ds = GaitDataset(X, y, labels)
-    plot_inference(model, full_ds, device, out_dir,
-                   n_joints=n_joints, n_gaits=len(gait_tables))
+    # plot_inference(model, full_ds, device, out_dir,
+    #                n_joints=n_joints, n_gaits=len(gait_tables))
     plot_gait_reconstruction(
         model, X, y, pure_mask, labels, device, out_dir,
         n_joints=n_joints, tgt_range=tgt_range,
@@ -871,6 +877,7 @@ def main():
         "global_min":      tgt_range[0],
         "global_max":      tgt_range[1],
         "seq_len":         args.seq_len,
+        "n_neurons":       N,
         "n_gaits":         len(gait_tables),
         "n_joints":        n_joints,
         "gait_names":      gait_names,

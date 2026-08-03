@@ -190,6 +190,7 @@ def run_inference(cfg, onnx_path, out_dir, args,
     global_min      = float(cfg["global_min"])
     global_max      = float(cfg["global_max"])
     seq_len         = int(cfg["seq_len"])
+    n_neurons         = int(cfg["n_neurons"])
     n_gaits         = int(cfg["n_gaits"])
     n_joints        = int(cfg["n_joints"])
     n_in            = int(cfg["n_in"])
@@ -218,6 +219,10 @@ def run_inference(cfg, onnx_path, out_dir, args,
     ]
     gait_names = base_gait_names + mirrored_gait_names
 
+    base_gait_names=["bittle_wkF", "bittle_bk", "bittle_wkL", "bittle_wkR"]
+    gait_names=base_gait_names
+    mirrored_gait_names=[]
+
     GAIT_TABLES_ORIG = []
     for name in base_gait_names:
         gait_table = np.loadtxt(f"{this_file_dir}/gaits/{name}.csv",
@@ -230,8 +235,8 @@ def run_inference(cfg, onnx_path, out_dir, args,
                                 delimiter=",", dtype=np.float32)
         GAIT_TABLES_ORIG.append(np.flip(gait_table, axis=0).copy())
 
-    gait_names = gait_names[0:8:2]
-    GAIT_TABLES_ORIG = GAIT_TABLES_ORIG[0:8:2]
+    # gait_names = gait_names[0:8:2]
+    # GAIT_TABLES_ORIG = GAIT_TABLES_ORIG[0:8:2]
 
     GAIT_TABLES = upsample_gait_tables(
         GAIT_TABLES_ORIG, gait_names, target_rows)
@@ -239,7 +244,7 @@ def run_inference(cfg, onnx_path, out_dir, args,
 
     # ── Inference components ─────────────────────────────────────
     predictor = ONNXGaitPredictor(onnx_path)
-    cpg = BLIF_CPG(N=6, t_max=t_max)
+    cpg = BLIF_CPG(N=n_neurons, t_max=t_max)
 
     if gait_schedule:
         schedule = sorted(gait_schedule, key=lambda x: x[0])
@@ -296,8 +301,6 @@ def run_inference(cfg, onnx_path, out_dir, args,
         spikes, _, t_now = cpg.step()
         steps_done += 1
 
-        n_neurons = len(spikes)
-
 
         abs_phase_rad = float(
             2.0 * np.pi * (t_now % gait_period) / gait_period)
@@ -315,6 +318,7 @@ def run_inference(cfg, onnx_path, out_dir, args,
 
         # This if statement allows for both phase and non-phase included versions of the model
         if n_in - n_neurons - n_gaits == 2:
+            print("phase")
             feat[n_neurons] = float(np.sin(abs_phase_rad))
             feat[n_neurons+1] = float(np.cos(abs_phase_rad))
             feat[n_neurons+2 + active_gait] = 1.0
