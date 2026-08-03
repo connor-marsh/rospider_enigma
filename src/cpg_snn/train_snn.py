@@ -167,7 +167,7 @@ def main():
                         help="Spike events per input window. "
                              "Needs to span ~1 full gait cycle (~32 spikes) "
                              "for reliable phase tracking.")
-    parser.add_argument("--hidden",          type=int,   default=128)
+    parser.add_argument("--hidden",          type=int,   default=256)
     parser.add_argument("--beta",            type=float, default=0.9)
     parser.add_argument("--use_phase",       type=bool, default=False)
 
