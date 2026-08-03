@@ -307,7 +307,6 @@ def run_inference(cfg, onnx_path, out_dir, args,
 
         # This if statement allows for both phase and non-phase included versions of the model
         if n_in - n_neurons - n_gaits == 2:
-            print("phase")
             feat[n_neurons] = float(np.sin(abs_phase_rad))
             feat[n_neurons+1] = float(np.cos(abs_phase_rad))
             feat[n_neurons+2 + active_gait] = 1.0

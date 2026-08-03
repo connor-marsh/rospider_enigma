@@ -1,0 +1,21 @@
+{
+  "gait_period": 254.0,
+  "burst_threshold": 30.194920182890034,
+  "global_min": -5.204385757446289,
+  "global_max": 71.10956573486328,
+  "seq_len": 10.0,
+  "n_neurons": 4.0,
+  "n_gaits": 4.0,
+  "n_joints": 8.0,
+  "gait_names": [
+    "bittle_wkF",
+    "bittle_bk",
+    "bittle_wkL",
+    "bittle_wkR"
+  ],
+  "chunk_size": 1,
+  "spike_thresh": -2.0,
+  "cpg_start_time": 90.0,
+  "target_rows": 54.0,
+  "n_in": 8.0
+}

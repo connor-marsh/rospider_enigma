@@ -59,8 +59,9 @@ qtcreator-*
 CATKIN_IGNORE
 
 # Model files
-*.pt
+src/large_models
+src/large_models_examples
 
 src/cpg_snn/outputs
 
-!src/cpg_snn/saved_models/*
+!src/cpg_snn/saved_models
