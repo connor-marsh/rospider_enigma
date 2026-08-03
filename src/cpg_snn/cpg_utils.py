@@ -6,8 +6,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-torch.set_float32_matmul_precision('high')
+
 import snntorch as snn
 from snntorch import surrogate
 from scipy.stats import gaussian_kde
