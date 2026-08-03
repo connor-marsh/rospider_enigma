@@ -163,7 +163,7 @@ def main():
                         help="Upward vm crossing threshold for spike detection")
 
     # ── Network ──────────────────────────────────────────────────
-    parser.add_argument("--seq_len",         type=int,   default=3,
+    parser.add_argument("--seq_len",         type=int,   default=20,
                         help="Spike events per input window. "
                              "Needs to span ~1 full gait cycle (~32 spikes) "
                              "for reliable phase tracking.")
@@ -172,7 +172,7 @@ def main():
     parser.add_argument("--use_phase",       type=bool, default=False)
 
     # ── Training ─────────────────────────────────────────────────
-    parser.add_argument("--epochs",          type=int,   default=30)
+    parser.add_argument("--epochs",          type=int,   default=200)
     parser.add_argument("--lr",              type=float, default=1e-3)
     parser.add_argument("--batch",           type=int,   default=256)
     parser.add_argument("--val",             type=float, default=0.15)

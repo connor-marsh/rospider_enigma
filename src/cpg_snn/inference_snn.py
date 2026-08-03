@@ -208,35 +208,24 @@ def run_inference(cfg, onnx_path, out_dir, args,
     print(f"  Stepper params from config: cpg_start_time={cpg_start_time}")
 
     this_file_dir = os.path.dirname(os.path.abspath(__file__))
+
     # Upsample gait tables to match training target resolution
-    base_gait_names = [
-            "tripod", "tripod_huge", "tripod_right", "tripod_huge_right",
-            "ripple", "ripple_tiny", "ripple_right", "ripple_tiny_right",
-        ]
-    mirrored_gait_names = [
+    gait_names = [
+        "tripod", "tripod_huge", "tripod_right", "tripod_huge_right",
+        "ripple", "ripple_tiny", "ripple_right", "ripple_tiny_right",
         "tripod_backwards", "tripod_huge_backwards", "tripod_left", "tripod_huge_left",
         "ripple_backwards", "ripple_tiny_backwards", "ripple_left", "ripple_tiny_left",
     ]
-    gait_names = base_gait_names + mirrored_gait_names
-
-    base_gait_names=["bittle_wkF", "bittle_bk", "bittle_wkL", "bittle_wkR"]
-    gait_names=base_gait_names
-    mirrored_gait_names=[]
+    gait_names = gait_names[0:8:2]
+    
+    gait_names=["bittle_wkF", "bittle_bk", "bittle_wkL", "bittle_wkR"]
 
     GAIT_TABLES_ORIG = []
-    for name in base_gait_names:
+    for name in gait_names:
         gait_table = np.loadtxt(f"{this_file_dir}/gaits/{name}.csv",
                                 delimiter=",", dtype=np.float32)
         GAIT_TABLES_ORIG.append(gait_table)
 
-    for name in mirrored_gait_names:
-        base_name = name.replace("_backwards", "").replace("_left", "_right")
-        gait_table = np.loadtxt(f"{this_file_dir}/gaits/{base_name}.csv",
-                                delimiter=",", dtype=np.float32)
-        GAIT_TABLES_ORIG.append(np.flip(gait_table, axis=0).copy())
-
-    # gait_names = gait_names[0:8:2]
-    # GAIT_TABLES_ORIG = GAIT_TABLES_ORIG[0:8:2]
 
     GAIT_TABLES = upsample_gait_tables(
         GAIT_TABLES_ORIG, gait_names, target_rows)

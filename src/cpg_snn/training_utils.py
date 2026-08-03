@@ -280,7 +280,7 @@ def build_dataset(base_feats, event_phases, gait_tables,
     print(f"  Transition windows : {(~pure_mask).sum():>8,}"
           f"  (actual frac = {actual_frac:.2f})")
     print(f"  Total              : {len(X):>8,}")
-    print(f"  Feature dim        : {X.shape[2]}  (one-hot + 2 phase + {n_gaits} gait flag)")
+    print(f"  Feature dim        : {X.shape[2]}  (one-hot + 2 or 0 phases + {n_gaits} gait flag)")
 
     return X, y, (tgt_min, tgt_max), pure_mask, labels
 
