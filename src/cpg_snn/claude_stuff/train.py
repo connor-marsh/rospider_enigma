@@ -94,6 +94,7 @@ from scipy.interpolate import interp1d
 
 import torch
 import torch.nn as nn
+torch.set_float32_matmul_precision('high')
 
 import matplotlib
 matplotlib.use("Agg")
@@ -660,22 +661,30 @@ def spike_fn(x, slope=25.0):
         surr = x / (slope*|x| + 1)      d(surr)/dx = 1 / (slope*|x| + 1)^2
         hard = (x > 0)                  the forward value we want
 
-        hard.detach() + surr - surr.detach()
+        hard + (surr - surr.detach())
 
-    Forward:  surr - surr.detach() is numerically zero, so the returned
-              value is exactly `hard` -- clean 0/1 spikes.
-    Backward: only the tracked "+ surr" term carries gradient (both
-              .detach() terms contribute none), so the gradient is
+    Forward:  the parentheses matter.  `surr - surr.detach()` is a value
+              minus a bit-identical copy of itself, so it is EXACTLY 0.0
+              in IEEE-754 for any finite input, and hard + 0.0 == hard
+              bit-for-bit.  Written unparenthesised as
+              `hard.detach() + surr - surr.detach()` it evaluates as
+              (hard + surr) - surr, and float addition is not associative,
+              so spikes come back as 1.0 +/- 1 ulp (~1.2e-7 in float32)
+              instead of exactly 1.0.  Numerically irrelevant next to TF32
+              matmul error, but the grouped form makes the parity test a
+              hard == 0.0 gate instead of a judgement call.
+    Backward: only the tracked `surr` term carries gradient (the .detach()
+              term contributes none), so the gradient is
               d(surr)/dx = 1/(slope*|x| + 1)^2, character-for-character
               what FastSigmoidSpike.backward returned.
 
     Verify with verify_spike_fn_parity.py before trusting a training run:
     both the forward and gradient diffs against the old version should
-    come out at 0.0.
+    come out at exactly 0.0.
     """
     surr = x / (slope * x.abs() + 1.0)
     hard = (x > 0).to(x.dtype)
-    return hard.detach() + surr - surr.detach()
+    return hard + (surr - surr.detach())
 
 
 def init_beta_logit(shape, tau_min, tau_max, generator=None):
@@ -1202,17 +1211,26 @@ def main():
         description="Bursting-LIF CPG -> leg-grouped stateful SNN")
 
     # CPG
-    ap.add_argument("--tmax",   type=int,   default=150_000)
+    ap.add_argument("--tmax",   type=int,   default=50_000,
+                    help="Steps of CPG spike train to collect. Lowered from "
+                         "150k: the CPG is exactly periodic after warmup, so "
+                         "150k was ~590 duplicate copies of the same ~254-step "
+                         "cycle. Phase alignment and switch timing are "
+                         "randomised by StreamSampler independently of this.")
     ap.add_argument("--warmup", type=int,   default=2_000)
     ap.add_argument("--i_app",  type=float, default=8.0)
 
     # network
     ap.add_argument("--hidden",     type=int,   default=256)
     ap.add_argument("--tau_min",    type=float, default=2.0)
-    ap.add_argument("--tau_max",    type=float, default=500.0,
-                    help="Longest membrane time constant. Must comfortably "
-                         "exceed the CPG period (~254 steps) or the network "
-                         "cannot hold phase without a phase input.")
+    ap.add_argument("--tau_max",    type=float, default=256.0,
+                    help="Longest membrane time constant, in steps. Lowered "
+                         "from 500: what the network actually has to hold is "
+                         "'which neuron burst last, and how long ago', and "
+                         "inter-burst onset spacing is only ~63 steps "
+                         "(silent gap ~34). One full CPG period (~254) is "
+                         "the natural ceiling; 500 was overkill. Sweep "
+                         "150-256.")
     ap.add_argument("--cross_gain", type=float, default=0.25,
                     help="Initial strength of non-own-neuron drive into a leg "
                          "group. 0.0 = strictly one neuron per leg.")
@@ -1222,7 +1240,12 @@ def main():
     ap.add_argument("--epochs",           type=int,   default=300)
     ap.add_argument("--chunks_per_epoch", type=int,   default=40)
     ap.add_argument("--val_chunks",       type=int,   default=8)
-    ap.add_argument("--bptt",             type=int,   default=512)
+    ap.add_argument("--bptt",             type=int,   default=256,
+                    help="Gradient truncation horizon. NOT the network's "
+                         "receptive field -- state is carried and detached "
+                         "across chunks, so the forward pass sees unbounded "
+                         "history. 256 ~= one full CPG period. Sweep "
+                         "128/256/512 at fixed batch*bptt.")
     ap.add_argument("--batch",            type=int,   default=128,
                     help="Stream heads per gradient step. Raised from 32: at "
                          "these sizes the timestep loop is kernel-launch "
@@ -1233,7 +1256,7 @@ def main():
     ap.add_argument("--clip",             type=float, default=1.0)
     ap.add_argument("--switch_min",       type=int,   default=600)
     ap.add_argument("--switch_max",       type=int,   default=3000)
-    ap.add_argument("--settle",           type=int,   default=300,
+    ap.add_argument("--settle",           type=int,   default=100,
                     help="Steps after a gait switch counted as 'post-switch'.")
     ap.add_argument("--val_frac",         type=float, default=0.15)
     ap.add_argument("--phase_zero",       type=float, default=0.0,
