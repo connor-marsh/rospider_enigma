@@ -26,6 +26,7 @@ Requires from the training run:
 
 import argparse
 import json
+import os
 import threading as _threading
 import time
 from pathlib import Path
@@ -376,7 +377,10 @@ def main():
     ap.add_argument("--onnx_threads", type=int, default=2)
     args = ap.parse_args()
 
-    md  = Path(args.model_dir)
+    this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    out_dir = Path(this_file_dir + "/" + args.out_dir)
+
+    md  = Path(this_file_dir + "/" + args.model_dir)
     cfg = json.loads((md / "cpg_lif_snn_config.json").read_text())
     onnx_path = md / "cpg_lif_snn_step.onnx"
 
@@ -384,14 +388,14 @@ def main():
     q = args.t_max // 4
     schedule = [(0, 0), (q, 1), (2 * q, 2), (3 * q, 3)]
 
-    res = run_inference(cfg, onnx_path, Path(args.out_dir),
+    res = run_inference(cfg, onnx_path, Path(out_dir),
                         t_max=args.t_max, gait_schedule=schedule,
                         record=True, robot=not args.no_robot,
                         serial_port=args.serial_port,
                         servo_every=args.servo_every,
                         onnx_threads=args.onnx_threads)
     if res is not None:
-        plot_run(res, Path(args.out_dir))
+        plot_run(res, Path(out_dir))
 
 
 if __name__ == "__main__":
