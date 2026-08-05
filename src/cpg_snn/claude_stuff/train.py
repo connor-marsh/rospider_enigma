@@ -84,6 +84,10 @@ import argparse
 import json
 import math
 import os
+import platform
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -111,6 +115,54 @@ LEG_COLS   = [(0, 4), (1, 5), (2, 6), (3, 7)]
 SERVO_BASE = 8
 N_LEGS     = 4
 N_JOINTS   = 8
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 0b.  Small utilities
+# ═══════════════════════════════════════════════════════════════════
+
+def json_safe(obj):
+    """
+    Recursively coerce numpy scalars/arrays, Paths and tuples into
+    JSON-serialisable types.
+
+    Worth having: the config is written at the very END of a training run,
+    so a bare json.dump choking on a np.float32 would throw away the whole
+    run's artifacts at the last possible moment.
+    """
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return json_safe(obj.tolist())
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        f = float(obj)
+        return f if math.isfinite(f) else None      # NaN/inf are not valid JSON
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
+
+
+def git_info():
+    """Short commit hash + dirty flag of the repo this file lives in."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    def run(cmd):
+        return subprocess.check_output(
+            cmd, cwd=here, stderr=subprocess.DEVNULL, timeout=5
+        ).decode().strip()
+    try:
+        commit = run(["git", "rev-parse", "--short", "HEAD"])
+        dirty  = bool(run(["git", "status", "--porcelain"]))
+        return {"commit": commit, "dirty": dirty}
+    except Exception:                                    # noqa: BLE001
+        return {"commit": None, "dirty": None}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -908,66 +960,86 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
     print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val':>10}  "
           f"{'Val(post-sw)':>13}  {'LR':>9}")
     print("  " + "-" * 60)
+    print("  (Ctrl+C stops training and proceeds to export)")
 
-    for epoch in range(1, args.epochs + 1):
-        # ---- train -------------------------------------------------
-        model.train()
-        state = model.init_state(args.batch, device)
-        tot, nb = 0.0, 0
-        for _ in range(args.chunks_per_epoch):
-            x, g, y, m, sw, rst = tr_sampler.next_chunk(args.bptt)
-            x, g, y, m = x.to(device), g.to(device), y.to(device), m.to(device)
-            state = apply_reset(detach_state(state), rst.to(device))
+    try:
+        for epoch in range(1, args.epochs + 1):
+            # ---- train -------------------------------------------------
+            model.train()
+            state = model.init_state(args.batch, device)
+            tot, nb = 0.0, 0
+            for _ in range(args.chunks_per_epoch):
+                x, g, y, m, sw, rst = tr_sampler.next_chunk(args.bptt)
+                x, g, y, m = (x.to(device), g.to(device),
+                              y.to(device), m.to(device))
+                state = apply_reset(detach_state(state), rst.to(device))
 
-            pred, state = model(x, g, state)
-            loss = masked_loss(pred, y, m, g, gait_w)
+                pred, state = model(x, g, state)
+                loss = masked_loss(pred, y, m, g, gait_w)
 
-            opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-            opt.step()
-            tot += loss.item(); nb += 1
-        sched.step()
-        tr_loss = tot / max(nb, 1)
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+                opt.step()
+                tot += loss.item(); nb += 1
+            sched.step()
+            tr_loss = tot / max(nb, 1)
 
-        # ---- validate ----------------------------------------------
-        model.eval()
-        vstate = model.init_state(args.batch, device)
-        vtot, vsw_tot, vn, vsw_n = 0.0, 0.0, 0, 0
-        with torch.no_grad():
-            for _ in range(args.val_chunks):
-                x, g, y, m, sw, rst = va_sampler.next_chunk(args.bptt)
-                x, g, y, m = x.to(device), g.to(device), y.to(device), m.to(device)
-                sw = sw.to(device)
-                vstate = apply_reset(vstate, rst.to(device))
-                pred, vstate = model(x, g, vstate)
+            # ---- validate ----------------------------------------------
+            model.eval()
+            vstate = model.init_state(args.batch, device)
+            vtot, vsw_tot, vn, vsw_n = 0.0, 0.0, 0, 0
+            with torch.no_grad():
+                for _ in range(args.val_chunks):
+                    x, g, y, m, sw, rst = va_sampler.next_chunk(args.bptt)
+                    x, g, y, m = (x.to(device), g.to(device),
+                                  y.to(device), m.to(device))
+                    sw = sw.to(device)
+                    vstate = apply_reset(vstate, rst.to(device))
+                    pred, vstate = model(x, g, vstate)
 
-                vtot += masked_loss(pred, y, m, g).item(); vn += 1
+                    vtot += masked_loss(pred, y, m, g).item(); vn += 1
 
-                # "post-switch" window: args.settle steps after each switch
-                post = torch.zeros_like(sw)
-                idx = sw.nonzero(as_tuple=False)
-                for t_i, b_i in idx:
-                    post[t_i:min(t_i + args.settle, sw.shape[0]), b_i] = 1.0
-                if post.sum() > 0:
-                    vsw_tot += masked_loss(pred, y, m * post, g).item(); vsw_n += 1
+                    # "post-switch" window: args.settle steps after each switch
+                    post = torch.zeros_like(sw)
+                    idx = sw.nonzero(as_tuple=False)
+                    for t_i, b_i in idx:
+                        post[t_i:min(t_i + args.settle, sw.shape[0]), b_i] = 1.0
+                    if post.sum() > 0:
+                        vsw_tot += masked_loss(pred, y, m * post, g).item()
+                        vsw_n   += 1
 
-        va_loss = vtot / max(vn, 1)
-        vsw     = vsw_tot / max(vsw_n, 1) if vsw_n else float("nan")
+            va_loss = vtot / max(vn, 1)
+            vsw     = vsw_tot / max(vsw_n, 1) if vsw_n else float("nan")
 
-        hist["train"].append(tr_loss)
-        hist["val"].append(va_loss)
-        hist["val_sw"].append(vsw)
+            # Appended together, so an interrupt can never leave these
+            # three lists at different lengths.
+            hist["train"].append(tr_loss)
+            hist["val"].append(va_loss)
+            hist["val_sw"].append(vsw)
 
-        flag = ""
-        if va_loss < best:
-            best = va_loss
-            torch.save(model.state_dict(), best_path)
-            flag = " *"
+            flag = ""
+            if va_loss < best:
+                best = va_loss
+                torch.save(model.state_dict(), best_path)
+                flag = " *"
 
-        if epoch % args.log_every == 0 or epoch == 1:
-            print(f"  {epoch:>6}  {tr_loss:>10.6f}  {va_loss:>10.6f}  "
-                  f"{vsw:>13.6f}  {opt.param_groups[0]['lr']:>9.2e}{flag}")
+            if epoch % args.log_every == 0 or epoch == 1:
+                print(f"  {epoch:>6}  {tr_loss:>10.6f}  {va_loss:>10.6f}  "
+                      f"{vsw:>13.6f}  {opt.param_groups[0]['lr']:>9.2e}{flag}")
+
+    except KeyboardInterrupt:
+        # Return normally rather than propagating: main() then falls through
+        # to plots + config + ONNX export using the best checkpoint so far,
+        # so an aborted run still produces deployable artifacts.
+        done = len(hist["train"])
+        print()
+        print("  " + "-" * 60)
+        print(f"  [INTERRUPT] Ctrl+C received during epoch {done + 1}.")
+        print(f"              {done} epoch(s) completed and recorded; the "
+              f"partial epoch is discarded.")
+        print(f"              Best val MSE so far : {best:.6f}")
+        print( "              Stopping training and proceeding to export.")
 
     print("  " + "-" * 60)
     return best, hist
@@ -1197,7 +1269,7 @@ def export_onnx(model, out_dir, device, cfg):
 
     cfg_path = out_dir / "cpg_lif_snn_config.json"
     with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump(json_safe(cfg), f, indent=2, default=str)
     print(f"    [saved] config -> {cfg_path}")
     return path
 
@@ -1284,7 +1356,7 @@ def main():
     spikes = run_cpg(N=4, tmax=args.tmax, warmup=args.warmup, i_app=args.i_app)
 
     print("\n[2/6] Burst structure & phase ...")
-    onsets, period, neuron_offsets, _ = analyse_cpg(spikes, out_dir)
+    onsets, period, neuron_offsets, burst_thresholds = analyse_cpg(spikes, out_dir)
     plot_cpg_raster(spikes, onsets, out_dir)
 
     phase = cycle_phase(len(spikes), onsets[0])
@@ -1369,12 +1441,18 @@ def main():
           f"vs CPG period {period:.0f}")
     gait_w = make_gait_weights(GAIT_TABLES_ORIG, device)
 
+    # Defined for both branches so the config can always report them.
+    best     = float("nan")
+    hist     = {"train": [], "val": [], "val_sw": []}
+    final_lr = float(args.lr)
+
     if not args.dry_run:
         opt   = torch.optim.Adam(model.parameters(), lr=args.lr)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=args.epochs, eta_min=1e-5)
         best, hist = run_training(model, tr_sampler, va_sampler, opt, sched,
                                   device, args, gait_w, out_dir)
+        final_lr = float(opt.param_groups[0]["lr"])
         model.load_state_dict(torch.load(out_dir / "best_model.pt",
                                          map_location=device))
         print(f"\n  best val MSE : {best:.6f}")
@@ -1390,8 +1468,18 @@ def main():
     plot_transition(model, spikes, targets, device, out_dir, tgt_range,
                     t0=t_eval, g_from=0, g_to=1)
 
+    epochs_done = len(hist["train"])
+    grad_steps  = epochs_done * args.chunks_per_epoch
+
     cfg = {
+        # ── identity ──────────────────────────────────────────────
         "model":            "cpg_lif_leggrouped_stateful",
+        "config_version":   2,
+        "created_utc":      datetime.now(timezone.utc).isoformat(
+                                timespec="seconds"),
+
+        # ── deployment-critical: inference.py reads these by name at
+        #    the top level.  Do not move or rename them. ───────────
         "hidden":           args.hidden,
         "hidden_per_leg":   model.Hg,
         "n_gaits":          len(gait_tables),
@@ -1415,8 +1503,99 @@ def main():
             "W": CPG_W.tolist(), "warmup": args.warmup,
         },
         "per_joint_rmse_deg": rmse.tolist(),
+
+        # ── full argparse namespace, verbatim ──────────────────────
+        "args": vars(args),
+
+        # ── run provenance ────────────────────────────────────────
+        "run": {
+            "git":            git_info(),
+            "argv":           sys.argv,
+            "cwd":            os.getcwd(),
+            "script":         os.path.abspath(__file__),
+            "out_dir":        str(out_dir.resolve()),
+            "hostname":       platform.node(),
+            "platform":       platform.platform(),
+            "processor":      platform.processor(),
+            "python":         sys.version.split()[0],
+            "torch":          torch.__version__,
+            "numpy":          np.__version__,
+            "device":         str(device),
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_device":    (torch.cuda.get_device_name(0)
+                               if torch.cuda.is_available() else None),
+            "torch_compile_step":       device.type == "cuda",
+            "float32_matmul_precision": "high",
+            "seed":           args.seed,
+        },
+
+        # ── model detail (not needed to run, useful to reproduce) ──
+        "model_detail": {
+            "class":            "LegGroupedSNN",
+            "n_params":         int(n_par),
+            "tau_min":          float(args.tau_min),
+            "tau_max":          float(args.tau_max),
+            "cross_gain_init":  float(args.cross_gain),
+            "slope":            float(args.slope),
+            "thresh":           1.0,
+            "surrogate":        "fast-sigmoid straight-through "
+                                "(plain ops, bit-exact forward)",
+            "state_tensors":    ["mem1", "spk1", "mem2", "spk2", "memo"],
+            "state_shape":      [1, N_LEGS, model.Hg],
+            "onnx_inputs":      ["spikes", "gait", "mem1_in", "spk1_in",
+                                 "mem2_in", "spk2_in", "memo_in"],
+            "onnx_outputs":     ["angles", "mem1_out", "spk1_out",
+                                 "mem2_out", "spk2_out", "memo_out"],
+            "weights_file":     "best_model.pt",
+        },
+
+        # ── CPG analysis ──────────────────────────────────────────
+        "cpg_analysis": {
+            "period_steps":           float(period),
+            "neuron_burst_offsets":   neuron_offsets.tolist(),
+            "burst_isi_thresholds":   [float(t) for t in burst_thresholds],
+            "bursts_per_neuron":      [int(len(o)) for o in onsets],
+            "spikes_per_neuron":      [int(c) for c in spikes.sum(0)],
+            "phase_valid_coverage":   float(valid.mean()),
+        },
+
+        # ── data / split ──────────────────────────────────────────
+        "data": {
+            "tmax":                 int(args.tmax),
+            "warmup":               int(args.warmup),
+            "t_lo":                 int(t_lo),
+            "t_split":              int(t_split),
+            "t_hi":                 int(t_hi),
+            "train_steps":          int(t_split - t_lo),
+            "val_steps":            int(t_hi - t_split),
+            "gait_table_rows_orig": [int(g.shape[0])
+                                     for g in GAIT_TABLES_ORIG],
+            "target_rows":          int(target_rows),
+            "target_range_deg":     [float(tgt_range[0]), float(tgt_range[1])],
+        },
+
+        # ── training outcome ──────────────────────────────────────
+        "training": {
+            "dry_run":            bool(args.dry_run),
+            "epochs_requested":   int(args.epochs),
+            "epochs_completed":   int(epochs_done),
+            "chunks_per_epoch":   int(args.chunks_per_epoch),
+            "gradient_steps":     int(grad_steps),
+            "sample_timesteps":   int(grad_steps * args.bptt * args.batch),
+            "batch":              int(args.batch),
+            "bptt":               int(args.bptt),
+            "lr_initial":         float(args.lr),
+            "lr_final":           final_lr,
+            "lr_schedule":        "CosineAnnealingLR",
+            "lr_eta_min":         1e-5,
+            "optimizer":          "Adam",
+            "grad_clip":          float(args.clip),
+            "best_val_mse":       best,
+            "history":            hist,
+        },
     }
     export_onnx(model, out_dir, device, cfg)
+
     print(f"\nDone — {out_dir.resolve()}")
 
 
