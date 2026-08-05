@@ -58,6 +58,8 @@ import contextlib
 import hashlib
 import io
 import json
+import logging
+import math
 import os
 import platform
 import sys
@@ -69,6 +71,11 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+
+try:
+    import torch._dynamo as dynamo
+except Exception:                                            # noqa: BLE001
+    dynamo = None
 
 # Import the real pipeline. train.py's module level sets
 # float32_matmul_precision('high') and matplotlib Agg, which we want.
@@ -103,7 +110,19 @@ VARIANT_SETS = {
         ("compile_b32",      dict(batch=32,  compile="default")),
         ("compile_b128",     dict(batch=128, compile="default")),
         ("compile_b256",     dict(batch=256, compile="default")),
+        ("compile_b512",     dict(batch=512, compile="default")),
         ("cudagraph_b128",   dict(batch=128, compile="reduce-overhead")),
+        ("cudagraph_b256",   dict(batch=256, compile="reduce-overhead")),
+    ],
+
+    # Where does batch scaling stop being free? Compiled throughout, so
+    # only batch varies. OOM rows are skipped, not fatal.
+    "batch": [
+        ("compile_b64",      dict(batch=64,   compile="default")),
+        ("compile_b128",     dict(batch=128,  compile="default")),
+        ("compile_b256",     dict(batch=256,  compile="default")),
+        ("compile_b512",     dict(batch=512,  compile="default")),
+        ("compile_b1024",    dict(batch=1024, compile="default")),
     ],
 
     # bptt sweep holding batch*bptt fixed at 32768, so every row does the
@@ -209,7 +228,146 @@ def build_data(args, out_dir, verbose=False):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 3.  Timing helpers
+# 3.  Dynamo control + silent-fallback detection
+# ═══════════════════════════════════════════════════════════════════
+#
+# torch.compile caches per CODE OBJECT with guards, and every variant
+# shares the same LegGroupedSNN.step code object. Each compiled variant
+# burns at least two guard slots -- one for the training forward (grad
+# enabled) and one for the validation forward (no_grad), which is the
+# "GLOBAL_STATE changed: grad_mode" recompile reason -- plus more for new
+# module instances and new batch shapes.
+#
+# Past the limit, Dynamo permanently falls back to eager FOR THAT CODE
+# OBJECT and only emits a warning. Every variant after that point then
+# reports eager timings under a compiled label. That silently corrupted
+# two benchmark sessions, so this file now (a) resets between variants,
+# (b) raises the limit, and (c) actively verifies each variant compiled.
+
+# Steps at which the loss is sampled. Extends past 50 so a divergence that
+# starts late is visible, and so runs of different length are comparable.
+LOSS_STEPS = (1, 10, 50, 100, 200, 500)
+
+FALLBACK_PATTERNS = ("recompile_limit", "cache_size_limit",
+                     "falling back to eager", "torch._dynamo hit")
+
+
+def set_recompile_limit(n, accumulated=None):
+    """
+    Raise Dynamo's per-code-object recompile limit.
+
+    The config key was renamed (cache_size_limit -> recompile_limit), so
+    both spellings are set; whichever exists wins.
+    """
+    if dynamo is None:
+        return []
+    applied = []
+    cfg = dynamo.config
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(cfg, name):
+            setattr(cfg, name, int(n))
+            applied.append(f"{name}={n}")
+    if accumulated is not None:
+        for name in ("accumulated_recompile_limit",
+                     "accumulated_cache_size_limit"):
+            if hasattr(cfg, name):
+                setattr(cfg, name, int(accumulated))
+                applied.append(f"{name}={accumulated}")
+    return applied
+
+
+class _LogCatcher(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        try:
+            self.messages.append(record.getMessage())
+        except Exception:                                    # noqa: BLE001
+            pass
+
+
+class DynamoWatch:
+    """
+    Context manager collecting three independent fallback signals.
+
+    1. `limit_hit`  -- the recompile-limit warning was actually logged.
+    2. `frames_ok`  -- Dynamo's counter of successfully compiled frames;
+                       0 for a compiled variant means nothing compiled.
+    3. (checked by the caller) loss@1 bit-identical to an eager run --
+       Inductor reorders reductions, so a genuinely compiled run cannot
+       reproduce eager bit-for-bit.
+
+    All three are best-effort against torch internals, hence the broad
+    try/excepts: a missing counter should degrade to "unknown", never
+    break the benchmark.
+    """
+
+    LOGGERS = ("torch._dynamo", "torch._inductor")
+
+    def __init__(self):
+        self.catcher = _LogCatcher()
+        self._attached = []
+        self.frames_ok = None
+
+    def __enter__(self):
+        if dynamo is not None:
+            try:
+                dynamo.reset()
+            except Exception:                                # noqa: BLE001
+                pass
+            try:
+                dynamo.utils.counters.clear()
+            except Exception:                                # noqa: BLE001
+                pass
+        for name in self.LOGGERS:
+            lg = logging.getLogger(name)
+            lg.addHandler(self.catcher)
+            self._attached.append(lg)
+        return self
+
+    def __exit__(self, *exc):
+        for lg in self._attached:
+            try:
+                lg.removeHandler(self.catcher)
+            except Exception:                                # noqa: BLE001
+                pass
+        # .get() rather than subscripting: counters is a
+        # defaultdict(Counter) today, and __enter__ cleared it, so
+        # subscripting would auto-create entries on a defaultdict and raise
+        # KeyError on a plain dict. Absent means nothing compiled, i.e. 0.
+        try:
+            frames = dynamo.utils.counters.get("frames", {})
+            self.frames_ok = int(dict(frames).get("ok", 0))
+        except Exception:                                    # noqa: BLE001
+            self.frames_ok = None
+        return False
+
+    @property
+    def limit_hit(self):
+        blob = "\n".join(self.messages_seen).lower()
+        return any(p in blob for p in FALLBACK_PATTERNS)
+
+    @property
+    def messages_seen(self):
+        return self.catcher.messages
+
+    def verdict(self, expect_compiled):
+        """True = compiled, False = fell back, None = unknown / N/A."""
+        if not expect_compiled:
+            return None
+        if self.limit_hit:
+            return False
+        if self.frames_ok == 0:
+            return False
+        if self.frames_ok and self.frames_ok > 0:
+            return True
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 4.  Timing helpers
 # ═══════════════════════════════════════════════════════════════════
 
 def _sync(device):
@@ -259,17 +417,23 @@ def output_sanity(model, sampler, batch, bptt, device):
 def time_train_steps(model, sampler, opt, gait_w, device, batch, bptt,
                      n_warmup, n_measure, clip, loss_at):
     """
-    Returns (times_ms list, first_step_s, loss_fingerprint dict).
+    Returns (times_ms, first_step_s, loss_fingerprint, first_nonfinite_step).
 
     Warmup absorbs compilation, Inductor autotuning and CUDA-graph
     recording (which itself needs ~3 iterations). Peak memory stats are
     reset at the warmup boundary so those pools are not attributed to
     steady state.
+
+    Non-finite losses are stored as the STRINGS "nan"/"inf" rather than
+    floats, because json_safe maps non-finite floats to null -- which the
+    report would then render identically to "step never reached". Two very
+    different facts; they must not share a glyph.
     """
     model.train()
     state = model.init_state(batch, device)
     times, losses = [], {}
     first_step_s = None
+    first_nonfinite = None
 
     total = n_warmup + n_measure
     for i in range(total):
@@ -298,12 +462,19 @@ def time_train_steps(model, sampler, opt, gait_w, device, batch, bptt,
         if i == 0:
             first_step_s = dt
         step_no = i + 1
+
+        lv = float(loss.detach())
+        if not math.isfinite(lv) and first_nonfinite is None:
+            first_nonfinite = step_no
         if step_no in loss_at:
-            losses[str(step_no)] = float(loss.detach())
+            losses[str(step_no)] = (
+                lv if math.isfinite(lv)
+                else ("nan" if math.isnan(lv) else "inf"))
+
         if i >= n_warmup:
             times.append(dt * 1e3)
 
-    return times, first_step_s, losses
+    return times, first_step_s, losses, first_nonfinite
 
 
 def time_val_steps(model, sampler, device, batch, bptt, settle,
@@ -366,7 +537,7 @@ def numerics_key(cfg):
         json.dumps(payload, sort_keys=True).encode()).hexdigest()[:10]
 
 
-def run_variant(name, cfg, data, device, args):
+def run_variant(name, cfg, data, device, args, eager_ref=None):
     print(f"\n─── {name} " + "─" * max(0, 56 - len(name)))
     print(f"    batch={cfg['batch']}  bptt={cfg['bptt']}  "
           f"hidden={cfg['hidden']}  compile={cfg['compile'] or 'eager'}")
@@ -383,47 +554,70 @@ def run_variant(name, cfg, data, device, args):
             f"val range {data['t_hi'] - data['t_split']} steps < 2*bptt "
             f"({2 * bptt}); raise --tmax or lower --val_frac.")
 
-    # Fixed seeds so model init and sampler draws are identical across
-    # variants -- otherwise the loss fingerprint means nothing.
-    torch.manual_seed(cfg["seed"])
-    np.random.seed(cfg["seed"])
+    expect_compiled = cfg["compile"] not in (None, "none", "off")
 
-    model = LegGroupedSNN(
-        hidden=cfg["hidden"], n_gaits=data["n_gaits"],
-        route_P=data["route_P"], tau_min=cfg["tau_min"],
-        tau_max=cfg["tau_max"], cross_gain=cfg["cross_gain"],
-        slope=cfg["slope"]).to(device)
+    # DynamoWatch resets compiled caches so this variant starts clean --
+    # without it, guard slots burned by earlier variants leak forward and
+    # a later variant silently runs eager.
+    with DynamoWatch() as watch:
+        # Fixed seeds so model init and sampler draws are identical across
+        # variants -- otherwise the loss fingerprint means nothing.
+        torch.manual_seed(cfg["seed"])
+        np.random.seed(cfg["seed"])
 
-    t_compile0 = time.perf_counter()
-    compile_label = _compile_step(model, cfg["compile"])
-    compile_call_s = time.perf_counter() - t_compile0   # lazy; real cost is step 1
+        model = LegGroupedSNN(
+            hidden=cfg["hidden"], n_gaits=data["n_gaits"],
+            route_P=data["route_P"], tau_min=cfg["tau_min"],
+            tau_max=cfg["tau_max"], cross_gain=cfg["cross_gain"],
+            slope=cfg["slope"]).to(device)
 
-    n_par = sum(p.numel() for p in model.parameters())
-    opt   = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+        compile_label = _compile_step(model, cfg["compile"])
 
-    sink = io.StringIO()
-    with contextlib.redirect_stdout(sink):
-        gait_w = make_gait_weights(GAIT_TABLES_ORIG, device)
+        n_par = sum(p.numel() for p in model.parameters())
+        opt   = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
 
-    mk = lambda lo, hi, seed_off: StreamSampler(
-        data["spikes"], data["targets"], data["valid"], lo, hi, batch,
-        cfg["switch_min"], cfg["switch_max"],
-        np.random.default_rng(cfg["seed"] + seed_off),
-        n_gaits=data["n_gaits"])
+        sink = io.StringIO()
+        with contextlib.redirect_stdout(sink):
+            gait_w = make_gait_weights(GAIT_TABLES_ORIG, device)
 
-    tr_sampler = mk(data["t_lo"], data["t_split"], 0)
-    va_sampler = mk(data["t_split"], data["t_hi"], 1)
+        mk = lambda lo, hi, seed_off: StreamSampler(
+            data["spikes"], data["targets"], data["valid"], lo, hi, batch,
+            cfg["switch_min"], cfg["switch_max"],
+            np.random.default_rng(cfg["seed"] + seed_off),
+            n_gaits=data["n_gaits"])
 
-    loss_at = {1, 10, 50, 100}
-    times, first_s, losses = time_train_steps(
-        model, tr_sampler, opt, gait_w, device, batch, bptt,
-        args.warmup, args.measure, cfg["clip"], loss_at)
+        tr_sampler = mk(data["t_lo"], data["t_split"], 0)
+        va_sampler = mk(data["t_split"], data["t_hi"], 1)
 
-    val_times = time_val_steps(
-        model, va_sampler, device, batch, bptt, cfg["settle"],
-        max(2, args.warmup // 3), max(3, args.measure // 4))
+        times, first_s, losses, first_nonfinite = time_train_steps(
+            model, tr_sampler, opt, gait_w, device, batch, bptt,
+            args.warmup, args.measure, cfg["clip"], set(LOSS_STEPS))
 
-    sanity = output_sanity(model, va_sampler, batch, bptt, device)
+        # Validation compiles under its own guards (no_grad is a separate
+        # guard from the training forward), so it needs its own warmup --
+        # a floor, not a fraction of --measure, or val's compile lands
+        # inside the measured window and reads as "val slower than train".
+        val_times = time_val_steps(
+            model, va_sampler, device, batch, bptt, cfg["settle"],
+            args.val_warmup, args.val_measure)
+
+        sanity = output_sanity(model, va_sampler, batch, bptt, device)
+
+    compiled_ok = watch.verdict(expect_compiled)
+
+    # Third, independent signal: Inductor reorders reductions, so a
+    # genuinely compiled run cannot reproduce eager bit-for-bit. Exact
+    # equality with a known eager run for the same numerics key means
+    # fallback. Advisory -- in principle a step could fuse with no
+    # reordering -- so it only downgrades a verdict, never upgrades one.
+    l1 = losses.get("1")
+    ref1 = (eager_ref or {}).get(numerics_key(cfg))
+    loss1_identical = (
+        bool(isinstance(l1, float) and isinstance(ref1, float) and l1 == ref1)
+        if (expect_compiled and l1 is not None and ref1 is not None)
+        else None)
+    if loss1_identical and compiled_ok is not False:
+        compiled_ok = False
 
     t   = np.array(times)
     vt  = np.array(val_times)
@@ -437,7 +631,7 @@ def run_variant(name, cfg, data, device, args):
                    + args.val_chunks * float(np.median(vt))) / 1e3
 
     row = {
-        "schema":           1,
+        "schema":           2,
         "variant":          name,
         "timestamp":        datetime.now(timezone.utc).isoformat(
                                 timespec="seconds"),
@@ -449,6 +643,12 @@ def run_variant(name, cfg, data, device, args):
         "torch":            torch.__version__,
         "compile":          compile_label,
         "n_params":         int(n_par),
+        # compile verification
+        "compiled_ok":          compiled_ok,
+        "dynamo_frames_ok":     watch.frames_ok,
+        "dynamo_limit_hit":     bool(watch.limit_hit),
+        "loss1_identical_to_eager": loss1_identical,
+        "dynamo_warnings":      watch.messages_seen[:8],
         # timing
         "ms_median":        med,
         "ms_p10":           float(np.percentile(t, 10)),
@@ -458,35 +658,57 @@ def run_variant(name, cfg, data, device, args):
         "sample_timesteps_per_s": float(sts),
         "msts_per_s":       float(sts / 1e6),
         "first_step_s":     float(first_s),
-        "compile_call_s":   float(compile_call_s),
         "val_ms_median":    float(np.median(vt)),
         "est_epoch_s":      float(est_epoch_s),
         "peak_gib":         peak_gib,
         "n_measure":        len(times),
         "n_warmup":         args.warmup,
+        "val_n_measure":    len(val_times),
+        "val_n_warmup":     args.val_warmup,
+        "total_steps":      args.warmup + args.measure,
         # numerics
         "numerics_key":     numerics_key(cfg),
         "loss":             losses,
+        "loss_schedule":    list(LOSS_STEPS),
+        "first_nonfinite_step": first_nonfinite,
         "sanity":           sanity,
         # config
         "cfg":              {k: v for k, v in cfg.items()},
     }
 
     print(f"    median {med:8.2f} ms/step   "
-          f"p10 {row['ms_p10']:7.2f}  p90 {row['ms_p90']:7.2f}")
+          f"p10 {row['ms_p10']:7.2f}  p90 {row['ms_p90']:7.2f}   "
+          f"(n={len(times)}, warmup={args.warmup})")
     print(f"    throughput {row['msts_per_s']:7.3f} M sample-timesteps/s")
     print(f"    first step {first_s:7.2f} s (includes compile)   "
-          f"val {row['val_ms_median']:7.2f} ms")
+          f"val {row['val_ms_median']:7.2f} ms (n={len(val_times)})")
     print(f"    est. epoch {est_epoch_s:7.2f} s "
           f"({args.chunks_per_epoch} train + {args.val_chunks} val chunks)")
     if peak_gib is not None:
         print(f"    peak mem   {peak_gib:7.2f} GiB")
+
+    if expect_compiled:
+        verdict = {True: "yes", False: "NO — FELL BACK TO EAGER",
+                   None: "unknown"}[compiled_ok]
+        print(f"    compiled   {verdict}  "
+              f"(frames_ok={watch.frames_ok}, "
+              f"limit_hit={watch.limit_hit}, "
+              f"loss1==eager={loss1_identical})")
+        if compiled_ok is False:
+            print("    !! This row reports EAGER timings under a compiled "
+                  "label. Do not compare it.")
+            for msg in watch.messages_seen[:3]:
+                print(f"       dynamo: {msg.splitlines()[0][:100]}")
+
     if not sanity["time_varying"]:
         print("    !! OUTPUT NOT TIME-VARYING — suspect CUDA-graph output "
               "aliasing. Do not trust this row.")
+    if first_nonfinite is not None:
+        print(f"    !! loss became non-finite at step {first_nonfinite}")
     if losses:
         print("    loss  " + "   ".join(
-            f"@{k}={v:.6f}" for k, v in sorted(losses.items(), key=lambda kv: int(kv[0]))))
+            f"@{k}={v:.6f}" if isinstance(v, float) else f"@{k}={v}"
+            for k, v in sorted(losses.items(), key=lambda kv: int(kv[0]))))
 
     del model, opt, tr_sampler, va_sampler
     if device.type == "cuda":
@@ -524,7 +746,16 @@ def load_rows(out_dir):
 
 
 def _fmt(v, spec="{:.2f}", dash="—"):
-    return dash if v is None else spec.format(v)
+    """
+    Format a metric. Strings pass through unchanged, which is how "nan" and
+    "inf" survive: a missing value renders as the dash, a non-finite one as
+    its own name. Conflating the two is what hid a suspected divergence.
+    """
+    if v is None:
+        return dash
+    if isinstance(v, str):
+        return v
+    return spec.format(v)
 
 
 def write_report(out_dir, baseline=None):
@@ -584,25 +815,36 @@ def write_report(out_dir, baseline=None):
             cands = [r for r in grp if r.get("variant") == baseline]
             ref = cands[-1] if cands else None
         if ref is None:
-            ref = min(grp, key=thr)
+            # Never pick a fallback row as the reference: it is eager wearing
+            # a compiled label, so speedups against it would be nonsense.
+            usable = [r for r in grp if r.get("compiled_ok") is not False]
+            ref = min(usable or grp, key=thr)
         ref_thr = thr(ref) or 1.0
 
         L.append("### Performance")
         L.append("")
         L.append("| variant | commit | batch | bptt | hidden | compile | "
-                 "ms/step | M sTS/s | speedup | peak GiB | first step s | "
-                 "val ms | est epoch s |")
-        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+                 "compiled? | warm/meas | ms/step | M sTS/s | speedup | "
+                 "peak GiB | first step s | val ms | est epoch s |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for r in grp:
             g = r.get("git") or {}
             commit = g.get("commit") or "—"
             if g.get("dirty"):
                 commit += "*"
             c = r.get("cfg", {})
+            ok = r.get("compiled_ok")
+            if r.get("compile") in ("eager", None):
+                ok_s = "n/a"
+            else:
+                ok_s = {True: "yes", False: "**FELL BACK**",
+                        None: "?"}.get(ok, "?")
+            wm = f"{r.get('n_warmup','?')}/{r.get('n_measure','?')}"
             L.append(
                 f"| {r.get('variant','?')} | {commit} | "
                 f"{c.get('batch','—')} | {c.get('bptt','—')} | "
                 f"{c.get('hidden','—')} | {r.get('compile','—')} | "
+                f"{ok_s} | {wm} | "
                 f"{_fmt(r.get('ms_median'))} | "
                 f"{_fmt(r.get('msts_per_s') or (thr(r) / 1e6 or None), '{:.3f}')} | "
                 f"{thr(r) / ref_thr:.2f}x | {_fmt(r.get('peak_gib'))} | "
@@ -615,18 +857,28 @@ def write_report(out_dir, baseline=None):
                  f"working tree was dirty — that row is not reproducible "
                  f"from the commit alone.")
         L.append("")
+        L.append("`compiled?` verifies the variant actually compiled rather "
+                 "than silently falling back to eager after exhausting "
+                 "Dynamo's recompile limit. **FELL BACK** rows report eager "
+                 "timings under a compiled label and must not be compared. "
+                 "`warm/meas` is warmup/measured iteration counts — a small "
+                 "`meas` means the median is a small-sample statistic.")
+        L.append("")
 
         L.append("### Numerics")
         L.append("")
         L.append("Only compare loss values **within** a `nkey` group — a "
                  "different batch or bptt legitimately changes the loss "
-                 "trajectory. `time-varying` false means the stacked output "
-                 "collapsed (suspect CUDA-graph output aliasing) and the row "
-                 "should be discarded.")
+                 "trajectory. A dash means the step was not reached; `nan` "
+                 "or `inf` means the loss actually went non-finite. "
+                 "`varying` = no means the stacked output collapsed "
+                 "(suspect CUDA-graph output aliasing) and the row should "
+                 "be discarded.")
         L.append("")
-        L.append("| variant | commit | nkey | loss@1 | loss@10 | loss@50 | "
-                 "loss@100 | time-varying | params |")
-        L.append("|---|---|---|---|---|---|---|---|---|")
+        loss_cols = " | ".join(f"loss@{s}" for s in LOSS_STEPS)
+        L.append(f"| variant | commit | nkey | {loss_cols} | 1st nonfinite | "
+                 f"varying | params |")
+        L.append("|---|---|---|" + "---|" * len(LOSS_STEPS) + "---|---|---|")
         for r in grp:
             g = r.get("git") or {}
             commit = g.get("commit") or "—"
@@ -637,13 +889,15 @@ def write_report(out_dir, baseline=None):
             if sanity is None:
                 sane_s = "—"                      # not recorded, not failed
             else:
-                sane_s = "yes" if sanity.get("time_varying") else "**NO**"
+                sane_s = "yes" if sanity.get("time_varying") else "**no**"
+            nf = r.get("first_nonfinite_step")
+            nf_s = "—" if nf is None else f"**{nf}**"
             L.append(
                 f"| {r.get('variant','?')} | {commit} | "
                 f"{r.get('numerics_key','—')} | "
-                + " | ".join(_fmt(lo.get(k), '{:.6f}') for k in
-                             ("1", "10", "50", "100"))
-                + f" | {sane_s} | {npar_s} |")
+                + " | ".join(_fmt(lo.get(str(s)), '{:.6f}')
+                             for s in LOSS_STEPS)
+                + f" | {nf_s} | {sane_s} | {npar_s} |")
         L.append("")
 
     path = out_dir / "bench_results.md"
@@ -695,9 +949,22 @@ def main():
 
     # measurement
     ap.add_argument("--warmup",  type=int, default=20,
-                    help="Unmeasured iterations. Must cover compilation, "
-                         "autotuning and CUDA-graph recording.")
+                    help="Unmeasured training iterations. Must cover "
+                         "compilation, autotuning and CUDA-graph recording.")
     ap.add_argument("--measure", type=int, default=50)
+    ap.add_argument("--val_warmup",  type=int, default=10,
+                    help="Unmeasured validation iterations. A FLOOR, not a "
+                         "fraction of --measure: the no_grad forward compiles "
+                         "under its own guards, so too little warmup puts "
+                         "val's compile inside the measured window and makes "
+                         "val look slower than training.")
+    ap.add_argument("--val_measure", type=int, default=15)
+    ap.add_argument("--recompile_limit", type=int, default=64,
+                    help="Dynamo per-code-object recompile limit. The default "
+                         "of 8 is exhausted after ~4 compiled variants "
+                         "(train + no_grad guards each), after which Dynamo "
+                         "silently falls back to eager and every later "
+                         "variant reports eager timings.")
     ap.add_argument("--chunks_per_epoch", type=int, default=40,
                     help="Only used to estimate epoch wall-clock.")
     ap.add_argument("--val_chunks",       type=int, default=8)
@@ -764,6 +1031,9 @@ def main():
         print("         WARNING: on CPU. torch.compile gains and all memory "
               "numbers will not reflect a CUDA run.")
     print(f"torch  : {torch.__version__}")
+    applied = set_recompile_limit(args.recompile_limit,
+                                  accumulated=max(512, args.recompile_limit * 8))
+    print(f"dynamo : {', '.join(applied) if applied else 'unavailable'}")
     g = git_info()
     print(f"git    : {g['commit']}{' (dirty)' if g['dirty'] else ''}")
     print(f"out_dir: {out_dir}")
@@ -787,12 +1057,31 @@ def main():
     print(f"  train [{data['t_lo']}, {data['t_split']})   "
           f"val [{data['t_split']}, {data['t_hi']})")
 
+    # Eager loss@1 per numerics key, used as the third fallback signal: a
+    # compiled run that reproduces eager bit-for-bit did not compile.
+    # Seeded from history so the check works even when this session runs
+    # no eager variant of its own.
+    eager_ref = {}
+    for r in load_rows(out_dir):
+        if r.get("compile") in ("eager", None):
+            l1 = (r.get("loss") or {}).get("1")
+            nk = r.get("numerics_key")
+            if isinstance(l1, float) and nk:
+                eager_ref.setdefault(nk, l1)
+    if eager_ref:
+        print(f"  eager loss@1 references from history: {len(eager_ref)}")
+
     rows = []
     try:
         for name, ov in variants:
             cfg = build_cfg(args, ov, cpg_warmup)
             try:
-                rows.append(run_variant(name, cfg, data, device, args))
+                row = run_variant(name, cfg, data, device, args, eager_ref)
+                rows.append(row)
+                if row["compile"] in ("eager", None):
+                    l1 = (row.get("loss") or {}).get("1")
+                    if isinstance(l1, float):
+                        eager_ref.setdefault(row["numerics_key"], l1)
             except Exception as e:                          # noqa: BLE001
                 if "out of memory" in str(e).lower():
                     print(f"    !! OOM — skipping {name}. "
@@ -815,22 +1104,38 @@ def main():
     write_report(out_dir, baseline=args.baseline)
 
     # Session summary, ordered by throughput.
-    print("\n" + "=" * 72)
-    print(f"{'variant':<20}{'ms/step':>10}{'M sTS/s':>10}"
-          f"{'speedup':>10}{'peak GiB':>10}{'epoch s':>10}")
-    print("-" * 72)
-    ref = min(rows, key=lambda r: r["sample_timesteps_per_s"])
+    print("\n" + "=" * 82)
+    print(f"{'variant':<18}{'ms/step':>10}{'M sTS/s':>10}"
+          f"{'speedup':>10}{'peak GiB':>10}{'epoch s':>10}{'compiled':>12}")
+    print("-" * 82)
+    usable = [r for r in rows if r.get("compiled_ok") is not False]
+    ref = min(usable or rows, key=lambda r: r["sample_timesteps_per_s"])
     if args.baseline:
         c = [r for r in rows if r["variant"] == args.baseline]
         ref = c[0] if c else ref
     for r in sorted(rows, key=lambda r: -r["sample_timesteps_per_s"]):
         spd = r["sample_timesteps_per_s"] / ref["sample_timesteps_per_s"]
-        print(f"{r['variant']:<20}{r['ms_median']:>10.2f}"
+        if r["compile"] in ("eager", None):
+            ok_s = "n/a"
+        else:
+            ok_s = {True: "yes", False: "FELL BACK",
+                    None: "?"}.get(r.get("compiled_ok"), "?")
+        print(f"{r['variant']:<18}{r['ms_median']:>10.2f}"
               f"{r['msts_per_s']:>10.3f}{spd:>9.2f}x"
               f"{_fmt(r.get('peak_gib'), '{:.2f}'):>10}"
-              f"{r['est_epoch_s']:>10.2f}")
-    print("=" * 72)
+              f"{r['est_epoch_s']:>10.2f}{ok_s:>12}")
+    print("=" * 82)
     print(f"speedup vs {ref['variant']}")
+    bad = [r["variant"] for r in rows if r.get("compiled_ok") is False]
+    if bad:
+        print(f"\n!! FELL BACK TO EAGER (do not compare): {', '.join(bad)}")
+        print("   Raise --recompile_limit, or run fewer variants per "
+              "invocation.")
+    nf = [(r["variant"], r["first_nonfinite_step"]) for r in rows
+          if r.get("first_nonfinite_step") is not None]
+    if nf:
+        print("\n!! NON-FINITE LOSS: "
+              + ", ".join(f"{v} @step {s}" for v, s in nf))
 
 
 if __name__ == "__main__":
