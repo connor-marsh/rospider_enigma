@@ -368,8 +368,8 @@ def plot_run(res, out_dir, n_show=3000):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_dir", type=str,
-                    default="output_cpg_lif_leggrouped")
-    ap.add_argument("--out_dir",   type=str, default="inference_out")
+                    default="outputs")
+    ap.add_argument("--out_dir",   type=str, default="outputs/inference_out")
     ap.add_argument("--t_max",     type=int, default=20_000)
     ap.add_argument("--no_robot",  action="store_true")
     ap.add_argument("--serial_port", type=str, default=None)
