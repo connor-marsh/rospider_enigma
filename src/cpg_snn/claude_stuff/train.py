@@ -1293,7 +1293,7 @@ def main():
     ap.add_argument("--i_app",  type=float, default=8.0)
 
     # network
-    ap.add_argument("--hidden",     type=int,   default=128,
+    ap.add_argument("--hidden",     type=int,   default=256,
                     help="Hidden width. Fully connected now, so w2/w_read are "
                          "dense (H x H) rather than 4 blocks of (H/4 x H/4) — "
                          "h=128 lands at roughly the old grouped h=256 "
@@ -1317,16 +1317,16 @@ def main():
     ap.add_argument("--slope",      type=float, default=25.0)
 
     # training
-    ap.add_argument("--epochs",           type=int,   default=300)
+    ap.add_argument("--epochs",           type=int,   default=100)
     ap.add_argument("--chunks_per_epoch", type=int,   default=40)
-    ap.add_argument("--val_chunks",       type=int,   default=8)
+    ap.add_argument("--val_chunks",       type=int,   default=2)
     ap.add_argument("--bptt",             type=int,   default=256,
                     help="Gradient truncation horizon. NOT the network's "
                          "receptive field -- state is carried and detached "
                          "across chunks, so the forward pass sees unbounded "
                          "history. 256 ~= one full CPG period. Sweep "
                          "128/256/512 at fixed batch*bptt.")
-    ap.add_argument("--batch",            type=int,   default=128,
+    ap.add_argument("--batch",            type=int,   default=256,
                     help="Stream heads per gradient step. Raised from 32: at "
                          "these sizes the timestep loop is kernel-launch "
                          "bound, so a bigger batch is nearly free in "
@@ -1354,7 +1354,7 @@ def main():
 
     # misc
     ap.add_argument("--seed",      type=int, default=42)
-    ap.add_argument("--log_every", type=int, default=10)
+    ap.add_argument("--log_every", type=int, default=1)
     ap.add_argument("--dry_run",   action="store_true",
                     help="Build data + diagnostics, skip training.")
     ap.add_argument("--out_dir",   type=str, default="outputs")
