@@ -968,19 +968,22 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                  gait_w, out_dir):
     best = float("inf")
     best_path = out_dir / "best_model.pt"
-    hist = {"train": [], "val": [], "val_sw": []}
+    hist = {"train": [], "val": [], "val_sw": [], "gnorm": []}
 
     print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val':>10}  "
-          f"{'Val(post-sw)':>13}  {'LR':>9}")
-    print("  " + "-" * 60)
-    print("  (Ctrl+C stops training and proceeds to export)")
+          f"{'Val(post-sw)':>13}  {'LR':>9}  {'|grad|':>8}")
+    print("  " + "-" * 70)
+    print(f"  (Ctrl+C stops training and exports.  |grad| is the PRE-clip "
+          f"norm, clip={args.clip:g};")
+    print(f"   routinely much larger than clip means most updates are being "
+          f"truncated and the LR is too hot.)")
 
     try:
         for epoch in range(1, args.epochs + 1):
             # ---- train -------------------------------------------------
             model.train()
             state = model.init_state(args.batch, device)
-            tot, nb = 0.0, 0
+            tot, gtot, nb = 0.0, 0.0, 0
             for _ in range(args.chunks_per_epoch):
                 x, g, y, m, sw, rst = tr_sampler.next_chunk(args.bptt)
                 x, g, y, m = (x.to(device), g.to(device),
@@ -992,11 +995,19 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
 
                 opt.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+                # Returns the total norm BEFORE clipping — free to read,
+                # and the only way to tell whether clip=1.0 is quietly
+                # truncating nearly every update (i.e. masking a too-hot LR).
+                gnorm = nn.utils.clip_grad_norm_(model.parameters(), args.clip)
                 opt.step()
-                tot += loss.item(); nb += 1
-            sched.step()
-            tr_loss = tot / max(nb, 1)
+                # Stepped per GRADIENT STEP, not per epoch: the LR schedule
+                # must not depend on chunks_per_epoch, which is only a
+                # logging/validation boundary. T_max is set to
+                # epochs * chunks_per_epoch to match this call count.
+                sched.step()
+                tot += loss.item(); gtot += float(gnorm); nb += 1
+            tr_loss  = tot / max(nb, 1)
+            tr_gnorm = gtot / max(nb, 1)
 
             # ---- validate ----------------------------------------------
             model.eval()
@@ -1026,10 +1037,11 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             vsw     = vsw_tot / max(vsw_n, 1) if vsw_n else float("nan")
 
             # Appended together, so an interrupt can never leave these
-            # three lists at different lengths.
+            # lists at different lengths.
             hist["train"].append(tr_loss)
             hist["val"].append(va_loss)
             hist["val_sw"].append(vsw)
+            hist["gnorm"].append(tr_gnorm)
 
             flag = ""
             if va_loss < best:
@@ -1039,7 +1051,8 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
 
             if epoch % args.log_every == 0 or epoch == 1:
                 print(f"  {epoch:>6}  {tr_loss:>10.6f}  {va_loss:>10.6f}  "
-                      f"{vsw:>13.6f}  {opt.param_groups[0]['lr']:>9.2e}{flag}")
+                      f"{vsw:>13.6f}  {opt.param_groups[0]['lr']:>9.2e}"
+                      f"  {tr_gnorm:>8.2f}{flag}")
 
     except KeyboardInterrupt:
         # Return normally rather than propagating: main() then falls through
@@ -1047,14 +1060,14 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
         # so an aborted run still produces deployable artifacts.
         done = len(hist["train"])
         print()
-        print("  " + "-" * 60)
+        print("  " + "-" * 70)
         print(f"  [INTERRUPT] Ctrl+C received during epoch {done + 1}.")
         print(f"              {done} epoch(s) completed and recorded; the "
               f"partial epoch is discarded.")
         print(f"              Best val MSE so far : {best:.6f}")
         print( "              Stopping training and proceeding to export.")
 
-    print("  " + "-" * 60)
+    print("  " + "-" * 70)
     return best, hist
 
 
@@ -1335,8 +1348,17 @@ def main():
                          "bound, so a bigger batch is nearly free in "
                          "wall-clock. If raising further, consider an LR "
                          "rescale (sqrt rule for Adam).")
-    ap.add_argument("--lr",               type=float, default=2e-3)
-    ap.add_argument("--clip",             type=float, default=1.0)
+    ap.add_argument("--lr",               type=float, default=2e-3,
+                    help="Kept at 2e-3 after raising batch 32->128 so the "
+                         "first benchmark was a clean comparison. Adam's "
+                         "sqrt-scaling rule suggests ~4e-3 at batch 128 — "
+                         "worth sweeping, judged on the |grad| column and "
+                         "free-run RMSE rather than train loss.")
+    ap.add_argument("--clip",             type=float, default=1.0,
+                    help="Gradient-norm clip. Watch the |grad| column: if the "
+                         "pre-clip norm sits far above this, clipping is "
+                         "truncating most updates and stability is NOT "
+                         "evidence the LR is well chosen.")
     ap.add_argument("--switch_min",       type=int,   default=600)
     ap.add_argument("--switch_max",       type=int,   default=3000)
     ap.add_argument("--settle",           type=int,   default=100,
@@ -1459,13 +1481,21 @@ def main():
 
     # Defined for both branches so the config can always report them.
     best     = float("nan")
-    hist     = {"train": [], "val": [], "val_sw": []}
+    hist     = {"train": [], "val": [], "val_sw": [], "gnorm": []}
     final_lr = float(args.lr)
 
     if not args.dry_run:
         opt   = torch.optim.Adam(model.parameters(), lr=args.lr)
+        # bite #3: T_max must equal the number of sched.step() calls, and
+        # sched.step() now fires once per GRADIENT STEP (inside the chunk
+        # loop) rather than once per epoch. With T_max=epochs the cosine
+        # would finish after the first chunks_per_epoch steps and the rest
+        # of training would run at eta_min. Counting in gradient steps also
+        # makes the schedule independent of chunks_per_epoch, which is only
+        # a logging/validation boundary.
+        total_steps = args.epochs * args.chunks_per_epoch
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=args.epochs, eta_min=1e-5)
+            opt, T_max=total_steps, eta_min=1e-5)
         best, hist = run_training(model, tr_sampler, va_sampler, opt, sched,
                                   device, args, gait_w, out_dir)
         final_lr = float(opt.param_groups[0]["lr"])
@@ -1603,7 +1633,8 @@ def main():
             "bptt":               int(args.bptt),
             "lr_initial":         float(args.lr),
             "lr_final":           final_lr,
-            "lr_schedule":        "CosineAnnealingLR",
+            "lr_schedule":        "CosineAnnealingLR (per gradient step)",
+            "lr_T_max_steps":     int(args.epochs * args.chunks_per_epoch),
             "lr_eta_min":         1e-5,
             "optimizer":          "Adam",
             "grad_clip":          float(args.clip),
