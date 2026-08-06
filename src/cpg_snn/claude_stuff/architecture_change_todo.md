@@ -6,6 +6,54 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
 
 ---
 
+## Pertaining too architecture change
+
+**1.** [ ] **`max_gaits=16` fixes the FiLM table shape** — *Medium*
+   > 18.7% of params at h=128, so a checkpoint trained on `n_gaits=4` loads
+   into a run using up to 16. Changing `max_gaits` itself, unlike `n_gaits`,
+   invalidates old checkpoints — that's the tradeoff being made, just
+   flagging it so it doesn't surprise anyone later.
+
+**2.** [ ] **Hybrid gait conditioning (discrete pattern + continuous parameters)** — *Medium*
+   > Gait is currently one integer index into an over-allocated FiLM embedding,
+   which handles *growing the gait count* but not *structure*: some
+   variation is genuinely categorical (tripod vs ripple vs wave are
+   different footfall sequences — interpolating them is meaningless) while
+   some is continuous (`tripod` vs `tripod_huge` is one pattern at two
+   amplitudes; leg height and step length likewise). A small discrete
+   embedding for pattern class concatenated with continuous inputs for the
+   metric parameters would give interpolation between amplitudes for free
+   and remove `n_gaits` from the architecture entirely. Implementation
+   sketch: replace `Embedding(max_gaits, 2H)` with
+   `Embedding(n_patterns, d) ⊕ continuous_dims → Linear → ReLU → Linear(·, 2H)`.
+   The nonlinearity matters — a bare `Linear` on a code is additive in the
+   code, which for a binary gait index would force
+   `FiLM(0011) = FiLM(0001) + FiLM(0010) − b`, imposing arbitrary structure
+   over a meaningless labelling.
+
+**3.** [ ] **Reintroduce leg grouping, properly this time** — *High*
+   > Removed along with input routing because the old block-diagonal layers 2+
+   made the network four independent sub-networks with no principled way to
+   align each group to a CPG neuron (the routing permutation's phase
+   alignment only held for 1 of 4 gaits). A better alignment mechanism is
+   needed before grouping is worth bringing back — not just re-adding the
+   block-diagonal structure blind.
+
+**3a.** [ ] **Do it with no cross talk** — *High*
+
+**3b.** [ ] **Do it with cross talk** — *Medium*
+   > Compare results
+
+**4.** [ ] **`inference.py` is broken** — *High*
+   > `StatefulSNNPredictor` still hardcodes 5 state tensors (`state_names_in`,
+   `[z() for _ in range(5)]`, `out[1:]`) from before the recurrence removal,
+   and the state shape is now `(B, H)` rather than `(B, 4, H/4)` after the
+   leg-grouping removal — so it needs updating on both counts, not just the
+   tensor count. Needs a matching update once a model is actually ready to
+   deploy.
+
+## Miscellaneous items
+
 **1.** [ ] **Find the largest usable LR** — *Low*
    > Still at 2e-3. `|grad|` and loss both trend smoothly down with no
    oscillation, which rules out the LR being *too high* but says nothing
@@ -55,57 +103,10 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    validation can end up dominating the compute budget again at more extreme
    ratios.
 
-**6.** [ ] **`max_gaits=16` fixes the FiLM table shape** — *Medium*
-   > 18.7% of params at h=128, so a checkpoint trained on `n_gaits=4` loads
-   into a run using up to 16. Changing `max_gaits` itself, unlike `n_gaits`,
-   invalidates old checkpoints — that's the tradeoff being made, just
-   flagging it so it doesn't surprise anyone later.
-
-**7.** [ ] **Hybrid gait conditioning (discrete pattern + continuous parameters)** — *Medium*
-   > Gait is currently one integer index into an over-allocated FiLM embedding,
-   which handles *growing the gait count* but not *structure*: some
-   variation is genuinely categorical (tripod vs ripple vs wave are
-   different footfall sequences — interpolating them is meaningless) while
-   some is continuous (`tripod` vs `tripod_huge` is one pattern at two
-   amplitudes; leg height and step length likewise). A small discrete
-   embedding for pattern class concatenated with continuous inputs for the
-   metric parameters would give interpolation between amplitudes for free
-   and remove `n_gaits` from the architecture entirely. Implementation
-   sketch: replace `Embedding(max_gaits, 2H)` with
-   `Embedding(n_patterns, d) ⊕ continuous_dims → Linear → ReLU → Linear(·, 2H)`.
-   The nonlinearity matters — a bare `Linear` on a code is additive in the
-   code, which for a binary gait index would force
-   `FiLM(0011) = FiLM(0001) + FiLM(0010) − b`, imposing arbitrary structure
-   over a meaningless labelling.
-
-**8.** [ ] **Reintroduce leg grouping, properly this time** — *High*
-   > Removed along with input routing because the old block-diagonal layers 2+
-   made the network four independent sub-networks with no principled way to
-   align each group to a CPG neuron (the routing permutation's phase
-   alignment only held for 1 of 4 gaits). A better alignment mechanism is
-   needed before grouping is worth bringing back — not just re-adding the
-   block-diagonal structure blind.
-
-**9.** [ ] **Parallel scan over timesteps** — *Low*
+**6.** [ ] **Parallel scan over timesteps** — *Low*
    > The one remaining *structural* lever on speed, as opposed to the
    launch-count reductions already done. `mem_t = β·mem_{t-1} + cur_t` is a
    linear recurrence and is parallelisable by associative scan in O(log T)
    depth, but the spike-and-reset nonlinearity breaks that directly. Would
    need the reset approximated or restructured — this is a research
    question, not a speed optimisation, and shouldn't be attempted casually.
-
-**10.** [ ] **`inference.py` is broken** — *High*
-   > `StatefulSNNPredictor` still hardcodes 5 state tensors (`state_names_in`,
-   `[z() for _ in range(5)]`, `out[1:]`) from before the recurrence removal,
-   and the state shape is now `(B, H)` rather than `(B, 4, H/4)` after the
-   leg-grouping removal — so it needs updating on both counts, not just the
-   tensor count. Needs a matching update once a model is actually ready to
-   deploy.
-
-**11.** [ ] **Old `.onnx` / `best_model.pt` artifacts are incompatible** — *Low*
-   > Incompatible with the current architecture (recurrence removed, leg
-   grouping removed, FiLM reshaped). Any of the architecture changes above
-   will invalidate checkpoints again — expect to retrain from scratch after
-   each one, not fine-tune from an old checkpoint.
-
-   
