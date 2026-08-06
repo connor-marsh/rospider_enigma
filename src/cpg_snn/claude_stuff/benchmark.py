@@ -81,10 +81,10 @@ except Exception:                                            # noqa: BLE001
 # float32_matmul_precision('high') and matplotlib Agg, which we want.
 from train import (
     GAIT_NAMES, GAIT_TABLES_ORIG, LEG_COLS, N_JOINTS, N_LEGS,
-    LegGroupedSNN, StreamSampler,
+    StatefulSNN, StreamSampler,
     analyse_cpg, apply_reset, build_targets, cycle_phase, detach_state,
-    git_info, json_safe, make_gait_weights, masked_loss, routing_matrices,
-    run_cpg, solve_leg_routing, upsample_gait_tables,
+    git_info, json_safe, make_gait_weights, masked_loss,
+    run_cpg, upsample_gait_tables,
 )
 
 
@@ -197,7 +197,6 @@ def build_data(args, out_dir, verbose=False):
             print(f"  [cache hit] {cache.name}")
         return dict(
             spikes=z["spikes"], targets=z["targets"], valid=z["valid"],
-            route_P=z["route_P"], route=z["route"],
             period=float(z["period"]), n_gaits=int(z["n_gaits"]),
             t_lo=int(z["t_lo"]), t_split=int(z["t_split"]), t_hi=int(z["t_hi"]),
             tgt_range=(float(z["tgt_lo"]), float(z["tgt_hi"])),
@@ -213,8 +212,6 @@ def build_data(args, out_dir, verbose=False):
 
         gait_tables, target_rows = upsample_gait_tables(
             GAIT_TABLES_ORIG, GAIT_NAMES, verbose=False)
-        route = solve_leg_routing(GAIT_TABLES_ORIG, GAIT_NAMES, neuron_offsets)
-        route_P = routing_matrices(route, n_neurons=4)
 
         targets, valid, tgt_range = build_targets(
             phase, gait_tables, phase_zero=args.phase_zero)
@@ -229,7 +226,6 @@ def build_data(args, out_dir, verbose=False):
     np.savez(
         cache,
         spikes=spikes, targets=targets, valid=valid,
-        route_P=route_P, route=route,
         period=np.float64(period), n_gaits=np.int64(len(gait_tables)),
         t_lo=np.int64(t_lo), t_split=np.int64(t_split), t_hi=np.int64(t_hi),
         tgt_lo=np.float64(tgt_range[0]), tgt_hi=np.float64(tgt_range[1]),
@@ -238,7 +234,7 @@ def build_data(args, out_dir, verbose=False):
         print(f"  [cache write] {cache.name}")
 
     return dict(spikes=spikes, targets=targets, valid=valid,
-                route_P=route_P, route=route, period=float(period),
+                period=float(period),
                 n_gaits=len(gait_tables), t_lo=t_lo, t_split=t_split,
                 t_hi=t_hi, tgt_range=tgt_range)
 
@@ -248,7 +244,7 @@ def build_data(args, out_dir, verbose=False):
 # ═══════════════════════════════════════════════════════════════════
 #
 # torch.compile caches per CODE OBJECT with guards, and every variant
-# shares the same LegGroupedSNN.step code object. Each compiled variant
+# shares the same StatefulSNN.step code object. Each compiled variant
 # burns at least two guard slots -- one for the training forward (grad
 # enabled) and one for the validation forward (no_grad), which is the
 # "GLOBAL_STATE changed: grad_mode" recompile reason -- plus more for new
@@ -536,7 +532,7 @@ def time_val_steps(model, sampler, device, batch, bptt, settle,
 # ═══════════════════════════════════════════════════════════════════
 
 NUMERICS_FIELDS = ("batch", "bptt", "hidden", "seed", "tmax", "warmup",
-                   "i_app", "tau_min", "tau_max", "cross_gain", "slope",
+                   "i_app", "tau_min", "tau_max", "max_gaits", "slope",
                    "switch_min", "switch_max", "clip", "lr", "val_frac")
 
 
@@ -581,11 +577,11 @@ def run_variant(name, cfg, data, device, args, eager_ref=None):
         torch.manual_seed(cfg["seed"])
         np.random.seed(cfg["seed"])
 
-        model = LegGroupedSNN(
+        model = StatefulSNN(
             hidden=cfg["hidden"], n_gaits=data["n_gaits"],
-            route_P=data["route_P"], tau_min=cfg["tau_min"],
-            tau_max=cfg["tau_max"], cross_gain=cfg["cross_gain"],
-            slope=cfg["slope"]).to(device)
+            max_gaits=cfg["max_gaits"],
+            tau_min=cfg["tau_min"], tau_max=cfg["tau_max"],
+            slope=cfg["slope"], n_joints=N_JOINTS).to(device)
 
         compile_label = _compile_step(model, cfg["compile"])
 
@@ -600,7 +596,7 @@ def run_variant(name, cfg, data, device, args, eager_ref=None):
             data["spikes"], data["targets"], data["valid"], lo, hi, batch,
             cfg["switch_min"], cfg["switch_max"],
             np.random.default_rng(cfg["seed"] + seed_off),
-            n_gaits=data["n_gaits"])
+            n_gaits=data["n_gaits"], device=device)
 
         tr_sampler = mk(data["t_lo"], data["t_split"], 0)
         va_sampler = mk(data["t_split"], data["t_hi"], 1)
@@ -945,7 +941,7 @@ def build_cfg(args, overrides, cpg_warmup):
         compile=args.compile, lr=args.lr, clip=args.clip,
         settle=args.settle, seed=args.seed,
         tau_min=args.tau_min, tau_max=args.tau_max,
-        cross_gain=args.cross_gain, slope=args.slope,
+        max_gaits=args.max_gaits, slope=args.slope,
         switch_min=args.switch_min, switch_max=args.switch_max,
         tmax=args.tmax, warmup=cpg_warmup, i_app=args.i_app,
         val_frac=args.val_frac, phase_zero=args.phase_zero,
@@ -993,7 +989,7 @@ def main():
     # model / training (defaults mirror train.py)
     ap.add_argument("--batch",      type=int,   default=128)
     ap.add_argument("--bptt",       type=int,   default=256)
-    ap.add_argument("--hidden",     type=int,   default=256)
+    ap.add_argument("--hidden",     type=int,   default=128)
     ap.add_argument("--compile",    type=str,   default="default",
                     choices=["none", "default", "reduce-overhead",
                              "max-autotune"],
@@ -1003,7 +999,7 @@ def main():
     ap.add_argument("--settle",     type=int,   default=100)
     ap.add_argument("--tau_min",    type=float, default=2.0)
     ap.add_argument("--tau_max",    type=float, default=256.0)
-    ap.add_argument("--cross_gain", type=float, default=0.25)
+    ap.add_argument("--max_gaits",  type=int,   default=16)
     ap.add_argument("--slope",      type=float, default=25.0)
     ap.add_argument("--switch_min", type=int,   default=600)
     ap.add_argument("--switch_max", type=int,   default=3000)

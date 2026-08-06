@@ -42,32 +42,37 @@ What changed vs. the previous (conductance-based CPG + event-window) version
     while slightly improving step time and memory, so they were removed.
     See git history before the removal commit to reproduce that test.
 
-4.  One CPG neuron per leg.
-    The hidden layer is split into 4 equal groups.  Group l is driven
-    principally by ONE CPG neuron and reads out ONLY leg l's two joint
-    angles.  Cross-group leakage is a single scalar knob (`--cross_gain`)
-    so the association is architectural, not merely hoped-for.
+4.  Fully connected (was: one CPG neuron per leg).
+    Every CPG spike reaches every hidden unit, both hidden layers are
+    dense, and the readout maps the whole hidden state to all 8 joints.
 
-    Which neuron drives which leg is *derived*, not guessed: the per-leg
-    phase offsets baked into each gait table are measured by circular
-    cross-correlation, the CPG's per-neuron burst offsets are measured
-    from the spike train, and the two are matched by optimal assignment.
-    Result (auto-printed at startup):
+    The previous design split the hidden layer into 4 leg groups, drove
+    group l with a single CPG neuron chosen by a per-gait permutation, and
+    read leg l's two joints out of group l only.  Both parts are gone:
 
-        wkF : leg->neuron [0,2,1,3]   max residual 0.026 cycle
-        bk  : leg->neuron [0,2,3,1]   max residual 0.116 cycle
-        wkR : leg->neuron [0,2,1,3]   max residual 0.133 cycle
-        wkL : leg->neuron [0,2,1,3]   max residual 0.133 cycle
+      - The grouping made layers 2+ block diagonal (4 x Hg x Hg), i.e.
+        four independent sub-networks, with `cross_gain * w_cross` in
+        layer 1 as the only path between them.
+      - The routing permutation matched each leg's swing onset to the CPG
+        neuron whose burst was closest in phase, but the residuals were
+        0.116-0.133 cycle for 3 of the 4 gaits -- about 34 steps at period
+        254, longer than a burst (~29 steps) -- so the alignment only
+        really held for wkF.  And since `w_cross` already spanned all four
+        neurons, routing was an initialisation prior rather than a
+        capability; the network had to learn per-gait timing corrections
+        regardless, which is what FiLM is for.
 
-    i.e. leg 0 swings when N0 bursts, leg 1 when N2 bursts, and so on.
-    The routing is a per-gait 4x4 permutation matrix applied to the input
-    spikes; servo routing on the output side stays FIXED (group l always
-    drives leg l's servos), which is the only physically legal choice.
+    Servo routing on the output side is unchanged and still FIXED: column
+    j of the gait table lands on servo j + SERVO_BASE.
 
     >>> CHECK THIS <<<  see LEG_COLS / SERVO_BASE below.
 
 Leg / joint layout  (LEG_COLS)
 ------------------------------
+LEG_COLS is now presentation and wiring only -- it groups the 8 output
+columns per leg for the diagnostic plots and for the servo map.  It no
+longer constrains the network architecture.
+
 The 8 gait-table columns are two joints x four legs, laid out as
     columns 0..3 = joint A of legs 0..3
     columns 4..7 = joint B of legs 0..3
@@ -99,7 +104,6 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import gaussian_kde
 from scipy.signal import argrelmin
-from scipy.optimize import linear_sum_assignment
 from scipy.interpolate import interp1d
 
 import torch
@@ -522,63 +526,6 @@ def upsample_gait_tables(tables, names, target_rows=None, verbose=True):
     return out, int(target_rows)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 4.  Leg <-> CPG-neuron assignment
-# ═══════════════════════════════════════════════════════════════════
-
-def table_leg_offsets(table, leg_cols=LEG_COLS):
-    """
-    Per-leg phase offset baked into a gait table, measured by circular
-    cross-correlation of each leg's joint-A column against leg 0's.
-    Returns (n_legs,) in [0,1).
-    """
-    n   = table.shape[0]
-    ref = table[:, leg_cols[0][0]]
-    ref = (ref - ref.mean()) / (ref.std() + 1e-9)
-    offs = []
-    for cols in leg_cols:
-        a = table[:, cols[0]]
-        a = (a - a.mean()) / (a.std() + 1e-9)
-        err = [np.mean((np.roll(a, -s) - ref) ** 2) for s in range(n)]
-        offs.append(int(np.argmin(err)) / n)
-    return np.array(offs, dtype=np.float64)
-
-
-def solve_leg_routing(tables, names, neuron_offsets, leg_cols=LEG_COLS):
-    """
-    For each gait, assign every leg the CPG neuron whose burst onset is
-    closest (circularly) to that leg's swing onset.  Optimal assignment,
-    so it is always a permutation — no two legs share a neuron.
-
-    Returns route (n_gaits, n_legs) int:  route[g, l] = CPG neuron index
-    that drives leg l under gait g.
-    """
-    route = np.zeros((len(tables), len(leg_cols)), dtype=np.int64)
-    print("\n      leg-offset / neuron-offset matching:")
-    for gi, (t, nm) in enumerate(zip(tables, names)):
-        psi = table_leg_offsets(t, leg_cols)
-        d   = np.abs(psi[:, None] - neuron_offsets[None, :])
-        d   = np.minimum(d, 1.0 - d)                     # circular distance
-        rows, cols = linear_sum_assignment(d)
-        route[gi, rows] = cols
-        print(f"        {nm:>4s}: leg offsets={np.round(psi,3).tolist()}  "
-              f"-> leg2neuron={route[gi].tolist()}  "
-              f"resid={np.round(d[rows, cols],3).tolist()}")
-    return route
-
-
-def routing_matrices(route, n_neurons=4):
-    """
-    P[g] such that  x_routed = x @ P[g]  gives x_routed[l] = x[route[g,l]].
-    A matmul exports to ONNX far more reliably than gather-with-batched-index.
-    """
-    G, L = route.shape
-    P = np.zeros((G, n_neurons, L), dtype=np.float32)
-    for g in range(G):
-        for l in range(L):
-            P[g, route[g, l], l] = 1.0
-    return P
-
 
 # ═══════════════════════════════════════════════════════════════════
 # 5.  Targets
@@ -629,13 +576,25 @@ class StreamSampler:
 
     A head that runs off the end of its time range is rewound to a random
     start and flagged in `reset_mask` so the caller can zero its state.
+
+    Device residency
+    ----------------
+    The whole "dataset" is tiny -- spikes (T,4), targets (G,T,J) and valid
+    (T,) come to well under 10 MB at tmax=50k -- so all three live on the
+    training device permanently and batches are gathered on-device.  That
+    removes a Python loop over B heads doing numpy slicing plus a blocking
+    host->device copy per chunk.  It is worth only ~0.1% of epoch time (the
+    model, not the data path, is the cost) and is done mainly so there is no
+    data pipeline left to reason about.
+
+    The per-head gait timeline stays in numpy: it is branchy control flow,
+    and switches are rare (every switch_min..switch_max steps), so the
+    `while` loop almost never fires.
     """
 
     def __init__(self, spikes, targets, valid, t_lo, t_hi, batch,
-                 switch_min=600, switch_max=3000, rng=None, n_gaits=4):
-        self.spikes  = spikes
-        self.targets = targets
-        self.valid   = valid
+                 switch_min=600, switch_max=3000, rng=None, n_gaits=4,
+                 device=None):
         self.t_lo    = int(t_lo)
         self.t_hi    = int(t_hi)
         self.B       = int(batch)
@@ -644,9 +603,31 @@ class StreamSampler:
         self.n_gaits = int(n_gaits)
         self.rng     = rng or np.random.default_rng(0)
 
+        # One code path for CPU and GPU: torch indexing is identical, so
+        # `device=None` simply keeps everything on the CPU.
+        self.device = torch.device(device) if device is not None \
+            else torch.device("cpu")
+        self.spikes  = torch.as_tensor(np.ascontiguousarray(spikes),
+                                       dtype=torch.float32,
+                                       device=self.device)
+        self.targets = torch.as_tensor(np.ascontiguousarray(targets),
+                                       dtype=torch.float32,
+                                       device=self.device)
+        self.valid   = torch.as_tensor(
+            np.ascontiguousarray(valid).astype(np.float32),
+            dtype=torch.float32, device=self.device)
+
         self.pos   = self.rng.integers(t_lo, t_hi, size=self.B)
         self.gait  = self.rng.integers(0, n_gaits, size=self.B)
         self.count = self.rng.integers(self.smin, self.smax, size=self.B)
+        self._off  = {}                     # cached arange(L) per bptt
+
+    def _offsets(self, L):
+        off = self._off.get(L)
+        if off is None:
+            off = torch.arange(L, device=self.device, dtype=torch.long)
+            self._off[L] = off
+        return off
 
     def _rewind(self, b, L):
         hi = self.t_hi - L
@@ -660,47 +641,55 @@ class StreamSampler:
 
     def next_chunk(self, L):
         B = self.B
-        x   = np.zeros((L, B, self.spikes.shape[1]), dtype=np.float32)
         g   = np.zeros((L, B), dtype=np.int64)
-        y   = np.zeros((L, B, N_JOINTS), dtype=np.float32)
-        m   = np.zeros((L, B), dtype=np.float32)   # loss mask
         sw  = np.zeros((L, B), dtype=np.float32)   # 1 on the switch step
         reset_mask = np.zeros(B, dtype=np.float32)
 
+        # ── per-head bookkeeping: rewind + gait timeline (CPU) ────
         for b in range(B):
             if self.pos[b] + L > self.t_hi:
                 self._rewind(b, L)
                 reset_mask[b] = 1.0
-            s = self.pos[b]
-            x[:, b, :] = self.spikes[s:s + L]
 
-            # gait timeline for this head over the chunk
             gs = np.full(L, self.gait[b], dtype=np.int64)
             c  = self.count[b]
-            k  = 0
             while c < L:
                 new_g = self.rng.integers(0, self.n_gaits)
                 while new_g == gs[c] and self.n_gaits > 1:
                     new_g = self.rng.integers(0, self.n_gaits)
                 gs[c:] = new_g
                 sw[c, b] = 1.0
-                k = c
                 c += self.rng.integers(self.smin, self.smax)
             self.gait[b]  = int(gs[-1])
             self.count[b] = int(c - L)
-
             g[:, b] = gs
-            y[:, b, :] = self.targets[gs, np.arange(s, s + L), :]
-            m[:, b]    = self.valid[s:s + L].astype(np.float32)
-            self.pos[b] = s + L
 
-        return (torch.from_numpy(x), torch.from_numpy(g),
-                torch.from_numpy(y), torch.from_numpy(m),
-                torch.from_numpy(sw), torch.from_numpy(reset_mask))
+        # Capture the starts AFTER any rewind, then advance.
+        starts = self.pos.copy()
+        self.pos = self.pos + L
+
+        # ── on-device gather ─────────────────────────────────────
+        # idx[t, b] = which absolute timestep position t of head b refers to.
+        # pos[None,:] is (1,B) and off[:,None] is (L,1); broadcasting gives
+        # (L,B). Indexing a (T,4) tensor with an (L,B) index tensor replaces
+        # the indexed dim and keeps trailing dims -> (L,B,4), already in the
+        # layout the training loop wants, so no permutes.
+        dev   = self.device
+        pos_t = torch.as_tensor(starts, dtype=torch.long, device=dev)
+        idx   = pos_t[None, :] + self._offsets(L)[:, None]      # (L, B)
+        g_t   = torch.as_tensor(g, dtype=torch.long, device=dev)
+
+        x = self.spikes[idx]                                    # (L, B, 4)
+        y = self.targets[g_t, idx]                              # (L, B, J)
+        m = self.valid[idx]                                     # (L, B)
+
+        return (x, g_t, y, m,
+                torch.as_tensor(sw, dtype=torch.float32, device=dev),
+                torch.as_tensor(reset_mask, dtype=torch.float32, device=dev))
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 7.  Stateful leg-grouped SNN
+# 7.  Stateful SNN
 # ═══════════════════════════════════════════════════════════════════
 
 def spike_fn(x, slope=25.0):
@@ -761,134 +750,153 @@ def init_beta_logit(shape, tau_min, tau_max, generator=None):
     return torch.log(beta / (1.0 - beta))
 
 
-class LegGroupedSNN(nn.Module):
+class StatefulSNN(nn.Module):
     """
-    Input  : 4 binary CPG spikes per timestep  (nothing else)
-    Gait   : integer index, used for (a) input routing and (b) FiLM
-    Output : 8 joint angles per timestep
+    Input  : n_neurons binary CPG spikes per timestep  (nothing else)
+    Gait   : integer index, used only for FiLM conditioning
+    Output : n_joints joint angles per timestep
 
-    Hidden width `hidden` is split into 4 groups of `hidden//4`.  Group l:
-        - is driven by CPG neuron route[g, l]   (full-strength self drive)
-        - sees the other three neurons only through `cross_gain`
-        - reads out ONLY leg l's two joint columns
+    Fully connected: every CPG spike reaches every hidden unit, and both
+    hidden layers and the readout are dense.  There is no leg grouping and
+    no per-gait input routing.
 
-    So "leg l is moving" and "the neuron feeding group l is bursting" are
-    the same event by construction.
+    Why not leg-grouped (the previous design):
+      - Layers 2+ were block diagonal (4 x Hg x Hg), so the network was
+        four independent sub-networks and `cross_gain * w_cross` in layer 1
+        was the ONLY path between them.
+      - The routing permutation aligned each leg group with the CPG neuron
+        whose burst matched that leg's swing onset, but the residuals were
+        0.116-0.133 cycle for 3 of 4 gaits -- ~34 steps at period 254,
+        longer than a burst (~29 steps) -- so the alignment only held for
+        wkF and the network had to learn per-gait corrections anyway.
+      - `w_cross` already spanned all neurons, so routing was an
+        initialisation prior, not a capability. Removed.
 
-    Purely feedforward within a timestep; all memory lives in the three
-    leaky membranes, whose per-unit time constants are learnable and
-    initialised log-uniformly over [tau_min, tau_max].
+    Purely feedforward within a timestep; all cross-timestep memory lives
+    in the three leaky membranes, whose per-unit time constants are
+    learnable and initialised log-uniformly over [tau_min, tau_max].  With
+    no phase input and no recurrence, those taus are the ONLY mechanism
+    that can hold position within a ~254-step gait cycle, so tau_max must
+    comfortably exceed one period.
 
-    State (all (B, 4, Hg)): mem1, mem2, memo.
+    FiLM conditioning
+    -----------------
+    `film1`/`film2` are nn.Embedding LOOKUP TABLES, not linear layers:
+    they map an integer gait index to a (gamma, beta) pair per hidden
+    unit, applied AFTER LayerNorm.
+
+    After LayerNorm is the whole point.  A gait flag concatenated onto the
+    input contributes an additive term to the pre-activation, and
+    LayerNorm then subtracts the mean across the hidden dimension and
+    divides by the std -- removing the uniform part of that offset
+    outright and normalising away its scale.  Input concatenation is
+    therefore fought by the very layer that keeps the LIF from
+    saturating.  FiLM is applied after LN, so it survives, and gamma is
+    multiplicative, which lets a gait gate which units contribute rather
+    than merely bias them.
+
+    The table is OVER-ALLOCATED to `max_gaits` rows and only the first
+    `n_gaits` are used.  Unused rows initialise to identity modulation
+    (gamma=1, beta=0) and receive no gradient, so they are inert.  This
+    keeps every parameter shape independent of the gait count, so a
+    checkpoint trained on 4 gaits loads into a run using 8.  Embedding
+    lookup is O(1) in table size, so spare rows cost file size only.
+
+    State (all (B, H)): mem1, mem2, memo.
     """
 
-    def __init__(self, hidden=256, n_gaits=4, route_P=None,
-                 tau_min=2.0, tau_max=256.0, cross_gain=0.25,
-                 slope=25.0, thresh=1.0, n_neurons=4):
+    def __init__(self, hidden=128, n_gaits=4, max_gaits=16,
+                 tau_min=2.0, tau_max=256.0,
+                 slope=25.0, thresh=1.0, n_neurons=4, n_joints=N_JOINTS):
         super().__init__()
-        assert hidden % N_LEGS == 0, "hidden must be divisible by 4"
-        self.H       = hidden
-        self.Hg      = hidden // N_LEGS
-        self.G       = N_LEGS
-        self.n_gaits = n_gaits
-        self.slope   = slope
-        self.thresh  = thresh
-        Hg           = self.Hg
+        if n_gaits > max_gaits:
+            raise ValueError(
+                f"n_gaits ({n_gaits}) > max_gaits ({max_gaits}); raise "
+                f"--max_gaits. Note that changing max_gaits changes the FiLM "
+                f"parameter shape and so invalidates old checkpoints.")
+        self.H         = hidden
+        self.n_gaits   = n_gaits
+        self.max_gaits = max_gaits
+        self.slope     = slope
+        self.thresh    = thresh
 
-        if route_P is None:
-            route_P = np.tile(np.eye(n_neurons, dtype=np.float32),
-                              (n_gaits, 1, 1))
-        self.register_buffer("route_P", torch.tensor(route_P, dtype=torch.float32))
+        # ── layer 1: all CPG spikes -> all hidden units ───────────
+        # Scale 0.8 carries over from the old per-group self-drive. Only one
+        # CPG neuron fires per timestep, so cur1 is a single row of w_in and
+        # the magnitude matches the old design; LayerNorm follows anyway, so
+        # this mostly sets the gradient scale.
+        self.w_in   = nn.Parameter(torch.randn(n_neurons, hidden) * 0.8)
+        self.b1     = nn.Parameter(torch.zeros(hidden))
+        self.ln1    = nn.LayerNorm(hidden)
 
-        # ── layer 1: own-neuron drive + weak cross drive ──────────
-        self.w_self     = nn.Parameter(torch.randn(self.G, Hg) * 0.8)
-        self.w_cross    = nn.Parameter(torch.randn(n_neurons, self.H) * 0.2)
-        self.b1         = nn.Parameter(torch.zeros(self.G, Hg))
-        self.cross_gain = nn.Parameter(torch.tensor(float(cross_gain)))
-        self.ln1        = nn.LayerNorm(Hg)
+        # ── layer 2 ───────────────────────────────────────────────
+        self.w2     = nn.Parameter(torch.randn(hidden, hidden) / math.sqrt(hidden))
+        self.b2     = nn.Parameter(torch.zeros(hidden))
+        self.ln2    = nn.LayerNorm(hidden)
 
-        # ── layer 2: grouped feedforward ──────────────────────────
-        self.w2   = nn.Parameter(torch.randn(self.G, Hg, Hg) / math.sqrt(Hg))
-        self.b2   = nn.Parameter(torch.zeros(self.G, Hg))
-        self.ln2  = nn.LayerNorm(Hg)
-
-        # ── readout: non-spiking leaky membrane, then 2 angles ────
-        self.w_read = nn.Parameter(torch.randn(self.G, Hg, Hg) / math.sqrt(Hg))
-        self.b_read = nn.Parameter(torch.zeros(self.G, Hg))
-        self.w_out  = nn.Parameter(torch.randn(self.G, Hg, 2) / math.sqrt(Hg))
-        self.b_out  = nn.Parameter(torch.zeros(self.G, 2))
+        # ── readout: non-spiking leaky membrane, then joint angles ─
+        self.w_read = nn.Parameter(torch.randn(hidden, hidden) / math.sqrt(hidden))
+        self.b_read = nn.Parameter(torch.zeros(hidden))
+        self.w_out  = nn.Parameter(torch.randn(hidden, n_joints) / math.sqrt(hidden))
+        self.b_out  = nn.Parameter(torch.zeros(n_joints))
 
         # ── heterogeneous, learnable time constants ───────────────
-        self.beta1_logit = nn.Parameter(init_beta_logit((self.G, Hg), tau_min, tau_max))
-        self.beta2_logit = nn.Parameter(init_beta_logit((self.G, Hg), tau_min, tau_max))
-        self.betao_logit = nn.Parameter(init_beta_logit((self.G, Hg), 2.0, 40.0))
+        self.beta1_logit = nn.Parameter(init_beta_logit((hidden,), tau_min, tau_max))
+        self.beta2_logit = nn.Parameter(init_beta_logit((hidden,), tau_min, tau_max))
+        self.betao_logit = nn.Parameter(init_beta_logit((hidden,), 2.0, 40.0))
 
-        # ── FiLM: per-gait scale/shift on each layer's input current ──
-        self.film1 = nn.Embedding(n_gaits, 2 * self.H)
-        self.film2 = nn.Embedding(n_gaits, 2 * self.H)
+        # ── FiLM: per-gait scale/shift, over-allocated ────────────
+        self.film1 = nn.Embedding(max_gaits, 2 * hidden)
+        self.film2 = nn.Embedding(max_gaits, 2 * hidden)
         for e in (self.film1, self.film2):
             nn.init.zeros_(e.weight)
-            e.weight.data[:, :self.H] = 1.0     # gamma := 1, beta := 0
+            e.weight.data[:, :hidden] = 1.0     # gamma := 1, beta := 0
 
     # ---------------------------------------------------------------
     def init_state(self, batch, device, dtype=torch.float32):
         """State is (mem1, mem2, memo) -- the three leaky membranes."""
-        z = lambda: torch.zeros(batch, self.G, self.Hg, device=device, dtype=dtype)
+        z = lambda: torch.zeros(batch, self.H, device=device, dtype=dtype)
         return (z(), z(), z())
-
-    def _film(self, emb, gait):
-        v = emb(gait)                                     # (B, 2H)
-        gamma, beta = v[:, :self.H], v[:, self.H:]
-        return (gamma.view(-1, self.G, self.Hg),
-                beta.view(-1, self.G, self.Hg))
 
     def step(self, x, gait, state):
         """
         x     : (B, n_neurons) float — CPG spikes this timestep
         gait  : (B,) int64
-        state : 3-tuple (mem1, mem2, memo), each (B, G, Hg)
+        state : 3-tuple (mem1, mem2, memo), each (B, H)
 
-        Feedforward within a timestep: spk1 and spk2 are local, consumed by
-        the next layer in the same step and never carried across steps.
-        All cross-timestep memory is in the three leaky membranes.
+        Feedforward within a timestep: spk1/spk2 are local, consumed by the
+        next layer in the same step and never carried across steps.
+        `addmm` folds each bias into its matmul, one kernel per layer.
         """
         mem1, mem2, memo = state
-        B = x.shape[0]
 
-        # gait-conditioned input routing: leg l <- CPG neuron route[g, l]
-        P  = self.route_P[gait]                            # (B, n_neurons, G)
-        xr = torch.bmm(x.unsqueeze(1), P).squeeze(1)       # (B, G)
-
-        g1, f1 = self._film(self.film1, gait)
-        g2, f2 = self._film(self.film2, gait)
+        v1 = self.film1(gait)                              # (B, 2H)
+        v2 = self.film2(gait)
+        g1, f1 = v1[:, :self.H], v1[:, self.H:]
+        g2, f2 = v2[:, :self.H], v2[:, self.H:]
 
         # ---- layer 1 -------------------------------------------------
-        cur1 = (torch.einsum("bg,gh->bgh", xr, self.w_self)
-                + self.cross_gain * (x @ self.w_cross).view(B, self.G, self.Hg)
-                + self.b1)
-        cur1 = self.ln1(cur1) * g1 + f1
+        cur1  = torch.addmm(self.b1, x, self.w_in)
+        cur1  = self.ln1(cur1) * g1 + f1
         beta1 = torch.sigmoid(self.beta1_logit)
         mem1  = beta1 * mem1 + cur1
         spk1  = spike_fn(mem1 - self.thresh, self.slope)
         mem1  = mem1 - self.thresh * spk1
 
         # ---- layer 2 -------------------------------------------------
-        cur2 = (torch.einsum("bgh,ghk->bgk", spk1, self.w2)
-                + self.b2)
-        cur2 = self.ln2(cur2) * g2 + f2
+        cur2  = torch.addmm(self.b2, spk1, self.w2)
+        cur2  = self.ln2(cur2) * g2 + f2
         beta2 = torch.sigmoid(self.beta2_logit)
         mem2  = beta2 * mem2 + cur2
         spk2  = spike_fn(mem2 - self.thresh, self.slope)
         mem2  = mem2 - self.thresh * spk2
 
         # ---- analog readout -----------------------------------------
-        curo  = torch.einsum("bgh,ghk->bgk", spk2, self.w_read) + self.b_read
+        curo  = torch.addmm(self.b_read, spk2, self.w_read)
         betao = torch.sigmoid(self.betao_logit)
         memo  = betao * memo + curo
 
-        out = torch.einsum("bgh,ghj->bgj", memo, self.w_out) + self.b_out  # (B,G,2)
-        y   = torch.cat([out[:, :, 0], out[:, :, 1]], dim=1)               # (B,8)
-
+        y = torch.addmm(self.b_out, memo, self.w_out)       # (B, n_joints)
         return y, (mem1, mem2, memo)
 
     def forward(self, x_seq, gait_seq, state=None):
@@ -896,13 +904,7 @@ class LegGroupedSNN(nn.Module):
         x_seq    : (L, B, n_neurons)
         gait_seq : (L, B)
 
-        Returns (y_seq, state) with y_seq (L, B, 8).
-
-        The old `return_spikes` option is gone: it read spk1/spk2 out of
-        the state tuple, and those are no longer carried across timesteps.
-        Hidden-layer rasters would now need step() to return the spikes,
-        which would change the ONNX signature -- not worth it for a
-        diagnostic. Add a separate non-exported path if they're wanted.
+        Returns (y_seq, state) with y_seq (L, B, n_joints).
         """
         L, B = x_seq.shape[0], x_seq.shape[1]
         if state is None:
@@ -911,8 +913,7 @@ class LegGroupedSNN(nn.Module):
         for t in range(L):
             y, state = self.step(x_seq[t], gait_seq[t], state)
             ys.append(y)
-        y_seq = torch.stack(ys)                                # (L,B,8)
-        return y_seq, state
+        return torch.stack(ys), state
 
 
 class SingleStepONNX(nn.Module):
@@ -1095,40 +1096,6 @@ def plot_cpg_raster(spikes, onsets, out_dir, n_show=1200):
     print(f"    [saved] {p}")
 
 
-def plot_leg_alignment(spikes, onsets, targets, route, out_dir,
-                       t0, n_show=800, tgt_range=(0, 1)):
-    """
-    THE diagnostic for this rewrite: for each gait, leg l's joint-A target is
-    plotted with vertical lines at the burst onsets of the neuron that drives
-    leg l.  If the assignment is right, every leg's swing starts on a line.
-    """
-    lo, hi = tgt_range
-    scale, shift = (hi - lo) / 2.0, (hi + lo) / 2.0
-    G = targets.shape[0]
-    colors = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261"]
-    sl = slice(t0, t0 + n_show)
-
-    fig, axes = plt.subplots(G, 1, figsize=(15, 3.0 * G), sharex=True)
-    for g in range(G):
-        ax = axes[g]
-        for l in range(N_LEGS):
-            col = LEG_COLS[l][0]
-            ax.plot(np.arange(t0, t0 + n_show),
-                    targets[g, sl, col] * scale + shift,
-                    color=colors[l], lw=1.6, label=f"leg{l} (N{route[g, l]})")
-            on = onsets[route[g, l]]
-            for b in on[(on >= t0) & (on < t0 + n_show)]:
-                ax.axvline(b, color=colors[l], lw=1.0, alpha=0.35, ls="--")
-        ax.set_title(f"{GAIT_NAMES[g]} — leg joint-A target vs driving neuron's bursts",
-                     fontsize=10)
-        ax.set_ylabel("angle (deg)"); ax.legend(fontsize=7, ncol=4)
-        ax.grid(alpha=0.25)
-    axes[-1].set_xlabel("timestep")
-    plt.tight_layout()
-    p = out_dir / "leg_alignment.png"
-    plt.savefig(p, dpi=140); plt.close()
-    print(f"    [saved] {p}")
-
 
 def plot_training_curves(hist, out_dir):
     fig, ax = plt.subplots(figsize=(10, 4))
@@ -1147,7 +1114,7 @@ def plot_training_curves(hist, out_dir):
 
 
 @torch.no_grad()
-def plot_reconstruction(model, spikes, targets, valid, route, device,
+def plot_reconstruction(model, spikes, targets, valid, device,
                         out_dir, tgt_range, t0, n_steps=1200, warm=600):
     """Free-run the network on held-out steps, one plot per gait."""
     lo, hi = tgt_range
@@ -1260,7 +1227,7 @@ def export_onnx(model, out_dir, device, cfg):
 
         dummy = (torch.zeros(1, 4, device=device),
                  torch.zeros(1, dtype=torch.long, device=device),
-                 *[torch.zeros(1, model.G, model.Hg, device=device)
+                 *[torch.zeros(1, model.H, device=device)
                    for _ in range(3)])
 
         in_names  = ["spikes", "gait", "mem1_in", "mem2_in", "memo_in"]
@@ -1317,7 +1284,18 @@ def main():
     ap.add_argument("--i_app",  type=float, default=8.0)
 
     # network
-    ap.add_argument("--hidden",     type=int,   default=256)
+    ap.add_argument("--hidden",     type=int,   default=128,
+                    help="Hidden width. Fully connected now, so w2/w_read are "
+                         "dense (H x H) rather than 4 blocks of (H/4 x H/4) — "
+                         "h=128 lands at roughly the old grouped h=256 "
+                         "parameter count; h=256 is ~3.5x larger.")
+    ap.add_argument("--max_gaits",  type=int,   default=16,
+                    help="Rows allocated in the FiLM embedding tables. Only "
+                         "the first n_gaits are used; the rest are inert "
+                         "(identity modulation, no gradient). Fixing this "
+                         "keeps every parameter shape independent of the gait "
+                         "count, so checkpoints transfer between runs with "
+                         "different numbers of gaits. Changing it does NOT.")
     ap.add_argument("--tau_min",    type=float, default=2.0)
     ap.add_argument("--tau_max",    type=float, default=256.0,
                     help="Longest membrane time constant, in steps. Lowered "
@@ -1327,9 +1305,6 @@ def main():
                          "(silent gap ~34). One full CPG period (~254) is "
                          "the natural ceiling; 500 was overkill. Sweep "
                          "150-256.")
-    ap.add_argument("--cross_gain", type=float, default=0.25,
-                    help="Initial strength of non-own-neuron drive into a leg "
-                         "group. 0.0 = strictly one neuron per leg.")
     ap.add_argument("--slope",      type=float, default=25.0)
 
     # training
@@ -1400,8 +1375,6 @@ def main():
         print(f"      {nm:>4s} : {g.shape[0]} rows x {g.shape[1]} joints (original)")
     gait_tables, target_rows = upsample_gait_tables(GAIT_TABLES_ORIG, GAIT_NAMES)
 
-    route  = solve_leg_routing(GAIT_TABLES_ORIG, GAIT_NAMES, neuron_offsets)
-    P      = routing_matrices(route, n_neurons=4)
     print(f"\n      leg->servo: " +
           ", ".join(f"leg{l}=servo({LEG_COLS[l][0]+SERVO_BASE},"
                     f"{LEG_COLS[l][1]+SERVO_BASE})" for l in range(N_LEGS)))
@@ -1411,10 +1384,6 @@ def main():
     print(f"      targets {targets.shape}   valid coverage "
           f"{valid.mean()*100:.2f}%   range [{tgt_range[0]:.1f}, "
           f"{tgt_range[1]:.1f}] deg")
-
-    t_first = int(onsets[0][2])
-    plot_leg_alignment(spikes, onsets, targets, route, out_dir,
-                       t0=t_first, tgt_range=tgt_range)
 
     # ── 4. Samplers ─────────────────────────────────────────────
     print("\n[4/6] Stream samplers (truncated BPTT, state carried) ...")
@@ -1427,20 +1396,21 @@ def main():
     if t_split - t_lo < 4 * args.bptt or t_hi - t_split < 2 * args.bptt:
         raise ValueError("Not enough timesteps — raise --tmax or lower --bptt.")
 
+    # Data lives on the training device; batches are gathered there.
     tr_sampler = StreamSampler(spikes, targets, valid, t_lo, t_split,
                                args.batch, args.switch_min, args.switch_max,
-                               rng, n_gaits=len(gait_tables))
+                               rng, n_gaits=len(gait_tables), device=device)
     va_sampler = StreamSampler(spikes, targets, valid, t_split, t_hi,
                                args.batch, args.switch_min, args.switch_max,
                                np.random.default_rng(args.seed + 1),
-                               n_gaits=len(gait_tables))
+                               n_gaits=len(gait_tables), device=device)
 
     # ── 5. Model + training ─────────────────────────────────────
     print("\n[5/6] Model ...")
-    model = LegGroupedSNN(hidden=args.hidden, n_gaits=len(gait_tables),
-                          route_P=P, tau_min=args.tau_min,
-                          tau_max=args.tau_max, cross_gain=args.cross_gain,
-                          slope=args.slope).to(device)
+    model = StatefulSNN(hidden=args.hidden, n_gaits=len(gait_tables),
+                        max_gaits=args.max_gaits,
+                        tau_min=args.tau_min, tau_max=args.tau_max,
+                        slope=args.slope, n_joints=N_JOINTS).to(device)
 
     # ── Compile the single timestep, NOT forward() ────────────────
     # forward() loops over L (= --bptt, 256-512) timesteps in Python.
@@ -1469,7 +1439,12 @@ def main():
         print(f"      torch.compile: SKIPPED (device={device.type}, not cuda)")
 
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"      hidden={args.hidden} ({model.Hg}/leg)  params={n_par:,}")
+    print(f"      hidden={args.hidden}  params={n_par:,}  "
+          f"(fully connected, no leg grouping)")
+    n_film = model.film1.weight.numel() + model.film2.weight.numel()
+    print(f"      FiLM table : {n_film:,} params for max_gaits="
+          f"{args.max_gaits}, of which {len(gait_tables)} row(s) in use; "
+          f"unused rows are identity modulation and get no gradient")
     print(f"      tau range [{args.tau_min:.0f}, {args.tau_max:.0f}] steps "
           f"vs CPG period {period:.0f}")
     if args.tau_max < period:
@@ -1509,7 +1484,7 @@ def main():
     # ── 6. Eval + export ────────────────────────────────────────
     print("\n[6/6] Evaluation & export ...")
     t_eval = max(t_split + 800, t_lo + 800)
-    rmse = plot_reconstruction(model, spikes, targets, valid, route, device,
+    rmse = plot_reconstruction(model, spikes, targets, valid, device,
                                out_dir, tgt_range, t0=t_eval)
     plot_transition(model, spikes, targets, device, out_dir, tgt_range,
                     t0=t_eval, g_from=0, g_to=1)
@@ -1527,7 +1502,7 @@ def main():
         # ── deployment-critical: inference.py reads these by name at
         #    the top level.  Do not move or rename them. ───────────
         "hidden":           args.hidden,
-        "hidden_per_leg":   model.Hg,
+        "max_gaits":        int(args.max_gaits),
         "n_gaits":          len(gait_tables),
         "n_legs":           N_LEGS,
         "n_joints":         N_JOINTS,
@@ -1535,7 +1510,6 @@ def main():
         "gait_names":       GAIT_NAMES,
         "leg_cols":         [list(c) for c in LEG_COLS],
         "servo_base":       SERVO_BASE,
-        "route_leg2neuron": route.tolist(),
         "global_min":       float(tgt_range[0]),
         "global_max":       float(tgt_range[1]),
         "target_rows":      int(target_rows),
@@ -1577,18 +1551,20 @@ def main():
 
         # ── model detail (not needed to run, useful to reproduce) ──
         "model_detail": {
-            "class":            "LegGroupedSNN",
+            "class":            "StatefulSNN",
+            "fully_connected":  True,
+            "leg_grouped":      False,
+            "input_routing":    False,
             "n_params":         int(n_par),
             "recurrent":        False,
             "tau_min":          float(args.tau_min),
             "tau_max":          float(args.tau_max),
-            "cross_gain_init":  float(args.cross_gain),
             "slope":            float(args.slope),
             "thresh":           1.0,
             "surrogate":        "fast-sigmoid straight-through "
                                 "(plain ops, bit-exact forward)",
             "state_tensors":    ["mem1", "mem2", "memo"],
-            "state_shape":      [1, N_LEGS, model.Hg],
+            "state_shape":      [1, args.hidden],
             "onnx_inputs":      ["spikes", "gait", "mem1_in", "mem2_in",
                                  "memo_in"],
             "onnx_outputs":     ["angles", "mem1_out", "mem2_out",
