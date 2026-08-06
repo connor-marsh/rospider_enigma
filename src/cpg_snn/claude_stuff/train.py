@@ -775,7 +775,8 @@ class LegGroupedSNN(nn.Module):
 
     def __init__(self, hidden=256, n_gaits=4, route_P=None,
                  tau_min=2.0, tau_max=500.0, cross_gain=0.25,
-                 slope=25.0, thresh=1.0, n_neurons=4):
+                 slope=25.0, thresh=1.0, n_neurons=4,
+                 use_recurrence=True):
         super().__init__()
         assert hidden % N_LEGS == 0, "hidden must be divisible by 4"
         self.H       = hidden
@@ -784,6 +785,12 @@ class LegGroupedSNN(nn.Module):
         self.n_gaits = n_gaits
         self.slope   = slope
         self.thresh  = thresh
+        # Plain Python bool, NOT a buffer or tensor: Dynamo guards on its
+        # value and resolves the branch in step() at trace time, so
+        # use_recurrence=False produces a graph with the recurrent einsums
+        # absent rather than multiplied by zero. Changing it after
+        # construction triggers a recompile.
+        self.use_recurrence = bool(use_recurrence)
         Hg           = self.Hg
 
         if route_P is None:
@@ -850,10 +857,27 @@ class LegGroupedSNN(nn.Module):
         g1, f1 = self._film(self.film1, gait)
         g2, f2 = self._film(self.film2, gait)
 
+        # Recurrent terms, gated by the ablation flag. Written as a
+        # separate term added in the SAME position as before so that
+        # use_recurrence=True is bit-identical to the pre-flag version:
+        # adding a Python 0.0 is an exact IEEE-754 identity, and Inductor
+        # folds it away, so the disabled path costs nothing.
+        #
+        # NOTE which spk is which. rec1 consumes spk1 from the PREVIOUS
+        # timestep (spk1 is rebound below), and rec2 consumes spk2 from the
+        # previous timestep. These two einsums are the only consumers of
+        # the incoming spk1/spk2, so with recurrence off those two state
+        # slots become inert -- but mem1/mem2/memo are still carried, since
+        # the leaky membranes are what make this a stateful SNN at all.
+        rec1_term = (torch.einsum("bgh,ghk->bgk", spk1, self.rec1)
+                     if self.use_recurrence else 0.0)
+        rec2_term = (torch.einsum("bgh,ghk->bgk", spk2, self.rec2)
+                     if self.use_recurrence else 0.0)
+
         # ---- layer 1 -------------------------------------------------
         cur1 = (torch.einsum("bg,gh->bgh", xr, self.w_self)
                 + self.cross_gain * (x @ self.w_cross).view(B, self.G, self.Hg)
-                + torch.einsum("bgh,ghk->bgk", spk1, self.rec1)
+                + rec1_term
                 + self.b1)
         cur1 = self.ln1(cur1) * g1 + f1
         beta1 = torch.sigmoid(self.beta1_logit)
@@ -863,7 +887,7 @@ class LegGroupedSNN(nn.Module):
 
         # ---- layer 2 -------------------------------------------------
         cur2 = (torch.einsum("bgh,ghk->bgk", spk1, self.w2)
-                + torch.einsum("bgh,ghk->bgk", spk2, self.rec2)
+                + rec2_term
                 + self.b2)
         cur2 = self.ln2(cur2) * g2 + f2
         beta2 = torch.sigmoid(self.beta2_logit)
@@ -1307,6 +1331,19 @@ def main():
                     help="Initial strength of non-own-neuron drive into a leg "
                          "group. 0.0 = strictly one neuron per leg.")
     ap.add_argument("--slope",      type=float, default=25.0)
+    ap.add_argument("--no_recurrence", action="store_true",
+                    help="Ablate the within-group recurrent connections "
+                         "(rec1/rec2, ~45%% of all parameters). The leaky "
+                         "membranes and heterogeneous taus still provide "
+                         "memory, so this tests whether recurrence earns its "
+                         "cost. Judge on free-run reconstruction RMSE and "
+                         "Val(post-sw), NOT training loss -- a smaller model "
+                         "can show higher train loss and generalise the same. "
+                         "Keep tau_max >= one CPG period when ablating, since "
+                         "taus become the only long-timescale mechanism. "
+                         "The rec1/rec2 parameters stay registered so the "
+                         "state tuple, ONNX signature and checkpoints are "
+                         "unchanged; they simply receive no gradient.")
 
     # training
     ap.add_argument("--epochs",           type=int,   default=300)
@@ -1407,7 +1444,8 @@ def main():
     model = LegGroupedSNN(hidden=args.hidden, n_gaits=len(gait_tables),
                           route_P=P, tau_min=args.tau_min,
                           tau_max=args.tau_max, cross_gain=args.cross_gain,
-                          slope=args.slope).to(device)
+                          slope=args.slope,
+                          use_recurrence=not args.no_recurrence).to(device)
 
     # ── Compile the single timestep, NOT forward() ────────────────
     # forward() loops over L (= --bptt, 256-512) timesteps in Python.
@@ -1436,7 +1474,19 @@ def main():
         print(f"      torch.compile: SKIPPED (device={device.type}, not cuda)")
 
     n_par = sum(p.numel() for p in model.parameters())
+    n_rec = sum(p.numel() for n, p in model.named_parameters()
+                if n.startswith("rec"))
+    n_active = n_par - (0 if model.use_recurrence else n_rec)
     print(f"      hidden={args.hidden} ({model.Hg}/leg)  params={n_par:,}")
+    print(f"      recurrent params : {n_rec:,} "
+          f"({100.0 * n_rec / max(n_par, 1):.0f}% of total) — "
+          f"{'ACTIVE' if model.use_recurrence else 'INERT (ablated)'}")
+    if not model.use_recurrence:
+        print(f"      active params    : {n_active:,}")
+        if args.tau_max < period:
+            print(f"      WARNING: tau_max={args.tau_max:.0f} < CPG period "
+                  f"{period:.0f}. With recurrence ablated, taus are the ONLY "
+                  f"long-timescale memory — raise tau_max to >= one period.")
     print(f"      tau range [{args.tau_min:.0f}, {args.tau_max:.0f}] steps "
           f"vs CPG period {period:.0f}")
     gait_w = make_gait_weights(GAIT_TABLES_ORIG, device)
@@ -1533,6 +1583,9 @@ def main():
         "model_detail": {
             "class":            "LegGroupedSNN",
             "n_params":         int(n_par),
+            "n_params_recurrent": int(n_rec),
+            "n_params_active":  int(n_active),
+            "use_recurrence":   bool(model.use_recurrence),
             "tau_min":          float(args.tau_min),
             "tau_max":          float(args.tau_max),
             "cross_gain_init":  float(args.cross_gain),

@@ -104,6 +104,16 @@ VARIANT_SETS = {
 
     # The optimisation ladder from the speedup todo list. Each row adds one
     # thing to the row above it, so the deltas are attributable.
+    #
+    # No reduce-overhead variants: CUDA graphs are structurally
+    # incompatible with this model. forward() calls step() ~256 times
+    # before backward(), and autograd retains every invocation's outputs
+    # for the backward pass -- but CUDA graphs give one static buffer set,
+    # so invocation N+1 overwrites tensors N still needs. It raises
+    # "accessing tensor output of CUDAGraphs that has been overwritten".
+    # The only fix is compiling the whole 256-step forward as one graph,
+    # which is the unroll we rejected on compile time. Measured, not
+    # assumed -- see bench_results.jsonl history.
     "full": [
         ("eager_b32",        dict(batch=32,  compile=None)),
         ("eager_b128",       dict(batch=128, compile=None)),
@@ -111,8 +121,17 @@ VARIANT_SETS = {
         ("compile_b128",     dict(batch=128, compile="default")),
         ("compile_b256",     dict(batch=256, compile="default")),
         ("compile_b512",     dict(batch=512, compile="default")),
-        ("cudagraph_b128",   dict(batch=128, compile="reduce-overhead")),
-        ("cudagraph_b256",   dict(batch=256, compile="reduce-overhead")),
+    ],
+
+    # Does the recurrence (rec1/rec2, ~45% of all parameters) earn its
+    # cost? This set answers the SPEED half only. The quality half needs a
+    # real training run judged on free-run reconstruction RMSE and
+    # Val(post-sw) -- loss@N here is far too early to tell.
+    "recurrence": [
+        ("rec_on",           dict(use_recurrence=True)),
+        ("rec_off",          dict(use_recurrence=False)),
+        ("rec_on_b512",      dict(use_recurrence=True,  batch=512)),
+        ("rec_off_b512",     dict(use_recurrence=False, batch=512)),
     ],
 
     # Where does batch scaling stop being free? Compiled throughout, so
@@ -521,7 +540,8 @@ def time_val_steps(model, sampler, device, batch, bptt, settle,
 
 NUMERICS_FIELDS = ("batch", "bptt", "hidden", "seed", "tmax", "warmup",
                    "i_app", "tau_min", "tau_max", "cross_gain", "slope",
-                   "switch_min", "switch_max", "clip", "lr", "val_frac")
+                   "switch_min", "switch_max", "clip", "lr", "val_frac",
+                   "use_recurrence")
 
 
 def numerics_key(cfg):
@@ -540,7 +560,8 @@ def numerics_key(cfg):
 def run_variant(name, cfg, data, device, args, eager_ref=None):
     print(f"\n─── {name} " + "─" * max(0, 56 - len(name)))
     print(f"    batch={cfg['batch']}  bptt={cfg['bptt']}  "
-          f"hidden={cfg['hidden']}  compile={cfg['compile'] or 'eager'}")
+          f"hidden={cfg['hidden']}  compile={cfg['compile'] or 'eager'}  "
+          f"recurrence={'on' if cfg['use_recurrence'] else 'OFF'}")
 
     bptt, batch = cfg["bptt"], cfg["batch"]
 
@@ -569,11 +590,18 @@ def run_variant(name, cfg, data, device, args, eager_ref=None):
             hidden=cfg["hidden"], n_gaits=data["n_gaits"],
             route_P=data["route_P"], tau_min=cfg["tau_min"],
             tau_max=cfg["tau_max"], cross_gain=cfg["cross_gain"],
-            slope=cfg["slope"]).to(device)
+            slope=cfg["slope"],
+            use_recurrence=cfg["use_recurrence"]).to(device)
 
         compile_label = _compile_step(model, cfg["compile"])
 
         n_par = sum(p.numel() for p in model.parameters())
+        # rec1/rec2 stay registered when ablated so state/ONNX/checkpoints
+        # are unchanged, which means n_params does NOT drop. Report the
+        # active count separately or the ablation looks free.
+        n_rec = sum(p.numel() for n, p in model.named_parameters()
+                    if n.startswith("rec"))
+        n_active = n_par - (0 if model.use_recurrence else n_rec)
         opt   = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
 
         sink = io.StringIO()
@@ -643,6 +671,9 @@ def run_variant(name, cfg, data, device, args, eager_ref=None):
         "torch":            torch.__version__,
         "compile":          compile_label,
         "n_params":         int(n_par),
+        "n_params_recurrent": int(n_rec),
+        "n_params_active":  int(n_active),
+        "use_recurrence":   bool(cfg["use_recurrence"]),
         # compile verification
         "compiled_ok":          compiled_ok,
         "dynamo_frames_ok":     watch.frames_ok,
@@ -823,10 +854,10 @@ def write_report(out_dir, baseline=None):
 
         L.append("### Performance")
         L.append("")
-        L.append("| variant | commit | batch | bptt | hidden | compile | "
+        L.append("| variant | commit | batch | bptt | hidden | rec | compile | "
                  "compiled? | warm/meas | ms/step | M sTS/s | speedup | "
                  "peak GiB | first step s | val ms | est epoch s |")
-        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for r in grp:
             g = r.get("git") or {}
             commit = g.get("commit") or "—"
@@ -840,10 +871,12 @@ def write_report(out_dir, baseline=None):
                 ok_s = {True: "yes", False: "**FELL BACK**",
                         None: "?"}.get(ok, "?")
             wm = f"{r.get('n_warmup','?')}/{r.get('n_measure','?')}"
+            ur = r.get("use_recurrence", c.get("use_recurrence"))
+            rec_s = "—" if ur is None else ("on" if ur else "**off**")
             L.append(
                 f"| {r.get('variant','?')} | {commit} | "
                 f"{c.get('batch','—')} | {c.get('bptt','—')} | "
-                f"{c.get('hidden','—')} | {r.get('compile','—')} | "
+                f"{c.get('hidden','—')} | {rec_s} | {r.get('compile','—')} | "
                 f"{ok_s} | {wm} | "
                 f"{_fmt(r.get('ms_median'))} | "
                 f"{_fmt(r.get('msts_per_s') or (thr(r) / 1e6 or None), '{:.3f}')} | "
@@ -873,17 +906,20 @@ def write_report(out_dir, baseline=None):
                  "or `inf` means the loss actually went non-finite. "
                  "`varying` = no means the stacked output collapsed "
                  "(suspect CUDA-graph output aliasing) and the row should "
-                 "be discarded.")
+                 "be discarded. `active params` excludes rec1/rec2 when "
+                 "recurrence is ablated — they stay registered so state, "
+                 "ONNX and checkpoints are unchanged, so the raw parameter "
+                 "count does not drop.")
         L.append("")
         loss_cols = " | ".join(f"loss@{s}" for s in LOSS_STEPS)
         L.append(f"| variant | commit | nkey | {loss_cols} | 1st nonfinite | "
-                 f"varying | params |")
+                 f"varying | active params |")
         L.append("|---|---|---|" + "---|" * len(LOSS_STEPS) + "---|---|---|")
         for r in grp:
             g = r.get("git") or {}
             commit = g.get("commit") or "—"
             lo = r.get("loss") or {}
-            npar = r.get("n_params")
+            npar = r.get("n_params_active", r.get("n_params"))
             npar_s = f"{npar:,}" if isinstance(npar, int) else "—"
             sanity = r.get("sanity")
             if sanity is None:
@@ -928,6 +964,7 @@ def build_cfg(args, overrides, cpg_warmup):
         switch_min=args.switch_min, switch_max=args.switch_max,
         tmax=args.tmax, warmup=cpg_warmup, i_app=args.i_app,
         val_frac=args.val_frac, phase_zero=args.phase_zero,
+        use_recurrence=not args.no_recurrence,
     )
     cfg.update(overrides)
     return cfg
@@ -984,6 +1021,9 @@ def main():
     ap.add_argument("--tau_max",    type=float, default=256.0)
     ap.add_argument("--cross_gain", type=float, default=0.25)
     ap.add_argument("--slope",      type=float, default=25.0)
+    ap.add_argument("--no_recurrence", action="store_true",
+                    help="Ablate rec1/rec2 (~45%% of parameters). Overridden "
+                         "per-variant by the 'recurrence' set.")
     ap.add_argument("--switch_min", type=int,   default=600)
     ap.add_argument("--switch_max", type=int,   default=3000)
 
@@ -1000,7 +1040,7 @@ def main():
     ap.add_argument("--seed",    type=int, default=42)
     ap.add_argument("--device",  type=str, default=None,
                     help="cuda | cpu. Default: cuda if available.")
-    ap.add_argument("--out_dir", type=str, default="bench")
+    ap.add_argument("--out_dir", type=str, default="outputs/bench")
     ap.add_argument("--report_only", action="store_true",
                     help="Regenerate bench_results.md from history and exit.")
     args = ap.parse_args()
