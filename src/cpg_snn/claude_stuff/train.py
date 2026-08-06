@@ -42,13 +42,13 @@ What changed vs. the previous (conductance-based CPG + event-window) version
     while slightly improving step time and memory, so they were removed.
     See git history before the removal commit to reproduce that test.
 
-4.  Fully connected (was: one CPG neuron per leg).
+4.  `--arch dense` (StatefulSNN): fully connected.
     Every CPG spike reaches every hidden unit, both hidden layers are
     dense, and the readout maps the whole hidden state to all 8 joints.
 
-    The previous design split the hidden layer into 4 leg groups, drove
+    The design BEFORE that split the hidden layer into 4 leg groups, drove
     group l with a single CPG neuron chosen by a per-gait permutation, and
-    read leg l's two joints out of group l only.  Both parts are gone:
+    read leg l's two joints out of group l only.  Both parts were removed:
 
       - The grouping made layers 2+ block diagonal (4 x Hg x Hg), i.e.
         four independent sub-networks, with `cross_gain * w_cross` in
@@ -66,6 +66,37 @@ What changed vs. the previous (conductance-based CPG + event-window) version
     j of the gait table lands on servo j + SERVO_BASE.
 
     >>> CHECK THIS <<<  see LEG_COLS / SERVO_BASE below.
+
+5.  `--arch timing_grouped` (TimingGroupedSNN): grouping, reintroduced.
+    CPG spikes -> a small TIMING layer of n_timing LIF neurons (densely
+    driven, so n_timing need NOT equal n_cpg_neurons) -> n_timing fully
+    disconnected sub-networks, one per timing neuron, each two spiking
+    layers of `--hidden` units plus a block-diagonal analog readout.  Group
+    g writes only its own gait-table columns (see build_group_cols).
+
+    The split of labour: the timing layer learns the RHYTHM in a few
+    hundred parameters; the sub-networks learn ANGLES given a clean phase
+    reference, instead of four copies of the network each re-deriving phase
+    from raw CPG spikes.
+
+    What makes the grouping viable this time is per-gait input weights.
+    The old routing was a fixed permutation solved offline, and its phase
+    alignment held for only 1 of 4 gaits.  Here CPG->timing is a per-gait
+    learned matrix (`w_in_gait`, an Embedding lookup), which is what lets
+    footfall ORDER change between gaits.  FiLM alone cannot do that -- it
+    is one scale and one shift per unit, so it cannot reorder which CPG
+    neuron drives which timing neuron.  See the TimingGroupedSNN docstring.
+
+    This is todo 3a (no cross talk).  3b -- every sub-network sees all
+    n_timing timing spikes -- is a one-line change to sub-net layer 1 and
+    is deliberately not wired up yet.
+
+6.  CPG size is an argument.
+    `--n_cpg_neurons {3,4,6}` selects a coupling matrix from CPG_W_BY_N and
+    sizes the SNN input; nothing downstream assumes 4.  Read the provenance
+    note above CPG_W_BY_N before using N=3 or N=6 -- those matrices came
+    from a different from_fb_weight regime, and `--from_fb_weight` exists
+    for that reason.
 
 Leg / joint layout  (LEG_COLS)
 ------------------------------
@@ -87,8 +118,20 @@ so gait-table column j lands on servo index j + 8.
 
 Usage
 -----
-    python cpg_lif_snn_train.py --epochs 300 --hidden 256
-    python cpg_lif_snn_train.py --dry_run          # data + plots, no training
+    python train.py --epochs 300 --hidden 256
+    python train.py --dry_run                       # data + plots, no training
+
+    # timing layer + per-leg sub-networks (todo 3a)
+    python train.py --arch timing_grouped --hidden 256
+
+    # matched-parameter comparison against dense --hidden 256
+    python train.py --arch timing_grouped --hidden 128
+
+    # sanity-check the timing layer's firing regime before committing
+    python train.py --arch timing_grouped --dry_run
+
+    # 6-neuron CPG; see the from_fb_weight caveat above CPG_W_BY_N
+    python train.py --n_cpg_neurons 6 --from_fb_weight -1e6
 """
 
 import argparse
@@ -125,6 +168,45 @@ LEG_COLS   = [(0, 4), (1, 5), (2, 6), (3, 7)]
 SERVO_BASE = 8
 N_LEGS     = 4
 N_JOINTS   = 8
+
+# Long enough for a 6-neuron CPG; indexed modulo its own length everywhere.
+CPG_PALETTE = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261",
+               "#6a0572", "#8ecae6"]
+
+
+def build_group_cols(n_timing, leg_cols=LEG_COLS, n_joints=N_JOINTS):
+    """
+    Map sub-network index -> the gait-table output columns it owns.
+
+    `n_timing` is the number of timing neurons, and there is exactly one
+    disconnected sub-network per timing neuron, so this also fixes how the
+    8 output columns are partitioned:
+
+        n_timing == n_legs   -> group l owns LEG_COLS[l], e.g. (l, l+4)
+        n_timing == n_joints -> group j owns column j alone
+
+    Anything else is rejected: a partition into unequal or overlapping
+    groups would make `w_out` ragged and silently mis-route servos, so
+    there is no third case to guess at.
+    """
+    n_legs = len(leg_cols)
+    if n_timing == n_legs:
+        groups = [list(c) for c in leg_cols]
+    elif n_timing == n_joints:
+        groups = [[j] for j in range(n_joints)]
+    else:
+        raise ValueError(
+            f"n_timing must be n_legs ({n_legs}) or n_joints ({n_joints}), "
+            f"got {n_timing}.")
+
+    flat = [c for grp in groups for c in grp]
+    if sorted(flat) != list(range(n_joints)):
+        raise ValueError(
+            f"group columns {groups} are not a partition of "
+            f"0..{n_joints - 1} (flattened: {sorted(flat)}).")
+    if len({len(g) for g in groups}) != 1:
+        raise ValueError(f"groups must be equal size, got {groups}.")
+    return groups
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -179,12 +261,54 @@ def git_info():
 # 1.  Bursting-LIF CPG
 # ═══════════════════════════════════════════════════════════════════
 
-CPG_W = np.asarray([
-    [    0.0      , -648.52905924, -449.60304695, -413.48426163],
-    [-369.91504928,     0.0      , -592.29635234, -568.0712858 ],
-    [-412.08729881, -391.54918498,     0.0      , -618.03381552],
-    [-498.16458351, -655.01105883, -345.38277449,     0.0      ],
-], dtype=np.float64)
+# All-to-all inhibitory coupling, one matrix per CPG size.  Keyed by N so
+# nothing downstream has to know which sizes exist -- add a row here and
+# `--n_cpg_neurons` accepts it.
+#
+# PROVENANCE / CAVEAT: the N=3 and N=6 matrices were ported from the older
+# `cpg_utils.py::BLIF_CPG`, which ran with from_fb_weight = -1e6.  This file
+# defaults to -1e4.  from_fb_weight is the kick that terminates a burst, and
+# it lands in the slow `u` filter (du=0.1), so recovery time -- and hence the
+# inter-burst gap and the period -- scales like log(|from_fb|/i_app)/du:
+# roughly 111 steps at -1e6 vs 68 at -1e4.  The ported matrices were tuned in
+# the -1e6 regime.  `--from_fb_weight` exists so you can switch regimes
+# without editing source, and `analyse_cpg` warns if the resulting burst
+# phase offsets are not close to evenly spaced.  Verify N=3/N=6 against
+# cpg_raster.png before trusting a training run on them.
+CPG_W_BY_N = {
+    3: np.asarray([
+        [    0.0      , -523.65135942, -593.28982051],
+        [-696.81822016,     0.0      , -632.34680962],
+        [-687.56816569, -577.5693762 ,     0.0      ],
+    ], dtype=np.float64),
+
+    4: np.asarray([
+        [    0.0      , -648.52905924, -449.60304695, -413.48426163],
+        [-369.91504928,     0.0      , -592.29635234, -568.0712858 ],
+        [-412.08729881, -391.54918498,     0.0      , -618.03381552],
+        [-498.16458351, -655.01105883, -345.38277449,     0.0      ],
+    ], dtype=np.float64),
+
+    6: np.asarray([
+        [    0.0      , -375.86210512, -518.18703523, -371.82375498, -399.74231244, -487.45119873],
+        [-531.99480471,     0.0      , -489.1139223 , -128.33470562, -404.33117771, -628.03347932],
+        [-529.89653583, -418.34662835,     0.0      , -543.37143674, -336.83773596, -679.12224243],
+        [-674.09562904, -130.56007131, -297.35360394,     0.0      , -363.1208234 , -425.10847629],
+        [-486.03391005, -386.7920052 , -412.91478912, -437.7646991 ,     0.0      , -288.47748806],
+        [-112.97808475, -510.59115452, -367.63412082, -374.83106147, -393.86103887,     0.0      ],
+    ], dtype=np.float64),
+}
+
+
+def cpg_weight_matrix(N):
+    """Coupling matrix for an N-neuron CPG.  Raises rather than falling back,
+    so a typo'd --n_cpg_neurons fails at startup instead of silently
+    training against the wrong oscillator."""
+    if N not in CPG_W_BY_N:
+        raise ValueError(
+            f"No CPG weight matrix for N={N}; available: "
+            f"{sorted(CPG_W_BY_N)}.  Add one to CPG_W_BY_N.")
+    return CPG_W_BY_N[N].copy()
 
 
 class LIFGeneralArray:
@@ -265,12 +389,17 @@ class LIFCPGStepper:
     and streaming use, so there is no train/deploy mismatch to reason about.
     """
 
-    def __init__(self, N=4, W=None, i_app=8.0,
+    def __init__(self, N, W=None, i_app=8.0,
                  vth_main=100.0, du_main=0.1, dv_main=0.3, refrac_main=1,
                  vth_fb=100.0, du_fb=1.0, dv_fb=0.0, refrac_fb=1,
                  from_fb_weight=-10000.0, to_fb_weight=10.0):
-        self.N     = N
-        self.W     = CPG_W.copy() if W is None else np.asarray(W, dtype=np.float64)
+        self.N     = int(N)
+        self.W     = (cpg_weight_matrix(self.N) if W is None
+                      else np.asarray(W, dtype=np.float64))
+        if self.W.shape != (self.N, self.N):
+            raise ValueError(
+                f"CPG weight matrix is {self.W.shape}, expected "
+                f"({self.N}, {self.N}).")
         self.i_app = float(i_app)
         self.core  = BurstingLIF(N, vth_main, du_main, dv_main, refrac_main,
                                  vth_fb, du_fb, dv_fb, refrac_fb,
@@ -296,9 +425,16 @@ class LIFCPGStepper:
         self.t = 0
 
 
-def run_cpg(N=4, tmax=120_000, warmup=2_000, i_app=8.0):
-    """Warm up, then collect the spike train used for training."""
-    cpg = LIFCPGStepper(N=N, i_app=i_app)
+def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0,
+            from_fb_weight=-10000.0):
+    """Warm up, then collect the spike train used for training.
+
+    `N` is deliberately positional-with-no-default: it selects the coupling
+    matrix, and a wrong value changes the oscillator rather than raising, so
+    the caller is made to say it.
+    """
+    cpg = LIFCPGStepper(N=N, i_app=i_app, from_fb_weight=from_fb_weight)
+    print(f"  N={N}  i_app={i_app}  from_fb_weight={from_fb_weight:g}")
     print(f"  Warming up CPG ({warmup} steps) ...")
     cpg.step_chunk(warmup)
     print(f"  Collecting {tmax} steps ...")
@@ -372,6 +508,18 @@ def analyse_cpg(spikes, out_dir):
         for i in range(N)], dtype=np.float64)
     print(f"    period = {period:.1f} steps   "
           f"neuron phase offsets = {np.round(offsets, 3).tolist()}")
+
+    # A healthy N-neuron ring puts the bursts at ~i/N.  Gaps far from 1/N mean
+    # the coupling matrix and the current from_fb_weight / i_app do not agree
+    # (see the CPG_W_BY_N provenance note) -- the run will still "work", it
+    # just will not be the oscillator the matrix was tuned for.
+    gaps = np.diff(np.sort(np.concatenate([offsets % 1.0, [1.0]])))
+    if gaps.size and (gaps.min() < 0.5 / N or gaps.max() > 2.0 / N):
+        print(f"    WARNING: burst phase offsets are far from evenly spaced "
+              f"(sorted gaps {np.round(gaps, 3).tolist()}, ideal {1.0/N:.3f}).")
+        print(f"             The N={N} coupling matrix may not be tuned for "
+              f"the current from_fb_weight / i_app regime — inspect "
+              f"cpg_raster.png before trusting this run.")
 
     # diagnostic: log-ISI split for neuron 0
     ts  = np.where(spikes[:, 0] > 0)[0]
@@ -679,7 +827,7 @@ class StreamSampler:
         idx   = pos_t[None, :] + self._offsets(L)[:, None]      # (L, B)
         g_t   = torch.as_tensor(g, dtype=torch.long, device=dev)
 
-        x = self.spikes[idx]                                    # (L, B, 4)
+        x = self.spikes[idx]                        # (L, B, n_cpg_neurons)
         y = self.targets[g_t, idx]                              # (L, B, J)
         m = self.valid[idx]                                     # (L, B)
 
@@ -805,6 +953,11 @@ class StatefulSNN(nn.Module):
     State (all (B, H)): mem1, mem2, memo.
     """
 
+    # Consumed by export_onnx / config so neither has to branch on isinstance.
+    arch            = "dense"
+    state_names_in  = ("mem1_in",  "mem2_in",  "memo_in")
+    state_names_out = ("mem1_out", "mem2_out", "memo_out")
+
     def __init__(self, hidden=128, n_gaits=4, max_gaits=16,
                  tau_min=2.0, tau_max=256.0,
                  slope=25.0, thresh=1.0, n_neurons=4, n_joints=N_JOINTS):
@@ -819,6 +972,10 @@ class StatefulSNN(nn.Module):
         self.max_gaits = max_gaits
         self.slope     = slope
         self.thresh    = thresh
+        # Stored so export_onnx can size the dummy spike input from the model
+        # rather than assuming a 4-neuron CPG.
+        self.n_neurons = n_neurons
+        self.n_joints  = n_joints
 
         # ── layer 1: all CPG spikes -> all hidden units ───────────
         # Scale 0.8 carries over from the old per-group self-drive. Only one
@@ -916,6 +1073,326 @@ class StatefulSNN(nn.Module):
         return torch.stack(ys), state
 
 
+class TimingGroupedSNN(nn.Module):
+    """
+    CPG spikes -> small TIMING layer -> G fully disconnected sub-networks.
+
+    Shape of the thing
+    ------------------
+        x            (B, n_neurons)      CPG spikes, one neuron fires at most
+        timing layer (B, n_timing)       LIF, densely driven by all CPG spikes
+        sub-net g    (B, Hg) x2 + memo   driven by timing neuron g ALONE
+        y            (B, n_joints)       group g writes its own columns only
+
+    G == n_timing: exactly one sub-network per timing neuron, and
+    `group_cols[g]` says which gait-table columns that sub-network owns
+    (see build_group_cols).
+
+    Why split it this way
+    ---------------------
+    The dense model has to solve two problems in one set of weights: work
+    out where in the ~254-step cycle it is, and turn that into 8 angles.
+    The first problem is shared across all joints and is cheap -- it is a
+    handful of phase-shifted oscillations.  The second is per-joint and
+    needs capacity.  Giving the timing layer n_timing units and no other
+    job means the rhythm is learned in a few hundred parameters, and the
+    sub-networks get a clean phase reference instead of re-deriving it
+    four times over.
+
+    This is todo item 3a: NO cross talk.  Sub-network g sees exactly one
+    binary channel.  Layers 2+ are block diagonal, the readout is block
+    diagonal, and there is no path between groups anywhere after the
+    timing layer.  (3b -- every sub-network sees all n_timing spikes -- is
+    a one-line change to layer 1, deliberately not wired up yet so the
+    comparison is between two committed variants rather than a flag.)
+
+    Per-gait input weights
+    ----------------------
+    `w_in_gait` is an Embedding(max_gaits, n_neurons * n_timing) reshaped
+    to a per-gait (n_neurons, n_timing) matrix.  This is the learned,
+    continuous successor to the deleted `solve_leg_routing` permutation.
+
+    It exists because FiLM CANNOT express a per-gait re-assignment of legs
+    to CPG neurons.  With a single static `w_in`, timing neuron j's input
+    current takes one of n_neurons+1 discrete values fixed by column j of
+    w_in.  FiLM contributes one scale and one shift per unit, so the
+    ORDERING of those values across CPG neurons is identical for every
+    gait: timing neuron j is always driven hardest by the same CPG neuron.
+    Gaits whose footfall ORDER differs (not just amplitude or phase
+    offset) are therefore unreachable, and the sub-networks would have to
+    re-derive phase internally -- exactly the thing the timing layer is
+    supposed to remove.
+
+    Consequences, noted rather than hidden:
+      - FiLM gamma on the timing layer is now largely redundant with
+        w_in_gait (both per-gait and multiplicative).  beta is not -- it is
+        an additive tonic drive that shifts threshold-crossing time.  Kept
+        because the layer is specified to have FiLM, and because gamma
+        becomes load-bearing again if w_in_gait is ever made gait-shared.
+      - Unused embedding rows (n_gaits..max_gaits) hold random values and
+        receive no gradient.  Unlike the FiLM tables, they are NOT inert
+        identities, so loading a 4-gait checkpoint into an 8-gait run gives
+        the 4 new gaits random routings.  That is the sensible default -- a
+        genuinely new gait needs a new routing -- but it does mean the new
+        gaits start untrained rather than as copies.
+
+    No LayerNorm on the timing layer
+    --------------------------------
+    LN subtracts the mean across the normalised dimension.  Over 4-8 units
+    that mean IS the signal: "some CPG neuron fired this timestep" is
+    almost entirely common mode, and LN deletes it.  Worse, during CPG
+    silence cur = b_timing, and LN(b) is a FIXED NONZERO vector once b
+    trains away from uniform -- so every timing neuron would receive tonic
+    drive and free-run during the silent gap instead of staying quiet,
+    which is the opposite of what a rhythm layer should do.  A 256-wide
+    layer tolerates this (the dense model has the same property and works);
+    an 8-wide one will not.  `timing_w_scale` against thresh=1.0 sets the
+    firing regime instead, and `timing_report` prints the rates so a dead
+    or saturated timing layer is visible from epoch 1.
+
+    Inside the sub-networks LN is optional (`sub_ln`) and uses
+    elementwise_affine=False: a shared gamma/beta over (G, Hg) would be a
+    parameter tied ACROSS groups, which breaks "fully disconnected".  FiLM
+    follows and supplies per-group per-gait affine anyway.
+
+    State: (mem_timing (B, n_timing), mem1, mem2, memo -- each (B, G, Hg)).
+    """
+
+    arch            = "timing_grouped"
+    state_names_in  = ("mem_timing_in",  "mem1_in",  "mem2_in",  "memo_in")
+    state_names_out = ("mem_timing_out", "mem1_out", "mem2_out", "memo_out")
+
+    def __init__(self, hidden_per_group=256, n_gaits=4, max_gaits=16,
+                 n_neurons=4, n_timing=N_LEGS, group_cols=None,
+                 n_joints=N_JOINTS,
+                 tau_min=2.0, tau_max=256.0,
+                 tau_timing_min=2.0, tau_timing_max=64.0,
+                 timing_w_scale=0.5, sub_ln="both",
+                 slope=25.0, thresh=1.0):
+        super().__init__()
+        if n_gaits > max_gaits:
+            raise ValueError(
+                f"n_gaits ({n_gaits}) > max_gaits ({max_gaits}); raise "
+                f"--max_gaits. Note that changing max_gaits changes the FiLM "
+                f"and w_in_gait parameter shapes and so invalidates old "
+                f"checkpoints.")
+        if sub_ln not in ("none", "l1", "l2", "both"):
+            raise ValueError(f"sub_ln must be none|l1|l2|both, got {sub_ln!r}")
+
+        group_cols = (build_group_cols(n_timing, n_joints=n_joints)
+                      if group_cols is None else
+                      [list(g) for g in group_cols])
+        if len(group_cols) != n_timing:
+            raise ValueError(
+                f"group_cols has {len(group_cols)} groups but n_timing="
+                f"{n_timing}; there is exactly one sub-network per timing "
+                f"neuron.")
+
+        G   = int(n_timing)
+        Hg  = int(hidden_per_group)
+        C   = len(group_cols[0])            # output columns per group
+
+        self.G          = G
+        self.Hg         = Hg
+        self.C          = C
+        self.n_timing   = G
+        self.n_neurons  = int(n_neurons)
+        self.n_joints   = int(n_joints)
+        self.n_gaits    = int(n_gaits)
+        self.max_gaits  = int(max_gaits)
+        self.slope      = slope
+        self.thresh     = thresh
+        self.sub_ln     = sub_ln
+        self.group_cols = group_cols
+        # `H` kept as an alias for the dense model's attribute name so any
+        # generic caller sizing a state tensor still works.
+        self.H          = Hg
+
+        # ── output column routing ─────────────────────────────────
+        # Groups emit (B, G, C); flattening gives columns in group order,
+        # e.g. [0,4, 1,5, 2,6, 3,7] for leg grouping.  out_perm reorders
+        # that into gait-table column order in one index_select, so no
+        # scatter and nothing for ONNX to choke on.
+        flat = [c for grp in group_cols for c in grp]
+        inv  = np.empty(n_joints, dtype=np.int64)
+        for pos, col in enumerate(flat):
+            inv[col] = pos
+        self.register_buffer("out_perm", torch.from_numpy(inv), persistent=False)
+
+        # ── timing layer ──────────────────────────────────────────
+        # Per-gait (n_neurons, n_timing) matrix, stored flat in an Embedding.
+        self.w_in_gait = nn.Embedding(max_gaits, self.n_neurons * G)
+        nn.init.normal_(self.w_in_gait.weight, mean=0.0, std=timing_w_scale)
+        self.b_timing  = nn.Parameter(torch.zeros(G))
+        self.film_t    = nn.Embedding(max_gaits, 2 * G)
+        nn.init.zeros_(self.film_t.weight)
+        self.film_t.weight.data[:, :G] = 1.0        # gamma := 1, beta := 0
+        self.beta_t_logit = nn.Parameter(
+            init_beta_logit((G,), tau_timing_min, tau_timing_max))
+
+        # ── sub-network layer 1: ONE binary spike -> Hg units ─────
+        # The only input is spk_timing[g], so this is an outer product, not
+        # a matmul: cur1 = spk[..., None] * w1 + b1.
+        self.w1 = nn.Parameter(torch.randn(G, Hg) * timing_w_scale)
+        self.b1 = nn.Parameter(torch.zeros(G, Hg))
+
+        # ── sub-network layer 2: block diagonal (G, Hg, Hg) ───────
+        self.w2 = nn.Parameter(torch.randn(G, Hg, Hg) / math.sqrt(Hg))
+        self.b2 = nn.Parameter(torch.zeros(G, Hg))
+
+        # ── block-diagonal analog readout ─────────────────────────
+        self.w_read = nn.Parameter(torch.randn(G, Hg, Hg) / math.sqrt(Hg))
+        self.b_read = nn.Parameter(torch.zeros(G, Hg))
+        self.w_out  = nn.Parameter(torch.randn(G, Hg, C) / math.sqrt(Hg))
+        self.b_out  = nn.Parameter(torch.zeros(G, C))
+
+        # affine=False: a shared gamma/beta would tie parameters across
+        # groups and break the disconnection.  FiLM supplies the affine.
+        self.ln1 = nn.LayerNorm(Hg, elementwise_affine=False)
+        self.ln2 = nn.LayerNorm(Hg, elementwise_affine=False)
+
+        # ── heterogeneous learnable taus, per group per unit ──────
+        self.beta1_logit = nn.Parameter(init_beta_logit((G, Hg), tau_min, tau_max))
+        self.beta2_logit = nn.Parameter(init_beta_logit((G, Hg), tau_min, tau_max))
+        self.betao_logit = nn.Parameter(init_beta_logit((G, Hg), 2.0, 40.0))
+
+        # ── FiLM, per group per unit, over-allocated to max_gaits ─
+        self.film1 = nn.Embedding(max_gaits, 2 * G * Hg)
+        self.film2 = nn.Embedding(max_gaits, 2 * G * Hg)
+        for e in (self.film1, self.film2):
+            nn.init.zeros_(e.weight)
+            e.weight.data[:, :G * Hg] = 1.0          # gamma := 1, beta := 0
+
+    # ---------------------------------------------------------------
+    def init_state(self, batch, device, dtype=torch.float32):
+        z = lambda: torch.zeros(batch, self.G, self.Hg,
+                                device=device, dtype=dtype)
+        mem_t = torch.zeros(batch, self.n_timing, device=device, dtype=dtype)
+        return (mem_t, z(), z(), z())
+
+    # ---------------------------------------------------------------
+    def _timing(self, x, gait, mem_t):
+        """
+        One timestep of the timing layer alone.
+
+        x     : (B, n_neurons)
+        gait  : (B,) int64
+        mem_t : (B, n_timing)
+
+        Factored out so `timing_only` can run it for diagnostics without
+        touching the sub-networks (and without going through the compiled
+        `step`, which would add a Dynamo guard set).
+        """
+        W  = self.w_in_gait(gait).view(-1, self.n_neurons, self.n_timing)
+        cur = torch.bmm(x.unsqueeze(1), W).squeeze(1) + self.b_timing
+        v   = self.film_t(gait)
+        cur = cur * v[:, :self.n_timing] + v[:, self.n_timing:]
+        beta_t = torch.sigmoid(self.beta_t_logit)
+        mem_t  = beta_t * mem_t + cur
+        spk_t  = spike_fn(mem_t - self.thresh, self.slope)
+        mem_t  = mem_t - self.thresh * spk_t
+        return spk_t, mem_t
+
+    def step(self, x, gait, state):
+        """
+        x     : (B, n_neurons) float — CPG spikes this timestep
+        gait  : (B,) int64
+        state : (mem_timing, mem1, mem2, memo)
+        """
+        mem_t, mem1, mem2, memo = state
+        G, Hg = self.G, self.Hg
+
+        # ---- timing layer (no LayerNorm — see class docstring) -------
+        spk_t, mem_t = self._timing(x, gait, mem_t)          # (B, G)
+
+        v1 = self.film1(gait).view(-1, 2, G, Hg)
+        v2 = self.film2(gait).view(-1, 2, G, Hg)
+        g1, f1 = v1[:, 0], v1[:, 1]
+        g2, f2 = v2[:, 0], v2[:, 1]
+
+        # ---- sub-net layer 1: outer product, no cross-group path -----
+        cur1 = spk_t.unsqueeze(-1) * self.w1 + self.b1        # (B, G, Hg)
+        if self.sub_ln in ("l1", "both"):
+            cur1 = self.ln1(cur1)
+        cur1  = cur1 * g1 + f1
+        beta1 = torch.sigmoid(self.beta1_logit)
+        mem1  = beta1 * mem1 + cur1
+        spk1  = spike_fn(mem1 - self.thresh, self.slope)
+        mem1  = mem1 - self.thresh * spk1
+
+        # ---- sub-net layer 2: block diagonal ------------------------
+        cur2 = torch.einsum("bgh,ghk->bgk", spk1, self.w2) + self.b2
+        if self.sub_ln in ("l2", "both"):
+            cur2 = self.ln2(cur2)
+        cur2  = cur2 * g2 + f2
+        beta2 = torch.sigmoid(self.beta2_logit)
+        mem2  = beta2 * mem2 + cur2
+        spk2  = spike_fn(mem2 - self.thresh, self.slope)
+        mem2  = mem2 - self.thresh * spk2
+
+        # ---- block-diagonal analog readout -------------------------
+        curo  = torch.einsum("bgh,ghk->bgk", spk2, self.w_read) + self.b_read
+        betao = torch.sigmoid(self.betao_logit)
+        memo  = betao * memo + curo
+
+        y_grp = torch.einsum("bgh,ghc->bgc", memo, self.w_out) + self.b_out
+        y     = y_grp.flatten(1).index_select(1, self.out_perm)
+        return y, (mem_t, mem1, mem2, memo)
+
+    def forward(self, x_seq, gait_seq, state=None):
+        """
+        x_seq    : (L, B, n_neurons)
+        gait_seq : (L, B)
+        Returns (y_seq, state) with y_seq (L, B, n_joints).
+        """
+        B = x_seq.shape[1]
+        if state is None:
+            state = self.init_state(B, x_seq.device, x_seq.dtype)
+        ys = []
+        for t in range(x_seq.shape[0]):
+            y, state = self.step(x_seq[t], gait_seq[t], state)
+            ys.append(y)
+        return torch.stack(ys), state
+
+    # ---------------------------------------------------------------
+    @torch.no_grad()
+    def timing_only(self, x_seq, gait_seq, mem_t=None):
+        """
+        Run ONLY the timing layer over a sequence.  Diagnostics path.
+
+        Deliberately calls `self._timing` rather than `self.step`: the
+        sub-networks are ~99% of the FLOPs and are not needed to ask
+        "when does each timing neuron fire", and going through the
+        compiled `step` at batch=1 would add a Dynamo guard set per call
+        shape.
+
+        Returns (L, B, n_timing) spikes.
+        """
+        B = x_seq.shape[1]
+        if mem_t is None:
+            mem_t = torch.zeros(B, self.n_timing, device=x_seq.device,
+                                dtype=x_seq.dtype)
+        out = []
+        for t in range(x_seq.shape[0]):
+            spk, mem_t = self._timing(x_seq[t], gait_seq[t], mem_t)
+            out.append(spk)
+        return torch.stack(out)
+
+    # ---------------------------------------------------------------
+    def param_breakdown(self):
+        """Grouped parameter counts, for the startup print."""
+        n = lambda *ps: int(sum(p.numel() for p in ps))
+        return {
+            "timing":  n(self.w_in_gait.weight, self.b_timing,
+                         self.film_t.weight, self.beta_t_logit),
+            "sub_l1":  n(self.w1, self.b1, self.beta1_logit),
+            "sub_l2":  n(self.w2, self.b2, self.beta2_logit),
+            "readout": n(self.w_read, self.b_read, self.w_out, self.b_out,
+                         self.betao_logit),
+            "film":    n(self.film1.weight, self.film2.weight),
+        }
+
+
 class SingleStepONNX(nn.Module):
     """Flat-signature wrapper so the exported graph is one timestep with
     explicit state in/out — the robot calls this once per CPG step."""
@@ -928,6 +1405,109 @@ class SingleStepONNX(nn.Module):
         y, (m1, m2, mo) = self.model.step(
             spikes, gait, (mem1, mem2, memo))
         return y, m1, m2, mo
+
+
+class SingleStepONNXTiming(nn.Module):
+    """
+    As SingleStepONNX but for TimingGroupedSNN's 4-tensor state.
+
+    Written as an explicit signature rather than *state: torch.onnx.export
+    traces varargs unreliably, and the input names have to line up
+    positionally with `model.state_names_in` anyway.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, spikes, gait, mem_timing, mem1, mem2, memo):
+        y, (mt, m1, m2, mo) = self.model.step(
+            spikes, gait, (mem_timing, mem1, mem2, memo))
+        return y, mt, m1, m2, mo
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 7b.  Timing-layer diagnostics
+# ═══════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def timing_report(model, spikes, phase, period, n_gaits, device,
+                  t0, n_steps=1500, gait_names=None, indent="    "):
+    """
+    Per-gait firing statistics for the timing layer.  Returns a list of
+    formatted lines (also returned as raw dicts) so the caller can print
+    them every N epochs.
+
+    Three numbers per timing neuron:
+
+      spk/cyc  Spikes per CPG cycle.  0.00 means the unit is DEAD -- its
+               sub-network then receives a constant-zero input and its
+               joints are frozen at whatever the decaying membranes settle
+               to, and the surrogate gradient through a never-crossing
+               membrane is weak, so it tends not to recover on its own.
+               This is a much sharper failure than a dead unit in a
+               256-wide dense layer, which is why it is checked every few
+               epochs rather than at the end.
+               Very large values (>> spikes/burst of the CPG) mean the unit
+               is saturated and carries no timing information either.
+
+      phase    Circular MEAN of the cycle phase at which the unit fires,
+               in [0,1).  This is the direct successor to the old routing
+               residual measurement: it says which part of the cycle each
+               sub-network is being told about.
+
+      R        Circular concentration in [0,1].  R near 1 means the unit is
+               phase-locked (fires in a tight burst at a consistent point
+               in the cycle) -- what a timing neuron is for.  R near 0
+               means its spikes are smeared around the cycle, so `phase` is
+               meaningless and the unit is not providing a phase reference
+               regardless of its rate.
+    """
+    if not hasattr(model, "timing_only"):
+        return [], []
+
+    n_steps = int(min(n_steps, len(spikes) - t0))
+    if n_steps <= 0:
+        return [], []
+
+    x  = torch.as_tensor(spikes[t0:t0 + n_steps], dtype=torch.float32,
+                         device=device).unsqueeze(1)          # (L, 1, Nn)
+    ph = np.asarray(phase[t0:t0 + n_steps], dtype=np.float64)
+    ok = ~np.isnan(ph)
+    n_cycles = max(n_steps / float(period), 1e-9)
+
+    lines, stats = [], []
+    for g in range(n_gaits):
+        gg  = torch.full((n_steps, 1), g, dtype=torch.long, device=device)
+        spk = model.timing_only(x, gg)[:, 0].cpu().numpy()    # (L, n_timing)
+
+        rate, mu, R = [], [], []
+        for j in range(spk.shape[1]):
+            m = (spk[:, j] > 0.5) & ok
+            rate.append(spk[:, j].sum() / n_cycles)
+            if m.sum() == 0:
+                mu.append(np.nan); R.append(0.0)
+                continue
+            z = np.mean(np.exp(1j * 2.0 * np.pi * ph[m]))
+            mu.append((np.angle(z) / (2.0 * np.pi)) % 1.0)
+            R.append(abs(z))
+
+        name = (gait_names[g] if gait_names is not None else f"g{g}")
+        fmt  = lambda v, w=5, p=2: " ".join(
+            ("  nan" if not np.isfinite(x_) else f"{x_:{w}.{p}f}") for x_ in v)
+        lines.append(f"{indent}timing {name:>5s} : "
+                     f"spk/cyc [{fmt(rate)}]  "
+                     f"phase [{fmt(mu)}]  R [{fmt(R)}]")
+        dead = [j for j, r in enumerate(rate) if r < 1e-6]
+        if dead:
+            lines.append(f"{indent}       {'':>5s}   "
+                         f"WARNING: timing neuron(s) {dead} DEAD for "
+                         f"{name} — sub-network(s) {dead} get no input.")
+        stats.append({"gait": name, "rate": [float(v) for v in rate],
+                      "phase": [None if not np.isfinite(v) else float(v)
+                                for v in mu],
+                      "R": [float(v) for v in R]})
+    return lines, stats
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -967,6 +1547,10 @@ def apply_reset(state, reset_mask):
     failing: with 2-D state (B,H) a (B,1,1) mask silently produces
     (B,B,H). That is how the leg-grouping removal first broke -- the old
     view(-1,1,1) was written for the (B,G,Hg) state.
+
+    TimingGroupedSNN makes this load-bearing again: its state MIXES ranks
+    -- mem_timing is (B, n_timing) while mem1/mem2/memo are (B, G, Hg) --
+    so a single hardcoded rank cannot be right for all four tensors.
     """
     if reset_mask.sum() == 0:
         return state
@@ -975,10 +1559,17 @@ def apply_reset(state, reset_mask):
 
 
 def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
-                 gait_w, out_dir):
+                 gait_w, out_dir, timing_diag=None):
+    """
+    `timing_diag` : optional zero-arg callable returning (lines, stats).
+                    Called every args.timing_log_every epochs for the
+                    timing-grouped arch; None for the dense arch.  Its last
+                    return value is handed back so the config can record it.
+    """
     best = float("inf")
     best_path = out_dir / "best_model.pt"
     hist = {"train": [], "val": [], "val_sw": [], "gnorm": []}
+    last_timing_stats = []
 
     print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val':>10}  "
           f"{'Val(post-sw)':>13}  {'LR':>9}  {'|grad|':>8}")
@@ -1064,6 +1655,14 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                       f"{vsw:>13.6f}  {opt.param_groups[0]['lr']:>9.2e}"
                       f"  {tr_gnorm:>8.2f}{flag}")
 
+            # Timing layer: cheap (timing units only, batch 1) but it prints
+            # n_gaits lines, so it runs on its own slower cadence.
+            if timing_diag is not None and (
+                    epoch % args.timing_log_every == 0 or epoch == 1):
+                lines, last_timing_stats = timing_diag()
+                for ln in lines:
+                    print(ln)
+
     except KeyboardInterrupt:
         # Return normally rather than propagating: main() then falls through
         # to plots + config + ONNX export using the best checkpoint so far,
@@ -1078,7 +1677,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
         print( "              Stopping training and proceeding to export.")
 
     print("  " + "-" * 70)
-    return best, hist
+    return best, hist, last_timing_stats
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1087,12 +1686,12 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
 
 def plot_cpg_raster(spikes, onsets, out_dir, n_show=1200):
     N = spikes.shape[1]
-    colors = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261"]
+    colors = CPG_PALETTE
     fig, ax = plt.subplots(figsize=(15, 3.6))
     for i in range(N):
         t = np.where(spikes[:n_show, i] > 0)[0]
         ax.scatter(t, np.full_like(t, i), marker="|", s=130, lw=1.6,
-                   color=colors[i % 4], label=f"N{i}")
+                   color=colors[i % len(colors)], label=f"N{i}")
     for b in onsets[0][onsets[0] < n_show]:
         ax.axvline(b, color="k", lw=0.9, alpha=0.45, ls="--")
     ax.set_yticks(range(N)); ax.set_yticklabels([f"CPG {i}" for i in range(N)])
@@ -1232,15 +1831,18 @@ def export_onnx(model, out_dir, device, cfg):
         print("    [onnx] using eager step() for export")
 
     try:
-        wrapper = SingleStepONNX(model).to(device).eval()
+        # Wrapper, spike width and state shapes all come from the model, so
+        # neither the CPG size nor the state layout is written twice.
+        wrap_cls = (SingleStepONNXTiming if model.arch == "timing_grouped"
+                    else SingleStepONNX)
+        wrapper  = wrap_cls(model).to(device).eval()
 
-        dummy = (torch.zeros(1, 4, device=device),
+        dummy = (torch.zeros(1, model.n_neurons, device=device),
                  torch.zeros(1, dtype=torch.long, device=device),
-                 *[torch.zeros(1, model.H, device=device)
-                   for _ in range(3)])
+                 *model.init_state(1, device))
 
-        in_names  = ["spikes", "gait", "mem1_in", "mem2_in", "memo_in"]
-        out_names = ["angles", "mem1_out", "mem2_out", "memo_out"]
+        in_names  = ["spikes", "gait"] + list(model.state_names_in)
+        out_names = ["angles"]         + list(model.state_names_out)
 
         path = out_dir / "cpg_lif_snn_step.onnx"
         torch.onnx.export(
@@ -1291,20 +1893,83 @@ def main():
                          "randomised by StreamSampler independently of this.")
     ap.add_argument("--warmup", type=int,   default=2_000)
     ap.add_argument("--i_app",  type=float, default=8.0)
+    ap.add_argument("--n_cpg_neurons", type=int, default=4,
+                    choices=sorted(CPG_W_BY_N),
+                    help="CPG size. Selects the coupling matrix from "
+                         "CPG_W_BY_N and sets the SNN's input width; nothing "
+                         "downstream assumes 4.")
+    ap.add_argument("--from_fb_weight", type=float, default=-10000.0,
+                    help="Burst-terminating kick from the feedback neuron. "
+                         "Lands in the slow u filter (du=0.1), so it sets the "
+                         "inter-burst gap and hence the period: ~68 steps of "
+                         "recovery at -1e4 vs ~111 at -1e6. The ported N=3 "
+                         "and N=6 matrices were tuned at -1e6 — try that "
+                         "value if analyse_cpg warns about uneven burst "
+                         "phase offsets.")
 
-    # network
+    # architecture
+    ap.add_argument("--arch", type=str, default="dense",
+                    choices=["dense", "timing_grouped"],
+                    help="dense: StatefulSNN, one fully connected network. "
+                         "timing_grouped: TimingGroupedSNN — CPG -> small "
+                         "timing layer -> n_timing disconnected sub-networks, "
+                         "one per timing neuron. Keep 'dense' runnable so A/B "
+                         "at matched gradient steps stays possible.")
+    ap.add_argument("--n_timing", type=int, default=None,
+                    help="[timing_grouped] Number of timing-layer LIF "
+                         f"neurons, and therefore the number of sub-networks. "
+                         f"Must be n_legs ({N_LEGS}, the default) or n_joints "
+                         f"({N_JOINTS}). Independent of --n_cpg_neurons: the "
+                         f"timing layer is densely driven by all CPG spikes, "
+                         f"so the two counts need not match.")
+    ap.add_argument("--tau_timing_min", type=float, default=2.0)
+    ap.add_argument("--tau_timing_max", type=float, default=64.0,
+                    help="[timing_grouped] Tau ceiling for the TIMING layer "
+                         "only. Separate from --tau_max because the sample is "
+                         "tiny: with n_timing=4 units, a log-uniform draw "
+                         "over [2, 256] puts ~1 unit above tau=64, so which "
+                         "timescales get covered is decided by the seed "
+                         "rather than by tiling. The timing layer also does "
+                         "not need to HOLD a cycle -- the sub-networks do "
+                         "that -- it only needs to re-time bursts, which "
+                         "needs memory of order the inter-burst onset gap "
+                         "(~63 steps at period 254). Taus stay learnable, so "
+                         "this is an init range, not a cap.")
+    ap.add_argument("--timing_w_scale", type=float, default=0.5,
+                    help="[timing_grouped] Init std for the per-gait CPG-> "
+                         "timing weights and for sub-net layer 1. There is NO "
+                         "LayerNorm on the timing layer, so this sets the "
+                         "firing regime directly against thresh=1.0 — check "
+                         "the spk/cyc column of the timing report and raise "
+                         "it if units are dead, lower it if saturated.")
+    ap.add_argument("--sub_ln", type=str, default="both",
+                    choices=["none", "l1", "l2", "both"],
+                    help="[timing_grouped] Which sub-network layers get "
+                         "LayerNorm (elementwise_affine=False; FiLM supplies "
+                         "the affine). Never applies to the timing layer. "
+                         "Worth ablating on l1: that layer's only input is "
+                         "one binary channel, so LN normalises away the "
+                         "amplitude of the sole drive and leaves FiLM gamma "
+                         "to restore it.")
+
     ap.add_argument("--hidden",     type=int,   default=256,
-                    help="Hidden width. Fully connected now, so w2/w_read are "
-                         "dense (H x H) rather than 4 blocks of (H/4 x H/4) — "
-                         "h=128 lands at roughly the old grouped h=256 "
-                         "parameter count; h=256 is ~3.5x larger.")
+                    help="Hidden width. For --arch dense this is the TOTAL "
+                         "width (dense H x H layers). For --arch "
+                         "timing_grouped it is PER GROUP, so w2/w_read are "
+                         "(G, H, H) — at G=4, hidden=128 lands near the dense "
+                         "hidden=256 parameter count and is the matched-"
+                         "parameter baseline; hidden=256 is ~4x that.")
     ap.add_argument("--max_gaits",  type=int,   default=16,
-                    help="Rows allocated in the FiLM embedding tables. Only "
-                         "the first n_gaits are used; the rest are inert "
-                         "(identity modulation, no gradient). Fixing this "
-                         "keeps every parameter shape independent of the gait "
-                         "count, so checkpoints transfer between runs with "
-                         "different numbers of gaits. Changing it does NOT.")
+                    help="Rows allocated in the FiLM embedding tables (and, "
+                         "for timing_grouped, in the per-gait CPG->timing "
+                         "table). Only the first n_gaits are used. Fixing "
+                         "this keeps every parameter shape independent of the "
+                         "gait count, so checkpoints transfer between runs "
+                         "with different numbers of gaits. Changing it does "
+                         "NOT. Note the unused FiLM rows are inert identities "
+                         "but the unused w_in_gait rows are random, so a new "
+                         "gait starts with a random routing rather than a "
+                         "trained one.")
     ap.add_argument("--tau_min",    type=float, default=2.0)
     ap.add_argument("--tau_max",    type=float, default=256.0,
                     help="Longest membrane time constant, in steps. Lowered "
@@ -1355,10 +2020,22 @@ def main():
     # misc
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--log_every", type=int, default=1)
+    ap.add_argument("--timing_log_every", type=int, default=10,
+                    help="[timing_grouped] Epoch cadence for the timing-layer "
+                         "firing report. Slower than --log_every because it "
+                         "prints one line per gait; the compute is "
+                         "negligible (timing units only, batch 1).")
     ap.add_argument("--dry_run",   action="store_true",
                     help="Build data + diagnostics, skip training.")
     ap.add_argument("--out_dir",   type=str, default="outputs")
     args = ap.parse_args()
+
+    # Resolve n_timing before anything reads it, and reject bad values now
+    # rather than after the CPG run.
+    if args.n_timing is None:
+        args.n_timing = N_LEGS
+    group_cols = (build_group_cols(args.n_timing) if args.arch == "timing_grouped"
+                  else None)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -1366,11 +2043,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     this_file_dir = os.path.dirname(os.path.abspath(__file__))
     out_dir = Path(this_file_dir + "/" + args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Device : {device}\nOutput : {out_dir.resolve()}\n")
+    print(f"Device : {device}\nOutput : {out_dir.resolve()}")
+    print(f"Arch   : {args.arch}\n")
 
     # ── 1. CPG ──────────────────────────────────────────────────
     print("[1/6] Bursting-LIF CPG ...")
-    spikes = run_cpg(N=4, tmax=args.tmax, warmup=args.warmup, i_app=args.i_app)
+    spikes = run_cpg(N=args.n_cpg_neurons, tmax=args.tmax, warmup=args.warmup,
+                     i_app=args.i_app, from_fb_weight=args.from_fb_weight)
 
     print("\n[2/6] Burst structure & phase ...")
     onsets, period, neuron_offsets, burst_thresholds = analyse_cpg(spikes, out_dir)
@@ -1416,10 +2095,23 @@ def main():
 
     # ── 5. Model + training ─────────────────────────────────────
     print("\n[5/6] Model ...")
-    model = StatefulSNN(hidden=args.hidden, n_gaits=len(gait_tables),
-                        max_gaits=args.max_gaits,
-                        tau_min=args.tau_min, tau_max=args.tau_max,
-                        slope=args.slope, n_joints=N_JOINTS).to(device)
+    if args.arch == "timing_grouped":
+        model = TimingGroupedSNN(
+            hidden_per_group=args.hidden, n_gaits=len(gait_tables),
+            max_gaits=args.max_gaits, n_neurons=args.n_cpg_neurons,
+            n_timing=args.n_timing, group_cols=group_cols,
+            n_joints=N_JOINTS,
+            tau_min=args.tau_min, tau_max=args.tau_max,
+            tau_timing_min=args.tau_timing_min,
+            tau_timing_max=args.tau_timing_max,
+            timing_w_scale=args.timing_w_scale, sub_ln=args.sub_ln,
+            slope=args.slope).to(device)
+    else:
+        model = StatefulSNN(hidden=args.hidden, n_gaits=len(gait_tables),
+                            max_gaits=args.max_gaits,
+                            n_neurons=args.n_cpg_neurons,
+                            tau_min=args.tau_min, tau_max=args.tau_max,
+                            slope=args.slope, n_joints=N_JOINTS).to(device)
 
     # ── Compile the single timestep, NOT forward() ────────────────
     # forward() loops over L (= --bptt, 256-512) timesteps in Python.
@@ -1448,12 +2140,33 @@ def main():
         print(f"      torch.compile: SKIPPED (device={device.type}, not cuda)")
 
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"      hidden={args.hidden}  params={n_par:,}  "
-          f"(fully connected, no leg grouping)")
+    if args.arch == "timing_grouped":
+        print(f"      hidden={args.hidden} PER GROUP  "
+              f"n_timing={args.n_timing}  params={n_par:,}")
+        print(f"      CPG({args.n_cpg_neurons}) -> timing({args.n_timing}) "
+              f"-> {args.n_timing} x [{args.hidden} -> {args.hidden} -> "
+              f"readout], no cross talk (todo 3a)")
+        print(f"      group -> gait-table cols : " +
+              "  ".join(f"g{i}={grp}" for i, grp in enumerate(group_cols)))
+        for k, v in model.param_breakdown().items():
+            print(f"        {k:<8s}: {v:>9,}  ({100.0 * v / n_par:4.1f}%)")
+        print(f"      timing tau init range "
+              f"[{args.tau_timing_min:.0f}, {args.tau_timing_max:.0f}] steps; "
+              f"sub-net [{args.tau_min:.0f}, {args.tau_max:.0f}]")
+        print(f"      sub_ln={args.sub_ln} (affine=False)  "
+              f"timing LayerNorm: never (see TimingGroupedSNN docstring)")
+    else:
+        print(f"      hidden={args.hidden}  params={n_par:,}  "
+              f"(fully connected, no leg grouping)")
     n_film = model.film1.weight.numel() + model.film2.weight.numel()
     print(f"      FiLM table : {n_film:,} params for max_gaits="
           f"{args.max_gaits}, of which {len(gait_tables)} row(s) in use; "
           f"unused rows are identity modulation and get no gradient")
+    if args.arch == "timing_grouped":
+        n_route = model.w_in_gait.weight.numel()
+        print(f"      per-gait CPG->timing routing : {n_route:,} params "
+              f"(unused rows are RANDOM, not identity — a new gait starts "
+              f"with an untrained routing)")
     print(f"      tau range [{args.tau_min:.0f}, {args.tau_max:.0f}] steps "
           f"vs CPG period {period:.0f}")
     if args.tau_max < period:
@@ -1463,10 +2176,23 @@ def main():
               f"network cannot hold phase.")
     gait_w = make_gait_weights(GAIT_TABLES_ORIG, device)
 
+    # ── Timing-layer diagnostic hook ────────────────────────────
+    # Closure so run_training does not need the spike train / phase array.
+    # t_eval sits in the val region so the report is about held-out steps.
+    if args.arch == "timing_grouped":
+        t_diag = max(t_split, t_lo) + 200
+        timing_diag = lambda: timing_report(
+            model, spikes, phase, period, len(gait_tables), device,
+            t0=t_diag, n_steps=int(6 * period), gait_names=GAIT_NAMES,
+            indent="      ")
+    else:
+        timing_diag = None
+
     # Defined for both branches so the config can always report them.
-    best     = float("nan")
-    hist     = {"train": [], "val": [], "val_sw": [], "gnorm": []}
-    final_lr = float(args.lr)
+    best          = float("nan")
+    hist          = {"train": [], "val": [], "val_sw": [], "gnorm": []}
+    final_lr      = float(args.lr)
+    timing_stats  = []
 
     if not args.dry_run:
         opt   = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -1480,15 +2206,31 @@ def main():
         total_steps = args.epochs * args.chunks_per_epoch
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=total_steps, eta_min=1e-5)
-        best, hist = run_training(model, tr_sampler, va_sampler, opt, sched,
-                                  device, args, gait_w, out_dir)
+        best, hist, timing_stats = run_training(
+            model, tr_sampler, va_sampler, opt, sched,
+            device, args, gait_w, out_dir, timing_diag=timing_diag)
         final_lr = float(opt.param_groups[0]["lr"])
         model.load_state_dict(torch.load(out_dir / "best_model.pt",
                                          map_location=device))
         print(f"\n  best val MSE : {best:.6f}")
         plot_training_curves(hist, out_dir)
+
+        # Re-report on the RESTORED best checkpoint: the last in-loop report
+        # may be several epochs stale and describes different weights.
+        if timing_diag is not None:
+            print("\n  Timing layer at best checkpoint:")
+            lines, timing_stats = timing_diag()
+            for ln in lines:
+                print(ln)
     else:
         print("      --dry_run: skipping training.")
+        # Still worth seeing: at init this says whether timing_w_scale has
+        # put the layer in a firing regime at all before you spend an hour.
+        if timing_diag is not None:
+            print("      Timing layer at initialisation:")
+            lines, timing_stats = timing_diag()
+            for ln in lines:
+                print(ln)
 
     # ── 6. Eval + export ────────────────────────────────────────
     print("\n[6/6] Evaluation & export ...")
@@ -1503,19 +2245,29 @@ def main():
 
     cfg = {
         # ── identity ──────────────────────────────────────────────
-        "model":            "cpg_lif_leggrouped_stateful",
-        "config_version":   2,
+        "model":            ("cpg_lif_timing_grouped"
+                             if args.arch == "timing_grouped"
+                             else "cpg_lif_dense_stateful"),
+        "arch":             args.arch,
+        "config_version":   3,
         "created_utc":      datetime.now(timezone.utc).isoformat(
                                 timespec="seconds"),
 
         # ── deployment-critical: inference.py reads these by name at
         #    the top level.  Do not move or rename them. ───────────
+        # NOTE: for arch=timing_grouped, `hidden` is PER GROUP and the state
+        # is (mem_timing (B,n_timing), mem1/mem2/memo (B,n_timing,hidden)).
         "hidden":           args.hidden,
+        "hidden_is_per_group": args.arch == "timing_grouped",
         "max_gaits":        int(args.max_gaits),
         "n_gaits":          len(gait_tables),
         "n_legs":           N_LEGS,
         "n_joints":         N_JOINTS,
-        "n_cpg_neurons":    4,
+        "n_cpg_neurons":    int(args.n_cpg_neurons),
+        "n_timing":         (int(args.n_timing)
+                             if args.arch == "timing_grouped" else None),
+        "group_cols":       ([list(g) for g in group_cols]
+                             if group_cols is not None else None),
         "gait_names":       GAIT_NAMES,
         "leg_cols":         [list(c) for c in LEG_COLS],
         "servo_base":       SERVO_BASE,
@@ -1528,10 +2280,14 @@ def main():
             "i_app": args.i_app, "vth_main": 100.0, "du_main": 0.1,
             "dv_main": 0.3, "refrac_main": 1, "vth_fb": 100.0,
             "du_fb": 1.0, "dv_fb": 0.0, "refrac_fb": 1,
-            "from_fb_weight": -10000.0, "to_fb_weight": 10.0,
-            "W": CPG_W.tolist(), "warmup": args.warmup,
+            "from_fb_weight": float(args.from_fb_weight),
+            "to_fb_weight": 10.0,
+            "N": int(args.n_cpg_neurons),
+            "W": cpg_weight_matrix(args.n_cpg_neurons).tolist(),
+            "warmup": args.warmup,
         },
         "per_joint_rmse_deg": rmse.tolist(),
+        "timing_layer_stats": timing_stats,
 
         # ── full argparse namespace, verbatim ──────────────────────
         "args": vars(args),
@@ -1559,25 +2315,48 @@ def main():
         },
 
         # ── model detail (not needed to run, useful to reproduce) ──
+        # Names and shapes are read off the live model so this section
+        # cannot drift from what was actually exported.
         "model_detail": {
-            "class":            "StatefulSNN",
-            "fully_connected":  True,
-            "leg_grouped":      False,
-            "input_routing":    False,
+            "class":            type(model).__name__,
+            "arch":             args.arch,
+            "fully_connected":  args.arch == "dense",
+            "leg_grouped":      args.arch == "timing_grouped",
+            "cross_talk":       False,
+            "timing_layer":     (args.arch == "timing_grouped"),
+            "input_routing":    (args.arch == "timing_grouped"),
+            "input_routing_kind": ("per-gait learned w_in_gait embedding"
+                                   if args.arch == "timing_grouped" else None),
             "n_params":         int(n_par),
+            "param_breakdown":  (model.param_breakdown()
+                                 if hasattr(model, "param_breakdown") else None),
             "recurrent":        False,
+            "n_cpg_neurons":    int(args.n_cpg_neurons),
+            "n_timing":         (int(args.n_timing)
+                                 if args.arch == "timing_grouped" else None),
+            "hidden_per_group": (int(args.hidden)
+                                 if args.arch == "timing_grouped" else None),
             "tau_min":          float(args.tau_min),
             "tau_max":          float(args.tau_max),
+            "tau_timing_min":   (float(args.tau_timing_min)
+                                 if args.arch == "timing_grouped" else None),
+            "tau_timing_max":   (float(args.tau_timing_max)
+                                 if args.arch == "timing_grouped" else None),
+            "timing_w_scale":   (float(args.timing_w_scale)
+                                 if args.arch == "timing_grouped" else None),
+            "sub_ln":           (args.sub_ln
+                                 if args.arch == "timing_grouped" else None),
+            "timing_layernorm": False,
             "slope":            float(args.slope),
             "thresh":           1.0,
             "surrogate":        "fast-sigmoid straight-through "
                                 "(plain ops, bit-exact forward)",
-            "state_tensors":    ["mem1", "mem2", "memo"],
-            "state_shape":      [1, args.hidden],
-            "onnx_inputs":      ["spikes", "gait", "mem1_in", "mem2_in",
-                                 "memo_in"],
-            "onnx_outputs":     ["angles", "mem1_out", "mem2_out",
-                                 "memo_out"],
+            "state_tensors":    [n.replace("_in", "")
+                                 for n in model.state_names_in],
+            "state_shapes":     [list(s.shape)
+                                 for s in model.init_state(1, "cpu")],
+            "onnx_inputs":      ["spikes", "gait"] + list(model.state_names_in),
+            "onnx_outputs":     ["angles"] + list(model.state_names_out),
             "weights_file":     "best_model.pt",
         },
 
