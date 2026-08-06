@@ -958,11 +958,20 @@ def detach_state(state):
 
 
 def apply_reset(state, reset_mask):
-    """Zero the state of any stream that was rewound."""
+    """
+    Zero the state of any stream that was rewound.
+
+    `reset_mask` is (B,); each state tensor is (B, ...). The mask is
+    reshaped to (B, 1, 1, ...) matching that tensor's rank rather than a
+    hardcoded rank, because getting this wrong broadcasts instead of
+    failing: with 2-D state (B,H) a (B,1,1) mask silently produces
+    (B,B,H). That is how the leg-grouping removal first broke -- the old
+    view(-1,1,1) was written for the (B,G,Hg) state.
+    """
     if reset_mask.sum() == 0:
         return state
-    keep = (1.0 - reset_mask).view(-1, 1, 1)
-    return tuple(s * keep for s in state)
+    keep = 1.0 - reset_mask
+    return tuple(s * keep.view(-1, *([1] * (s.dim() - 1))) for s in state)
 
 
 def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
