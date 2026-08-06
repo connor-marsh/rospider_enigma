@@ -141,6 +141,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1568,12 +1569,12 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
     """
     best = float("inf")
     best_path = out_dir / "best_model.pt"
-    hist = {"train": [], "val": [], "val_sw": [], "gnorm": []}
+    hist = {"train": [], "val": [], "val_sw": [], "gnorm": [], "sec": []}
     last_timing_stats = []
 
     print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val':>10}  "
-          f"{'Val(post-sw)':>13}  {'LR':>9}  {'|grad|':>8}")
-    print("  " + "-" * 70)
+          f"{'Val(post-sw)':>13}  {'LR':>9}  {'|grad|':>8}  {'sec':>6}")
+    print("  " + "-" * 78)
     print(f"  (Ctrl+C stops training and exports.  |grad| is the PRE-clip "
           f"norm, clip={args.clip:g};")
     print(f"   routinely much larger than clip means most updates are being "
@@ -1581,6 +1582,11 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
 
     try:
         for epoch in range(1, args.epochs + 1):
+            # Measures train + validate, i.e. the cost that recurs every
+            # epoch.  Read before the timing report below, so an occasional
+            # diagnostic epoch does not show up as a spike in this column.
+            t_epoch = time.perf_counter()
+
             # ---- train -------------------------------------------------
             model.train()
             state = model.init_state(args.batch, device)
@@ -1636,6 +1642,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
 
             va_loss = vtot / max(vn, 1)
             vsw     = vsw_tot / max(vsw_n, 1) if vsw_n else float("nan")
+            epoch_s = time.perf_counter() - t_epoch
 
             # Appended together, so an interrupt can never leave these
             # lists at different lengths.
@@ -1643,6 +1650,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             hist["val"].append(va_loss)
             hist["val_sw"].append(vsw)
             hist["gnorm"].append(tr_gnorm)
+            hist["sec"].append(epoch_s)
 
             flag = ""
             if va_loss < best:
@@ -1653,7 +1661,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             if epoch % args.log_every == 0 or epoch == 1:
                 print(f"  {epoch:>6}  {tr_loss:>10.6f}  {va_loss:>10.6f}  "
                       f"{vsw:>13.6f}  {opt.param_groups[0]['lr']:>9.2e}"
-                      f"  {tr_gnorm:>8.2f}{flag}")
+                      f"  {tr_gnorm:>8.2f}  {epoch_s:>6.1f}{flag}")
 
             # Timing layer: cheap (timing units only, batch 1) but it prints
             # n_gaits lines, so it runs on its own slower cadence.
@@ -1669,14 +1677,18 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
         # so an aborted run still produces deployable artifacts.
         done = len(hist["train"])
         print()
-        print("  " + "-" * 70)
+        print("  " + "-" * 78)
         print(f"  [INTERRUPT] Ctrl+C received during epoch {done + 1}.")
         print(f"              {done} epoch(s) completed and recorded; the "
               f"partial epoch is discarded.")
         print(f"              Best val MSE so far : {best:.6f}")
         print( "              Stopping training and proceeding to export.")
 
-    print("  " + "-" * 70)
+    print("  " + "-" * 78)
+    if hist["sec"]:
+        tot = sum(hist["sec"])
+        print(f"  {len(hist['sec'])} epoch(s) in {tot:.1f}s  "
+              f"(mean {tot / len(hist['sec']):.2f}s/epoch, train+val only)")
     return best, hist, last_timing_stats
 
 
@@ -2190,7 +2202,8 @@ def main():
 
     # Defined for both branches so the config can always report them.
     best          = float("nan")
-    hist          = {"train": [], "val": [], "val_sw": [], "gnorm": []}
+    hist          = {"train": [], "val": [], "val_sw": [],
+                     "gnorm": [], "sec": []}
     final_lr      = float(args.lr)
     timing_stats  = []
 
