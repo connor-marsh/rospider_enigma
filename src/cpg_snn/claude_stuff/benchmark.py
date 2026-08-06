@@ -123,16 +123,13 @@ VARIANT_SETS = {
         ("compile_b512",     dict(batch=512, compile="default")),
     ],
 
-    # Does the recurrence (rec1/rec2, ~45% of all parameters) earn its
-    # cost? This set answers the SPEED half only. The quality half needs a
-    # real training run judged on free-run reconstruction RMSE and
-    # Val(post-sw) -- loss@N here is far too early to tell.
-    "recurrence": [
-        ("rec_on",           dict(use_recurrence=True)),
-        ("rec_off",          dict(use_recurrence=False)),
-        ("rec_on_b512",      dict(use_recurrence=True,  batch=512)),
-        ("rec_off_b512",     dict(use_recurrence=False, batch=512)),
-    ],
+    # The recurrence ablation set is gone: rec1/rec2 were removed from the
+    # model after the ablation showed unchanged free-run reconstruction
+    # RMSE and Val(post-switch) with slightly better step time and memory.
+    # Rows from that test remain in bench_results.jsonl (variants
+    # rec_on/rec_off) and the report still renders their `rec` column, so
+    # the comparison stays readable in history. Check out the commit before
+    # the removal to re-run it.
 
     # Where does batch scaling stop being free? Compiled throughout, so
     # only batch varies. OOM rows are skipped, not fatal.
@@ -540,8 +537,7 @@ def time_val_steps(model, sampler, device, batch, bptt, settle,
 
 NUMERICS_FIELDS = ("batch", "bptt", "hidden", "seed", "tmax", "warmup",
                    "i_app", "tau_min", "tau_max", "cross_gain", "slope",
-                   "switch_min", "switch_max", "clip", "lr", "val_frac",
-                   "use_recurrence")
+                   "switch_min", "switch_max", "clip", "lr", "val_frac")
 
 
 def numerics_key(cfg):
@@ -560,8 +556,7 @@ def numerics_key(cfg):
 def run_variant(name, cfg, data, device, args, eager_ref=None):
     print(f"\n─── {name} " + "─" * max(0, 56 - len(name)))
     print(f"    batch={cfg['batch']}  bptt={cfg['bptt']}  "
-          f"hidden={cfg['hidden']}  compile={cfg['compile'] or 'eager'}  "
-          f"recurrence={'on' if cfg['use_recurrence'] else 'OFF'}")
+          f"hidden={cfg['hidden']}  compile={cfg['compile'] or 'eager'}")
 
     bptt, batch = cfg["bptt"], cfg["batch"]
 
@@ -590,18 +585,11 @@ def run_variant(name, cfg, data, device, args, eager_ref=None):
             hidden=cfg["hidden"], n_gaits=data["n_gaits"],
             route_P=data["route_P"], tau_min=cfg["tau_min"],
             tau_max=cfg["tau_max"], cross_gain=cfg["cross_gain"],
-            slope=cfg["slope"],
-            use_recurrence=cfg["use_recurrence"]).to(device)
+            slope=cfg["slope"]).to(device)
 
         compile_label = _compile_step(model, cfg["compile"])
 
         n_par = sum(p.numel() for p in model.parameters())
-        # rec1/rec2 stay registered when ablated so state/ONNX/checkpoints
-        # are unchanged, which means n_params does NOT drop. Report the
-        # active count separately or the ablation looks free.
-        n_rec = sum(p.numel() for n, p in model.named_parameters()
-                    if n.startswith("rec"))
-        n_active = n_par - (0 if model.use_recurrence else n_rec)
         opt   = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
 
         sink = io.StringIO()
@@ -671,9 +659,6 @@ def run_variant(name, cfg, data, device, args, eager_ref=None):
         "torch":            torch.__version__,
         "compile":          compile_label,
         "n_params":         int(n_par),
-        "n_params_recurrent": int(n_rec),
-        "n_params_active":  int(n_active),
-        "use_recurrence":   bool(cfg["use_recurrence"]),
         # compile verification
         "compiled_ok":          compiled_ok,
         "dynamo_frames_ok":     watch.frames_ok,
@@ -906,10 +891,10 @@ def write_report(out_dir, baseline=None):
                  "or `inf` means the loss actually went non-finite. "
                  "`varying` = no means the stacked output collapsed "
                  "(suspect CUDA-graph output aliasing) and the row should "
-                 "be discarded. `active params` excludes rec1/rec2 when "
-                 "recurrence is ablated — they stay registered so state, "
-                 "ONNX and checkpoints are unchanged, so the raw parameter "
-                 "count does not drop.")
+                 "be discarded. The `rec` and `active params` columns are "
+                 "retained to keep rows from before the recurrence removal "
+                 "readable; current rows show `—` and the full count, since "
+                 "rec1/rec2 no longer exist.")
         L.append("")
         loss_cols = " | ".join(f"loss@{s}" for s in LOSS_STEPS)
         L.append(f"| variant | commit | nkey | {loss_cols} | 1st nonfinite | "
@@ -964,7 +949,6 @@ def build_cfg(args, overrides, cpg_warmup):
         switch_min=args.switch_min, switch_max=args.switch_max,
         tmax=args.tmax, warmup=cpg_warmup, i_app=args.i_app,
         val_frac=args.val_frac, phase_zero=args.phase_zero,
-        use_recurrence=not args.no_recurrence,
     )
     cfg.update(overrides)
     return cfg
@@ -1021,9 +1005,6 @@ def main():
     ap.add_argument("--tau_max",    type=float, default=256.0)
     ap.add_argument("--cross_gain", type=float, default=0.25)
     ap.add_argument("--slope",      type=float, default=25.0)
-    ap.add_argument("--no_recurrence", action="store_true",
-                    help="Ablate rec1/rec2 (~45%% of parameters). Overridden "
-                         "per-variant by the 'recurrence' set.")
     ap.add_argument("--switch_min", type=int,   default=600)
     ap.add_argument("--switch_max", type=int,   default=3000)
 

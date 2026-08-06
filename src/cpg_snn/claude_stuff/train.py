@@ -26,15 +26,21 @@ What changed vs. the previous (conductance-based CPG + event-window) version
 
 3.  Stateful SNN.
     Because the input carries no phase, the network needs memory that
-    spans a full gait cycle (~254 steps).  Two mechanisms provide it:
-      - heterogeneous, learnable membrane time constants: each hidden
-        unit's tau is initialised log-uniformly over [tau_min, tau_max]
-        (default 2..500 steps) so the population tiles timescales from
-        within-burst to full-cycle.
-      - within-group recurrent connections on the spike outputs.
+    spans a full gait cycle (~254 steps).  This comes entirely from
+    heterogeneous, learnable membrane time constants: each hidden unit's
+    tau is initialised log-uniformly over [tau_min, tau_max] (default
+    2..256 steps) so the population tiles timescales from within-burst to
+    full-cycle, forming a temporal basis over "time since last burst"
+    that the readout reads off linearly.
     Training is truncated BPTT over contiguous chunks with state carried
     (and detached) across chunk boundaries -- B parallel streams walking
     the spike train, exactly like deployment.
+
+    Within-group recurrent connections on the spike outputs were also
+    tried (rec1/rec2, 32,768 params = 45% of the model).  Ablating them
+    left free-run reconstruction RMSE and Val(post-switch) unchanged
+    while slightly improving step time and memory, so they were removed.
+    See git history before the removal commit to reproduce that test.
 
 4.  One CPG neuron per leg.
     The hidden layer is split into 4 equal groups.  Group l is driven
@@ -764,19 +770,21 @@ class LegGroupedSNN(nn.Module):
     Hidden width `hidden` is split into 4 groups of `hidden//4`.  Group l:
         - is driven by CPG neuron route[g, l]   (full-strength self drive)
         - sees the other three neurons only through `cross_gain`
-        - has its own recurrent weights
         - reads out ONLY leg l's two joint columns
 
     So "leg l is moving" and "the neuron feeding group l is bursting" are
     the same event by construction.
 
-    State (all (B, 4, Hg)): mem1, spk1, mem2, spk2, mem_out.
+    Purely feedforward within a timestep; all memory lives in the three
+    leaky membranes, whose per-unit time constants are learnable and
+    initialised log-uniformly over [tau_min, tau_max].
+
+    State (all (B, 4, Hg)): mem1, mem2, memo.
     """
 
     def __init__(self, hidden=256, n_gaits=4, route_P=None,
-                 tau_min=2.0, tau_max=500.0, cross_gain=0.25,
-                 slope=25.0, thresh=1.0, n_neurons=4,
-                 use_recurrence=True):
+                 tau_min=2.0, tau_max=256.0, cross_gain=0.25,
+                 slope=25.0, thresh=1.0, n_neurons=4):
         super().__init__()
         assert hidden % N_LEGS == 0, "hidden must be divisible by 4"
         self.H       = hidden
@@ -785,12 +793,6 @@ class LegGroupedSNN(nn.Module):
         self.n_gaits = n_gaits
         self.slope   = slope
         self.thresh  = thresh
-        # Plain Python bool, NOT a buffer or tensor: Dynamo guards on its
-        # value and resolves the branch in step() at trace time, so
-        # use_recurrence=False produces a graph with the recurrent einsums
-        # absent rather than multiplied by zero. Changing it after
-        # construction triggers a recompile.
-        self.use_recurrence = bool(use_recurrence)
         Hg           = self.Hg
 
         if route_P is None:
@@ -803,13 +805,11 @@ class LegGroupedSNN(nn.Module):
         self.w_cross    = nn.Parameter(torch.randn(n_neurons, self.H) * 0.2)
         self.b1         = nn.Parameter(torch.zeros(self.G, Hg))
         self.cross_gain = nn.Parameter(torch.tensor(float(cross_gain)))
-        self.rec1       = nn.Parameter(torch.randn(self.G, Hg, Hg) / math.sqrt(Hg))
         self.ln1        = nn.LayerNorm(Hg)
 
-        # ── layer 2: grouped feedforward + recurrence ─────────────
+        # ── layer 2: grouped feedforward ──────────────────────────
         self.w2   = nn.Parameter(torch.randn(self.G, Hg, Hg) / math.sqrt(Hg))
         self.b2   = nn.Parameter(torch.zeros(self.G, Hg))
-        self.rec2 = nn.Parameter(torch.randn(self.G, Hg, Hg) / math.sqrt(Hg))
         self.ln2  = nn.LayerNorm(Hg)
 
         # ── readout: non-spiking leaky membrane, then 2 angles ────
@@ -832,8 +832,9 @@ class LegGroupedSNN(nn.Module):
 
     # ---------------------------------------------------------------
     def init_state(self, batch, device, dtype=torch.float32):
+        """State is (mem1, mem2, memo) -- the three leaky membranes."""
         z = lambda: torch.zeros(batch, self.G, self.Hg, device=device, dtype=dtype)
-        return (z(), z(), z(), z(), z())
+        return (z(), z(), z())
 
     def _film(self, emb, gait):
         v = emb(gait)                                     # (B, 2H)
@@ -845,9 +846,13 @@ class LegGroupedSNN(nn.Module):
         """
         x     : (B, n_neurons) float — CPG spikes this timestep
         gait  : (B,) int64
-        state : 5-tuple of (B, G, Hg)
+        state : 3-tuple (mem1, mem2, memo), each (B, G, Hg)
+
+        Feedforward within a timestep: spk1 and spk2 are local, consumed by
+        the next layer in the same step and never carried across steps.
+        All cross-timestep memory is in the three leaky membranes.
         """
-        mem1, spk1, mem2, spk2, memo = state
+        mem1, mem2, memo = state
         B = x.shape[0]
 
         # gait-conditioned input routing: leg l <- CPG neuron route[g, l]
@@ -857,27 +862,9 @@ class LegGroupedSNN(nn.Module):
         g1, f1 = self._film(self.film1, gait)
         g2, f2 = self._film(self.film2, gait)
 
-        # Recurrent terms, gated by the ablation flag. Written as a
-        # separate term added in the SAME position as before so that
-        # use_recurrence=True is bit-identical to the pre-flag version:
-        # adding a Python 0.0 is an exact IEEE-754 identity, and Inductor
-        # folds it away, so the disabled path costs nothing.
-        #
-        # NOTE which spk is which. rec1 consumes spk1 from the PREVIOUS
-        # timestep (spk1 is rebound below), and rec2 consumes spk2 from the
-        # previous timestep. These two einsums are the only consumers of
-        # the incoming spk1/spk2, so with recurrence off those two state
-        # slots become inert -- but mem1/mem2/memo are still carried, since
-        # the leaky membranes are what make this a stateful SNN at all.
-        rec1_term = (torch.einsum("bgh,ghk->bgk", spk1, self.rec1)
-                     if self.use_recurrence else 0.0)
-        rec2_term = (torch.einsum("bgh,ghk->bgk", spk2, self.rec2)
-                     if self.use_recurrence else 0.0)
-
         # ---- layer 1 -------------------------------------------------
         cur1 = (torch.einsum("bg,gh->bgh", xr, self.w_self)
                 + self.cross_gain * (x @ self.w_cross).view(B, self.G, self.Hg)
-                + rec1_term
                 + self.b1)
         cur1 = self.ln1(cur1) * g1 + f1
         beta1 = torch.sigmoid(self.beta1_logit)
@@ -887,7 +874,6 @@ class LegGroupedSNN(nn.Module):
 
         # ---- layer 2 -------------------------------------------------
         cur2 = (torch.einsum("bgh,ghk->bgk", spk1, self.w2)
-                + rec2_term
                 + self.b2)
         cur2 = self.ln2(cur2) * g2 + f2
         beta2 = torch.sigmoid(self.beta2_logit)
@@ -903,26 +889,29 @@ class LegGroupedSNN(nn.Module):
         out = torch.einsum("bgh,ghj->bgj", memo, self.w_out) + self.b_out  # (B,G,2)
         y   = torch.cat([out[:, :, 0], out[:, :, 1]], dim=1)               # (B,8)
 
-        return y, (mem1, spk1, mem2, spk2, memo)
+        return y, (mem1, mem2, memo)
 
-    def forward(self, x_seq, gait_seq, state=None, return_spikes=False):
+    def forward(self, x_seq, gait_seq, state=None):
         """
         x_seq    : (L, B, n_neurons)
         gait_seq : (L, B)
+
+        Returns (y_seq, state) with y_seq (L, B, 8).
+
+        The old `return_spikes` option is gone: it read spk1/spk2 out of
+        the state tuple, and those are no longer carried across timesteps.
+        Hidden-layer rasters would now need step() to return the spikes,
+        which would change the ONNX signature -- not worth it for a
+        diagnostic. Add a separate non-exported path if they're wanted.
         """
         L, B = x_seq.shape[0], x_seq.shape[1]
         if state is None:
             state = self.init_state(B, x_seq.device, x_seq.dtype)
-        ys, s1s, s2s = [], [], []
+        ys = []
         for t in range(L):
             y, state = self.step(x_seq[t], gait_seq[t], state)
             ys.append(y)
-            if return_spikes:
-                s1s.append(state[1].detach())
-                s2s.append(state[3].detach())
         y_seq = torch.stack(ys)                                # (L,B,8)
-        if return_spikes:
-            return y_seq, state, torch.stack(s1s), torch.stack(s2s)
         return y_seq, state
 
 
@@ -934,10 +923,10 @@ class SingleStepONNX(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, spikes, gait, mem1, spk1, mem2, spk2, memo):
-        y, (m1, s1, m2, s2, mo) = self.model.step(
-            spikes, gait, (mem1, spk1, mem2, spk2, memo))
-        return y, m1, s1, m2, s2, mo
+    def forward(self, spikes, gait, mem1, mem2, memo):
+        y, (m1, m2, mo) = self.model.step(
+            spikes, gait, (mem1, mem2, memo))
+        return y, m1, m2, mo
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1259,12 +1248,10 @@ def export_onnx(model, out_dir, device, cfg):
         dummy = (torch.zeros(1, 4, device=device),
                  torch.zeros(1, dtype=torch.long, device=device),
                  *[torch.zeros(1, model.G, model.Hg, device=device)
-                   for _ in range(5)])
+                   for _ in range(3)])
 
-        in_names  = ["spikes", "gait",
-                     "mem1_in", "spk1_in", "mem2_in", "spk2_in", "memo_in"]
-        out_names = ["angles",
-                     "mem1_out", "spk1_out", "mem2_out", "spk2_out", "memo_out"]
+        in_names  = ["spikes", "gait", "mem1_in", "mem2_in", "memo_in"]
+        out_names = ["angles", "mem1_out", "mem2_out", "memo_out"]
 
         path = out_dir / "cpg_lif_snn_step.onnx"
         torch.onnx.export(
@@ -1331,19 +1318,6 @@ def main():
                     help="Initial strength of non-own-neuron drive into a leg "
                          "group. 0.0 = strictly one neuron per leg.")
     ap.add_argument("--slope",      type=float, default=25.0)
-    ap.add_argument("--no_recurrence", action="store_true",
-                    help="Ablate the within-group recurrent connections "
-                         "(rec1/rec2, ~45%% of all parameters). The leaky "
-                         "membranes and heterogeneous taus still provide "
-                         "memory, so this tests whether recurrence earns its "
-                         "cost. Judge on free-run reconstruction RMSE and "
-                         "Val(post-sw), NOT training loss -- a smaller model "
-                         "can show higher train loss and generalise the same. "
-                         "Keep tau_max >= one CPG period when ablating, since "
-                         "taus become the only long-timescale mechanism. "
-                         "The rec1/rec2 parameters stay registered so the "
-                         "state tuple, ONNX signature and checkpoints are "
-                         "unchanged; they simply receive no gradient.")
 
     # training
     ap.add_argument("--epochs",           type=int,   default=300)
@@ -1444,8 +1418,7 @@ def main():
     model = LegGroupedSNN(hidden=args.hidden, n_gaits=len(gait_tables),
                           route_P=P, tau_min=args.tau_min,
                           tau_max=args.tau_max, cross_gain=args.cross_gain,
-                          slope=args.slope,
-                          use_recurrence=not args.no_recurrence).to(device)
+                          slope=args.slope).to(device)
 
     # ── Compile the single timestep, NOT forward() ────────────────
     # forward() loops over L (= --bptt, 256-512) timesteps in Python.
@@ -1474,21 +1447,14 @@ def main():
         print(f"      torch.compile: SKIPPED (device={device.type}, not cuda)")
 
     n_par = sum(p.numel() for p in model.parameters())
-    n_rec = sum(p.numel() for n, p in model.named_parameters()
-                if n.startswith("rec"))
-    n_active = n_par - (0 if model.use_recurrence else n_rec)
     print(f"      hidden={args.hidden} ({model.Hg}/leg)  params={n_par:,}")
-    print(f"      recurrent params : {n_rec:,} "
-          f"({100.0 * n_rec / max(n_par, 1):.0f}% of total) — "
-          f"{'ACTIVE' if model.use_recurrence else 'INERT (ablated)'}")
-    if not model.use_recurrence:
-        print(f"      active params    : {n_active:,}")
-        if args.tau_max < period:
-            print(f"      WARNING: tau_max={args.tau_max:.0f} < CPG period "
-                  f"{period:.0f}. With recurrence ablated, taus are the ONLY "
-                  f"long-timescale memory — raise tau_max to >= one period.")
     print(f"      tau range [{args.tau_min:.0f}, {args.tau_max:.0f}] steps "
           f"vs CPG period {period:.0f}")
+    if args.tau_max < period:
+        print(f"      WARNING: tau_max={args.tau_max:.0f} < CPG period "
+              f"{period:.0f}. The leaky membranes are the ONLY long-timescale "
+              f"memory in this model — raise tau_max to >= one period or the "
+              f"network cannot hold phase.")
     gait_w = make_gait_weights(GAIT_TABLES_ORIG, device)
 
     # Defined for both branches so the config can always report them.
@@ -1583,9 +1549,7 @@ def main():
         "model_detail": {
             "class":            "LegGroupedSNN",
             "n_params":         int(n_par),
-            "n_params_recurrent": int(n_rec),
-            "n_params_active":  int(n_active),
-            "use_recurrence":   bool(model.use_recurrence),
+            "recurrent":        False,
             "tau_min":          float(args.tau_min),
             "tau_max":          float(args.tau_max),
             "cross_gain_init":  float(args.cross_gain),
@@ -1593,12 +1557,12 @@ def main():
             "thresh":           1.0,
             "surrogate":        "fast-sigmoid straight-through "
                                 "(plain ops, bit-exact forward)",
-            "state_tensors":    ["mem1", "spk1", "mem2", "spk2", "memo"],
+            "state_tensors":    ["mem1", "mem2", "memo"],
             "state_shape":      [1, N_LEGS, model.Hg],
-            "onnx_inputs":      ["spikes", "gait", "mem1_in", "spk1_in",
-                                 "mem2_in", "spk2_in", "memo_in"],
-            "onnx_outputs":     ["angles", "mem1_out", "spk1_out",
-                                 "mem2_out", "spk2_out", "memo_out"],
+            "onnx_inputs":      ["spikes", "gait", "mem1_in", "mem2_in",
+                                 "memo_in"],
+            "onnx_outputs":     ["angles", "mem1_out", "mem2_out",
+                                 "memo_out"],
             "weights_file":     "best_model.pt",
         },
 
