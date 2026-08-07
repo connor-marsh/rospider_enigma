@@ -62,10 +62,12 @@ What changed vs. the previous (conductance-based CPG + event-window) version
         capability; the network had to learn per-gait timing corrections
         regardless, which is what FiLM is for.
 
-    Servo routing on the output side is unchanged and still FIXED: column
-    j of the gait table lands on servo j + SERVO_BASE.
+    Servo routing itself is out of scope for this file -- see
+    inference.py -- but the gait-table COLUMN ordering it depends on is
+    fixed: column j always means the same joint, so a deployment script
+    can map columns to servo channels however its harness needs.
 
-    >>> CHECK THIS <<<  see LEG_COLS / SERVO_BASE below.
+    >>> CHECK THIS <<<  see LEG_COLS below.
 
 5.  `--arch timing_grouped` (TimingGroupedSNN): grouping, reintroduced.
     CPG spikes -> a small TIMING layer of n_timing LIF neurons (densely
@@ -93,16 +95,16 @@ What changed vs. the previous (conductance-based CPG + event-window) version
 
 6.  CPG size is an argument.
     `--n_cpg_neurons {3,4,6}` selects a coupling matrix from CPG_W_BY_N and
-    sizes the SNN input; nothing downstream assumes 4.  Read the provenance
-    note above CPG_W_BY_N before using N=3 or N=6 -- those matrices came
-    from a different from_fb_weight regime, and `--from_fb_weight` exists
-    for that reason.
+    sizes the SNN input; nothing downstream assumes 4.  from_fb_weight is
+    fixed at CPG_FROM_FB_WEIGHT for every N (confirmed to work for both
+    N=4 and the ported N=3/N=6), so there is no regime to configure here.
 
 Leg / joint layout  (LEG_COLS)
 ------------------------------
-LEG_COLS is now presentation and wiring only -- it groups the 8 output
-columns per leg for the diagnostic plots and for the servo map.  It no
-longer constrains the network architecture.
+LEG_COLS is presentation only -- it groups the 8 output columns per leg for
+the diagnostic plots.  It no longer constrains the network architecture,
+and this file has no notion of servo channels at all: that mapping is
+inference.py's problem, not training's.
 
 The 8 gait-table columns are two joints x four legs, laid out as
     columns 0..3 = joint A of legs 0..3
@@ -111,17 +113,14 @@ so leg l == columns (l, l+4).  This was verified numerically: for every
 gait, col j and col j+4 share the same circular phase offset (5/54 cycle
 in wkF, 5/39 in wkL/wkR, 15..17/22 in bk) while cols 0..3 are the same
 waveform shifted, and cols 4..7 are a different waveform shifted by the
-same per-leg amounts.  Change LEG_COLS if your servo harness disagrees.
+same per-leg amounts.  Change LEG_COLS if your gait tables disagree.
 
-On the robot, `set_cmd` writes full_angles[j + SERVO_BASE] = pred[j],
-so gait-table column j lands on servo index j + 8.
-
-LEG_COLS / N_LEGS / N_JOINTS / SERVO_BASE above are the QUADRUPED values
-(n_cpg_neurons=4, n_joints=8).  HEXAPOD_LEG_COLS / HEXAPOD_N_LEGS /
-HEXAPOD_N_JOINTS (n_cpg_neurons=6, n_joints=18; 3 servos/leg, legs in
-LF/LM/LR/RF/RM/RR order) are the hexapod equivalent.  A run resolves
-n_legs/leg_cols/n_joints from whichever matches --n_cpg_neurons via
-`default_leg_layout()`, or from --leg_cols if that's given explicitly.
+LEG_COLS / N_LEGS / N_JOINTS above are the QUADRUPED values (n_cpg_neurons=4,
+n_joints=8).  HEXAPOD_LEG_COLS / HEXAPOD_N_LEGS / HEXAPOD_N_JOINTS
+(n_cpg_neurons=6, n_joints=18; 3 servos/leg, legs in LF/LM/LR/RF/RM/RR order)
+are the hexapod equivalent.  A run resolves n_legs/leg_cols/n_joints from
+whichever matches --n_cpg_neurons via `default_leg_layout()`, or from
+--leg_cols if that's given explicitly.
 
 Usage
 -----
@@ -137,8 +136,8 @@ Usage
     # sanity-check the timing layer's firing regime before committing
     python train.py --arch timing_grouped --dry_run
 
-    # 6-neuron CPG; see the from_fb_weight caveat above CPG_W_BY_N
-    python train.py --n_cpg_neurons 6 --from_fb_weight -1e6
+    # 6-neuron CPG (see CPG_W_BY_N)
+    python train.py --n_cpg_neurons 6
 
     # hexapod: n_cpg_neurons=6 auto-selects the 16 tripod/ripple gait CSVs
     # from --gaits_dir (default ../gaits) and HEXAPOD_LEG_COLS for grouping
@@ -171,13 +170,13 @@ import matplotlib.pyplot as plt
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 0.  Robot layout  —  EDIT HERE IF YOUR HARNESS DIFFERS
+# 0.  Gait-table column layout  —  EDIT HERE IF YOUR GAIT TABLES DIFFER
 # ═══════════════════════════════════════════════════════════════════
+# Servo channel mapping is deliberately NOT here: that is inference.py's
+# concern, not training's.  This file only groups output columns by leg.
 
 # leg l -> (gait-table column for joint A, column for joint B)
 LEG_COLS   = [(0, 4), (1, 5), (2, 6), (3, 7)]
-# inference writes full_angles[col + SERVO_BASE]
-SERVO_BASE = 8
 N_LEGS     = 4
 N_JOINTS   = 8
 
@@ -285,16 +284,15 @@ def git_info():
 # nothing downstream has to know which sizes exist -- add a row here and
 # `--n_cpg_neurons` accepts it.
 #
-# PROVENANCE / CAVEAT: the N=3 and N=6 matrices were ported from the older
-# `cpg_utils.py::BLIF_CPG`, which ran with from_fb_weight = -1e6.  This file
-# defaults to -1e4.  from_fb_weight is the kick that terminates a burst, and
-# it lands in the slow `u` filter (du=0.1), so recovery time -- and hence the
-# inter-burst gap and the period -- scales like log(|from_fb|/i_app)/du:
-# roughly 111 steps at -1e6 vs 68 at -1e4.  The ported matrices were tuned in
-# the -1e6 regime.  `--from_fb_weight` exists so you can switch regimes
-# without editing source, and `analyse_cpg` warns if the resulting burst
-# phase offsets are not close to evenly spaced.  Verify N=3/N=6 against
-# cpg_raster.png before trusting a training run on them.
+# PROVENANCE: the N=3 and N=6 matrices were ported from the older
+# `cpg_utils.py::BLIF_CPG`.  from_fb_weight (the burst-terminating kick, see
+# BurstingLIF below) is fixed at CPG_FROM_FB_WEIGHT = -1e6 for every N --
+# confirmed to work for both the original N=4 and the ported N=3/N=6, so
+# there is no per-N regime to configure or mismatch.  `analyse_cpg` still
+# warns if burst phase offsets come out far from evenly spaced, which would
+# now point at the coupling matrix or i_app rather than this weight.
+CPG_FROM_FB_WEIGHT = -1_000_000.0
+
 CPG_W_BY_N = {
     3: np.asarray([
         [    0.0      , -523.65135942, -593.28982051],
@@ -412,7 +410,7 @@ class LIFCPGStepper:
     def __init__(self, N, W=None, i_app=8.0,
                  vth_main=100.0, du_main=0.1, dv_main=0.3, refrac_main=1,
                  vth_fb=100.0, du_fb=1.0, dv_fb=0.0, refrac_fb=1,
-                 from_fb_weight=-10000.0, to_fb_weight=10.0):
+                 from_fb_weight=CPG_FROM_FB_WEIGHT, to_fb_weight=10.0):
         self.N     = int(N)
         self.W     = (cpg_weight_matrix(self.N) if W is None
                       else np.asarray(W, dtype=np.float64))
@@ -445,16 +443,19 @@ class LIFCPGStepper:
         self.t = 0
 
 
-def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0,
-            from_fb_weight=-10000.0):
+def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0):
     """Warm up, then collect the spike train used for training.
 
     `N` is deliberately positional-with-no-default: it selects the coupling
     matrix, and a wrong value changes the oscillator rather than raising, so
     the caller is made to say it.
+
+    from_fb_weight is not a parameter here: it is fixed at
+    CPG_FROM_FB_WEIGHT (see LIFCPGStepper) for every N, so there is nothing
+    for a caller to get wrong by omission.
     """
-    cpg = LIFCPGStepper(N=N, i_app=i_app, from_fb_weight=from_fb_weight)
-    print(f"  N={N}  i_app={i_app}  from_fb_weight={from_fb_weight:g}")
+    cpg = LIFCPGStepper(N=N, i_app=i_app)
+    print(f"  N={N}  i_app={i_app}  from_fb_weight={CPG_FROM_FB_WEIGHT:g}")
     print(f"  Warming up CPG ({warmup} steps) ...")
     cpg.step_chunk(warmup)
     print(f"  Collecting {tmax} steps ...")
@@ -530,16 +531,17 @@ def analyse_cpg(spikes, out_dir):
           f"neuron phase offsets = {np.round(offsets, 3).tolist()}")
 
     # A healthy N-neuron ring puts the bursts at ~i/N.  Gaps far from 1/N mean
-    # the coupling matrix and the current from_fb_weight / i_app do not agree
-    # (see the CPG_W_BY_N provenance note) -- the run will still "work", it
-    # just will not be the oscillator the matrix was tuned for.
+    # the coupling matrix and i_app don't agree (from_fb_weight is fixed at
+    # CPG_FROM_FB_WEIGHT and confirmed to work across N, so it's not a
+    # suspect here) -- the run will still "work", it just will not be the
+    # oscillator the matrix was tuned for.
     gaps = np.diff(np.sort(np.concatenate([offsets % 1.0, [1.0]])))
     if gaps.size and (gaps.min() < 0.5 / N or gaps.max() > 2.0 / N):
         print(f"    WARNING: burst phase offsets are far from evenly spaced "
               f"(sorted gaps {np.round(gaps, 3).tolist()}, ideal {1.0/N:.3f}).")
-        print(f"             The N={N} coupling matrix may not be tuned for "
-              f"the current from_fb_weight / i_app regime — inspect "
-              f"cpg_raster.png before trusting this run.")
+        print(f"             The N={N} coupling matrix may not agree with "
+              f"the current i_app — inspect cpg_raster.png before trusting "
+              f"this run.")
 
     # diagnostic: log-ISI split for neuron 0
     ts  = np.where(spikes[:, 0] > 0)[0]
@@ -581,7 +583,7 @@ def cycle_phase(T, onsets):
 #
 # Loaded from CSV, ported from train_snn.py's loader: np.loadtxt on
 # gaits_dir/{name}.csv.  The file list is picked from --n_cpg_neurons
-# (4 -> quadruped, 6 -> hexapod) unless overridden with --gait_files.
+# (4 -> quadruped, 6 -> hexapod) unless overridden with --gaits.
 #
 # train_snn.py's own list of hexapod file stems (below) was itself dead
 # code there -- it got built, sliced, and then immediately overwritten by
@@ -604,7 +606,7 @@ def load_gait_tables(names, gaits_dir):
     train_snn.py's (np.loadtxt, comma-delimited, float32); the only change
     is that the caller decides the name list instead of it being
     hardcoded, so the same function serves quadruped, hexapod, or a custom
-    --gait_files list.
+    --gaits list.
 
     Validates that every table has the same column count: upsample_gait_tables
     interpolates per column, and a width mismatch there fails confusingly far
@@ -620,7 +622,7 @@ def load_gait_tables(names, gaits_dir):
                 f"  Looked for {len(names)} file(s) in {gaits_dir.resolve()}: "
                 f"{names}\n"
                 f"  Pass --gaits_dir to point at the right folder, or "
-                f"--gait_files to load a different set of names.")
+                f"--gaits to load a different set of names.")
         tables.append(np.loadtxt(p, delimiter=",", dtype=np.float32))
 
     widths = {t.shape[1] for t in tables}
@@ -1944,14 +1946,6 @@ def main():
                     help="CPG size. Selects the coupling matrix from "
                          "CPG_W_BY_N and sets the SNN's input width; nothing "
                          "downstream assumes 4.")
-    ap.add_argument("--from_fb_weight", type=float, default=-10000.0,
-                    help="Burst-terminating kick from the feedback neuron. "
-                         "Lands in the slow u filter (du=0.1), so it sets the "
-                         "inter-burst gap and hence the period: ~68 steps of "
-                         "recovery at -1e4 vs ~111 at -1e6. The ported N=3 "
-                         "and N=6 matrices were tuned at -1e6 — try that "
-                         "value if analyse_cpg warns about uneven burst "
-                         "phase offsets.")
 
     # gait tables
     ap.add_argument("--gaits_dir", type=str, default="../gaits",
@@ -1961,22 +1955,20 @@ def main():
                          "sibling of this script's own directory, not a "
                          "child of it — differs from train_snn.py's "
                          "'{this_file_dir}/gaits'.")
-    ap.add_argument("--gait_files", type=str, nargs="*", default=None,
+    ap.add_argument("--gaits", type=str, nargs="*", default=None,
                     help="CSV file stems (no extension) to load as gaits, "
                          "overriding the --n_cpg_neurons default. Use this "
                          "to run a subset, a different naming, or a species "
-                         "GAIT_FILES_BY_N has no entry for.")
+                         "GAIT_FILES_BY_N has no entry for. Named to match "
+                         "visualize.py's --gaits, though that one filters "
+                         "which loaded gaits to plot rather than which "
+                         "files to load — same name, different job.")
     ap.add_argument("--leg_cols", type=str, default=None,
                     help="JSON list of equal-size column-index groups, one "
                          "group per leg. Overrides the built-in default for "
                          "--n_cpg_neurons (4->quadruped LEG_COLS, "
                          "6->HEXAPOD_LEG_COLS). Use this for a robot neither "
                          "of those matches.")
-    ap.add_argument("--servo_base", type=int, default=8,
-                    help="Recorded in the config for inference.py's benefit "
-                         "only (see architecture_change_todo.md item 4); "
-                         "8 is the verified quadruped value and is almost "
-                         "certainly wrong for any other robot.")
 
     # architecture
     ap.add_argument("--arch", type=str, default="dense",
@@ -2120,16 +2112,16 @@ def main():
     # both depend on n_joints / n_legs, which depend on what got loaded.
     print("[0/6] Gait tables ...")
     gaits_dir = Path(this_file_dir + "/" + args.gaits_dir)
-    if args.gait_files is not None:
-        gait_files = list(args.gait_files)
-        print(f"      --gait_files override: {gait_files}")
+    if args.gaits is not None:
+        gait_files = list(args.gaits)
+        print(f"      --gaits override: {gait_files}")
     else:
         gait_files = GAIT_FILES_BY_N.get(args.n_cpg_neurons)
         if gait_files is None:
             raise ValueError(
                 f"No default gait file list for n_cpg_neurons="
                 f"{args.n_cpg_neurons} (have entries for "
-                f"{sorted(GAIT_FILES_BY_N)}). Pass --gait_files explicitly.")
+                f"{sorted(GAIT_FILES_BY_N)}). Pass --gaits explicitly.")
         species = {4: "quadruped", 6: "hexapod"}.get(args.n_cpg_neurons, "?")
         print(f"      n_cpg_neurons={args.n_cpg_neurons} -> {species} "
               f"gait set: {gait_files}")
@@ -2157,7 +2149,6 @@ def main():
     else:
         n_legs, leg_cols = default_leg_layout(args.n_cpg_neurons, n_joints)
         layout_src = "default"
-    servo_base = args.servo_base
     print(f"      gait layout: n_legs={n_legs}  n_joints={n_joints}  "
           f"source={layout_src}  leg_cols={leg_cols}")
 
@@ -2169,7 +2160,7 @@ def main():
     # ── 1. CPG ──────────────────────────────────────────────────
     print("\n[1/6] Bursting-LIF CPG ...")
     spikes = run_cpg(N=args.n_cpg_neurons, tmax=args.tmax, warmup=args.warmup,
-                     i_app=args.i_app, from_fb_weight=args.from_fb_weight)
+                     i_app=args.i_app)
 
     print("\n[2/6] Burst structure & phase ...")
     onsets, period, neuron_offsets, burst_thresholds = analyse_cpg(spikes, out_dir)
@@ -2177,18 +2168,9 @@ def main():
 
     phase = cycle_phase(len(spikes), onsets[0])
 
-    # ── 3. Upsample + leg->servo summary ────────────────────────
+    # ── 3. Upsample ──────────────────────────────────────────────
     print("\n[3/6] Upsampling gait tables ...")
     gait_tables, target_rows = upsample_gait_tables(gait_tables_orig, gait_names)
-
-    if leg_cols and len(leg_cols[0]) == 2:
-        print(f"\n      leg->servo: " +
-              ", ".join(f"leg{l}=servo({leg_cols[l][0]+servo_base},"
-                        f"{leg_cols[l][1]+servo_base})" for l in range(n_legs)))
-    else:
-        print(f"\n      leg->servo: leg_cols has {len(leg_cols[0])} column(s) "
-              f"per group (not the 2-per-leg case), servo_base={servo_base}; "
-              f"see leg_cols above for the exact mapping.")
 
     targets, valid, tgt_range = build_targets(phase, gait_tables,
                                               phase_zero=args.phase_zero)
@@ -2404,7 +2386,6 @@ def main():
         "gaits_dir":        str(gaits_dir.resolve()),
         "leg_cols":         [list(c) for c in leg_cols],
         "leg_layout_source": layout_src,
-        "servo_base":       int(servo_base),
         "global_min":       float(tgt_range[0]),
         "global_max":       float(tgt_range[1]),
         "target_rows":      int(target_rows),
@@ -2414,7 +2395,7 @@ def main():
             "i_app": args.i_app, "vth_main": 100.0, "du_main": 0.1,
             "dv_main": 0.3, "refrac_main": 1, "vth_fb": 100.0,
             "du_fb": 1.0, "dv_fb": 0.0, "refrac_fb": 1,
-            "from_fb_weight": float(args.from_fb_weight),
+            "from_fb_weight": CPG_FROM_FB_WEIGHT,
             "to_fb_weight": 10.0,
             "N": int(args.n_cpg_neurons),
             "W": cpg_weight_matrix(args.n_cpg_neurons).tolist(),

@@ -73,7 +73,7 @@ from train import (
     detect_burst_threshold, burst_onsets,
     upsample_gait_tables, build_group_cols,
     load_gait_tables, GAIT_FILES_BY_N,
-    N_LEGS, N_JOINTS, CPG_PALETTE,
+    N_LEGS, N_JOINTS, CPG_PALETTE, CPG_FROM_FB_WEIGHT,
 )
 
 TIMING_PALETTE = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261",
@@ -205,7 +205,7 @@ def replay_cpg(cfg, n_steps):
         du_fb          = float(c.get("du_fb", 1.0)),
         dv_fb          = float(c.get("dv_fb", 0.0)),
         refrac_fb      = int(c.get("refrac_fb", 1)),
-        from_fb_weight = float(c.get("from_fb_weight", -10000.0)),
+        from_fb_weight = float(c.get("from_fb_weight", CPG_FROM_FB_WEIGHT)),
         to_fb_weight   = float(c.get("to_fb_weight", 10.0)))
 
     warmup = int(c.get("warmup", 2000))
@@ -385,11 +385,18 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     t     = np.arange(t_lo, t_hi)
 
     fig = plt.figure(figsize=(17, 3.4 + 1.9 * G))
-    gs  = gridspec.GridSpec(2 + G, 1, hspace=0.28,
+    gs  = gridspec.GridSpec(2 + G, 1, hspace=0.55,
                             height_ratios=[1.1, 1.1] + [1.5] * G)
     axes = [fig.add_subplot(gs[0])]
     for i in range(1, 2 + G):
         axes.append(fig.add_subplot(gs[i], sharex=axes[0]))
+
+    # Shared x axis via sharex= does not auto-hide tick labels on the upper
+    # subplots (that only happens with plt.subplots(sharex=True)), so every
+    # row was showing its own numeric time labels sitting right above the
+    # next row's title. Only the bottom row needs them.
+    for ax in axes[:-1]:
+        ax.tick_params(labelbottom=False)
 
     on_win = onsets[(onsets >= t_lo) & (onsets < t_hi)]
 
@@ -762,7 +769,7 @@ def main():
     if gait_files is None:
         # Older config, predates recording "gait_files" — assume it used
         # the standard set for its species, exactly as train.py's own
-        # fallback does when --gait_files isn't given.
+        # fallback does when --gaits isn't given.
         n_cpg = int(cfg_get(cfg, "n_cpg_neurons", 4))
         gait_files = GAIT_FILES_BY_N.get(n_cpg)
         if gait_files is None:

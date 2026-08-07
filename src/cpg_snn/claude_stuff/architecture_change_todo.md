@@ -278,24 +278,24 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    need the reset approximated or restructured — this is a research
    question, not a speed optimisation, and shouldn't be attempted casually.
 
-**7.** [ ] **Verify the ported N=3 and N=6 CPG matrices before using them** — *High*
-   > `--n_cpg_neurons {3,4,6}` now selects from `CPG_W_BY_N`, with the N=3 and
-   N=6 matrices ported from the old `cpg_utils.py::BLIF_CPG`. **They came from
-   a different parameter regime.** `cpg_utils.py` ran
-   `from_fb_weight = -1e6`; `train.py` defaults to `-1e4`. That value is the
-   burst-terminating kick and it lands in the slow `u` filter (`du=0.1`), so
-   recovery time — and hence the inter-burst gap and the period — scales like
-   `log(|from_fb| / i_app) / du`: roughly **111 steps at -1e6 vs 68 at -1e4**.
-   Those matrices look optimizer-derived, so they were almost certainly tuned
-   at -1e6.
+**7.** [x] **Verify the ported N=3 and N=6 CPG matrices before using them** — *High*
+   > `--n_cpg_neurons {3,4,6}` selects from `CPG_W_BY_N`, with the N=3 and N=6
+   matrices ported from the old `cpg_utils.py::BLIF_CPG`. The original concern
+   was a parameter-regime mismatch: that file ran `from_fb_weight = -1e6`
+   while this one defaulted to `-1e4`, and since that value is the
+   burst-terminating kick landing in the slow `u` filter (`du=0.1`), recovery
+   time scales like `log(|from_fb| / i_app) / du` — roughly 111 steps at -1e6
+   vs 68 at -1e4 — so a mismatched regime would produce a different
+   oscillator than the matrices were tuned for.
    >
-   > `--from_fb_weight` exists so the regime can be switched without editing
-   source, and `analyse_cpg` now warns when burst phase offsets drift far
-   from evenly spaced (`1/N`), which is the signature of a mismatched
-   matrix. Before trusting any N=3 or N=6 run: check `cpg_raster.png`, check
-   that no warning fired, and check the measured period against
-   `--tau_max` (the existing `tau_max < period` warning still applies, and a
-   longer period at -1e6 makes it more likely to trigger).
+   > **Resolved.** Confirmed that `-1e6` works correctly for both the
+   original N=4 case and the ported N=3/N=6 matrices, so there is no regime
+   to mismatch. `from_fb_weight` is no longer an argument at all —
+   `--from_fb_weight` is removed and `CPG_FROM_FB_WEIGHT = -1_000_000.0` is
+   hardcoded in `train.py` next to `CPG_W_BY_N`, used unconditionally by
+   `LIFCPGStepper` regardless of `N`. `analyse_cpg`'s burst-phase-offset
+   warning stays (still a useful general sanity check on the coupling matrix
+   vs `i_app`), just no longer framed as a regime check.
 
 **8.** [ ] **Move the timing layer out of the torch class** — *Low*
    > Longer-term intent: run the timing layer as a separate structure the way
@@ -307,3 +307,25 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    end-to-end by the same surrogate gradient as everything else, which is
    the version worth measuring first. `_timing` is already factored out as
    its own method, so the extraction is mechanical when the time comes.
+
+**9.** [ ] **Named legs for quadruped and hexapod, for use in visualizations** — *Low*
+   > Requested directly. Every leg-indexed label right now is a bare index —
+   `leg{l}` / `T{l}` in visualize.py's plots, `leg{l}=servo(...)` in
+   train.py's startup print — not an anatomical name. `HEXAPOD_LEG_NAMES =
+   ["LF","LM","LR","RF","RM","RR"]` already exists next to `HEXAPOD_LEG_COLS`
+   but nothing reads it yet. Needs:
+   > - `QUADRUPED_LEG_NAMES`, the equivalent constant for the 4-leg case
+   >   (convention TBD — e.g. `["FL","FR","BL","BR"]` matching LEG_COLS'
+   >   ordering, needs to be checked against which physical leg column 0
+   >   actually corresponds to).
+   > - Thread a name list through the same path `leg_cols` already takes:
+   >   `default_leg_layout` returns it (or a parallel lookup keyed the same
+   >   way), main() passes it down, and it lands in cfg (e.g. `"leg_names"`)
+   >   so visualize.py reads it back instead of re-deriving it from
+   >   `n_cpg_neurons`.
+   > - A user-supplied `--leg_cols` has no matching names by construction; add
+   >   `--leg_names` alongside it, and fall back to numeric labels when only
+   >   one of the two is given rather than guessing a pairing.
+   > - Swap the numeric labels for real names in visualize.py's
+   >   `plot_alignment`, `plot_phase_fold`, `plot_alignment_summary`, and
+   >   `plot_routing`, and in train.py's leg->servo startup print.
