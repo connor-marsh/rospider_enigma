@@ -128,12 +128,20 @@ def build_model_from_cfg(cfg, device):
             gc_kwargs["leg_cols"] = cfg_leg_cols
         group_cols = cfg_get(cfg, "group_cols") or build_group_cols(
             n_timing, **gc_kwargs)
+        # router_hidden default 16 matches train.py; a config from before the
+        # router existed has no such key and cannot be loaded into this class
+        # at all (its checkpoint has w_in_gait, which no longer exists), so
+        # load_run's strict=False report is what will flag that.
         model = TimingGroupedSNN(
             hidden_per_group = int(cfg_get(cfg, "hidden", 256)),
             n_timing         = n_timing,
             group_cols       = group_cols,
             tau_timing_min   = float(cfg_get(cfg, "tau_timing_min", 2.0)),
             tau_timing_max   = float(cfg_get(cfg, "tau_timing_max", 64.0)),
+            router_hidden    = int(cfg_get(cfg, "router_hidden", 16)),
+            tau_router_min   = float(cfg_get(cfg, "tau_router_min", 2.0)),
+            tau_router_max   = float(cfg_get(cfg, "tau_router_max", 64.0)),
+            timing_slope     = float(cfg_get(cfg, "timing_slope", 5.0)),
             timing_w_scale   = float(cfg_get(cfg, "timing_w_scale", 0.5)),
             # sub_ln changes FORWARD BEHAVIOUR, not shapes, so a wrong value
             # loads cleanly and then quietly computes something else.
@@ -283,7 +291,7 @@ def predict_and_membranes(model, spikes, gait_idx, device, warm, tgt_range,
     state = model.init_state(1, device)
     preds, mems = [], []
     for t in range(T):
-        y, state = model.step(x[t:t + 1], g, state)
+        y, state, _ = model.step(x[t:t + 1], g, state)
         preds.append(y[0].cpu().numpy())
         # Capped: at hidden=256 x 4 groups a full state snapshot is ~12 KB,
         # so recording every step of a long window would run to hundreds of
@@ -569,62 +577,105 @@ def plot_alignment_summary(summary, gait_names, G, out_dir, dpi):
     _savefig(fig, out_dir, "alignment_summary.png", dpi)
 
 
-def plot_routing(model, gait_names, out_dir, dpi):
+@torch.no_grad()
+def plot_routing(model, gait_names, device, period, out_dir, dpi,
+                 n_probe_cycles=4):
     """
-    The learned per-gait CPG->timing matrices.
+    Effective CPG -> timing routing, MEASURED rather than read off a weight.
 
-    This is what replaced the deleted fixed permutation, so it is worth
-    looking at directly.  The annotated argmax per column says which CPG
-    neuron drives each timing neuron most strongly for that gait -- if those
-    orderings differ between gaits, the per-gait parameterisation is earning
-    its keep, and if they are identical everywhere then a shared w_in plus
-    FiLM would have been enough (see todo 3d).
+    There is no per-gait routing matrix to inspect any more: the path is
+    a shared LIF router with a per-gait FiLM gate, so the routing is a
+    property of the whole layer's dynamics, not of one parameter. It is
+    recovered by probing -- for each gait and each CPG neuron, feed a
+    synthetic burst on that neuron alone and count which timing units
+    respond.
+
+    This is strictly more honest than the old weight heatmap even when a
+    weight existed: it reports what the layer DOES (after thresholds,
+    membrane decay and the gate) rather than what one matrix contains.
+
+    The annotated argmax per column is the strongest CPG driver for each
+    timing unit. Reading it:
+      - orderings that DIFFER across gaits => the per-gait gate is being
+        used, which is the whole reason the router exists
+      - orderings identical everywhere => gaits are not differentiating,
+        and either the gate has collapsed or the gait set genuinely does
+        not need distinct routings
+      - several timing units sharing one driver is EXPECTED, not a bug:
+        that is what a tripod is (3 legs at one phase, 3 at the opposite).
     """
-    W = model.w_in_gait.weight.detach().cpu().numpy()
-    ng = len(gait_names)
     n_cpg, n_t = model.n_neurons, model.n_timing
-    W = W[:ng].reshape(ng, n_cpg, n_t)
-    v = float(np.abs(W).max()) or 1.0
+    ng = len(gait_names)
+    P  = int(period)
 
-    fig, axes = plt.subplots(1, ng, figsize=(3.1 * ng, 2.6 + 0.28 * n_cpg),
+    # Synthetic burst probe: 10 spikes ~3 steps apart, matching the CPG's
+    # measured burst shape, repeated for a few cycles so membranes settle.
+    M = np.zeros((ng, n_cpg, n_t))
+    for i in range(n_cpg):
+        probe = np.zeros((P * n_probe_cycles, n_cpg), dtype=np.float32)
+        for c in range(n_probe_cycles):
+            for k in range(10):
+                t = c * P + k * 3
+                if t < probe.shape[0]:
+                    probe[t, i] = 1.0
+        x = torch.as_tensor(probe, device=device).unsqueeze(1)
+        for g in range(ng):
+            gg = torch.full((x.shape[0], 1), g, dtype=torch.long, device=device)
+            M[g, i] = model.timing_only(x, gg)[:, 0].sum(0).cpu().numpy()
+
+    v = float(M.max()) or 1.0
+    fig, axes = plt.subplots(1, ng, figsize=(2.9 * ng, 2.6 + 0.28 * n_cpg),
                              squeeze=False)
     axes = axes[0]
-    argmax_tbl = {}
+    argmax_tbl, im = {}, None
     for gi, gname in enumerate(gait_names):
         ax = axes[gi]
-        im = ax.imshow(W[gi], cmap="RdBu_r", vmin=-v, vmax=v, aspect="auto")
+        im = ax.imshow(M[gi], cmap="viridis", vmin=0, vmax=v, aspect="auto")
         ax.set_xticks(range(n_t))
         ax.set_xticklabels([f"T{j}" for j in range(n_t)], fontsize=7)
         ax.set_yticks(range(n_cpg))
         ax.set_yticklabels([f"N{i}" for i in range(n_cpg)], fontsize=7)
-        ax.set_title(gname, fontsize=9)
-        dom = W[gi].argmax(axis=0)
-        argmax_tbl[gname] = dom.tolist()
-        for j in range(n_t):
-            ax.add_patch(plt.Rectangle((j - 0.5, dom[j] - 0.5), 1, 1,
-                                       fill=False, edgecolor="k", lw=1.8))
+        ax.set_title(gname, fontsize=8)
+        if M[gi].sum() > 0:
+            dom = M[gi].argmax(axis=0)
+            argmax_tbl[gname] = [int(d) for d in dom]
+            for j in range(n_t):
+                ax.add_patch(plt.Rectangle((j - 0.5, dom[j] - 0.5), 1, 1,
+                                           fill=False, edgecolor="w", lw=1.8))
         for i in range(n_cpg):
             for j in range(n_t):
-                ax.text(j, i, f"{W[gi, i, j]:+.2f}", ha="center", va="center",
+                ax.text(j, i, f"{M[gi, i, j]:.0f}", ha="center", va="center",
                         fontsize=6,
-                        color="white" if abs(W[gi, i, j]) > 0.6 * v else "black")
-    plt.colorbar(im, ax=axes.tolist(), fraction=0.02, label="weight")
-    fig.suptitle("Learned per-gait CPG → timing weights  "
-                 "(boxed = strongest CPG driver per timing neuron)",
-                 fontsize=10, fontweight="bold")
+                        color="black" if M[gi, i, j] > 0.6 * v else "white")
+    if im is not None:
+        plt.colorbar(im, ax=axes.tolist(), fraction=0.02,
+                     label="timing spikes per probe")
+    fig.suptitle("Measured CPG → timing routing  "
+                 "(probe one CPG neuron, count timing responses; "
+                 "boxed = strongest driver)",
+                 fontsize=9, fontweight="bold")
     _savefig(fig, out_dir, "routing_matrices.png", dpi)
 
-    print("\n  Strongest CPG driver per timing neuron (learned routing):")
-    for gname, dom in argmax_tbl.items():
-        print(f"    {gname:>6s} : " +
+    print("\n  Strongest CPG driver per timing unit (measured):")
+    for gname in gait_names:
+        dom = argmax_tbl.get(gname)
+        if dom is None:
+            print(f"    {gname:>22s} : NO timing response to any probe")
+            continue
+        print(f"    {gname:>22s} : " +
               "  ".join(f"T{j}<-N{d}" for j, d in enumerate(dom)))
     uniq = {tuple(d) for d in argmax_tbl.values()}
-    if len(uniq) == 1:
-        print("    All gaits share one routing — a shared w_in plus FiLM "
-              "would likely have sufficed here (see todo 3d).")
+    if len(uniq) <= 1:
+        print("    All gaits share one routing — the per-gait FiLM gate is "
+              "not differentiating them. Either it has collapsed (check the "
+              "gate values) or this gait set doesn't need distinct routings.")
     else:
-        print(f"    {len(uniq)} distinct routings across {ng} gaits — the "
-              f"per-gait parameterisation is being used.")
+        print(f"    {len(uniq)} distinct routings across {len(argmax_tbl)} "
+              f"gaits — the per-gait gate is being used.")
+    shared = [d for d in uniq if len(set(d)) < n_t]
+    if shared:
+        print(f"    {len(shared)}/{len(uniq)} routings have timing units "
+              f"sharing a CPG driver (expected: that is what a tripod is).")
     return argmax_tbl
 
 
@@ -690,7 +741,11 @@ def plot_membranes(mems, state_names, gait_name, out_dir, dpi,
     stacks = [np.stack([m[k] for m in mems[:n_show]]) for k in range(len(mems[0]))]
     rng = np.random.default_rng(seed)
 
-    rows = [(k, nm) for k, nm in enumerate(state_names) if nm != "mem_timing"]
+    # Skip the router/timing membranes: they are tiny and already fully
+    # covered by the exact rasters elsewhere. This plot is about the
+    # sub-networks, whose spikes are NOT recoverable (see module docstring).
+    rows = [(k, nm) for k, nm in enumerate(state_names)
+            if nm not in ("mem_timing", "mem_router")]
     fig, axes = plt.subplots(len(rows), 1, figsize=(14, 2.4 * len(rows)),
                              sharex=True, squeeze=False)
     axes = axes[:, 0]
@@ -901,7 +956,8 @@ def main():
     if arch == "timing_grouped" and summary:
         plot_alignment_summary(summary, plotted, model.n_timing,
                                out_dir, args.dpi)
-        routing = plot_routing(model, all_names, out_dir, args.dpi)
+        routing = plot_routing(model, all_names, device, period,
+                               out_dir, args.dpi)
     plot_taus(model, period, cfg, out_dir, args.dpi)
 
     # ── 5. dump ─────────────────────────────────────────────────
