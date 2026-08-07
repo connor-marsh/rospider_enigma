@@ -139,13 +139,14 @@ def build_model_from_cfg(cfg, device):
             tau_timing_min   = float(cfg_get(cfg, "tau_timing_min", 2.0)),
             tau_timing_max   = float(cfg_get(cfg, "tau_timing_max", 64.0)),
             router_hidden    = int(cfg_get(cfg, "router_hidden", 16)),
+            readout_hidden   = int(cfg_get(cfg, "readout_hidden", 32)),
             tau_router_min   = float(cfg_get(cfg, "tau_router_min", 2.0)),
             tau_router_max   = float(cfg_get(cfg, "tau_router_max", 64.0)),
             timing_slope     = float(cfg_get(cfg, "timing_slope", 5.0)),
             timing_w_scale   = float(cfg_get(cfg, "timing_w_scale", 0.5)),
             # sub_ln changes FORWARD BEHAVIOUR, not shapes, so a wrong value
             # loads cleanly and then quietly computes something else.
-            sub_ln           = str(cfg_get(cfg, "sub_ln", "both")),
+            sub_ln           = str(cfg_get(cfg, "sub_ln", "l2")),
             **common)
     else:
         model = StatefulSNN(hidden=int(cfg_get(cfg, "hidden", 256)), **common)

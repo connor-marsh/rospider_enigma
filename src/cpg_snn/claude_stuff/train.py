@@ -747,7 +747,7 @@ class StreamSampler:
 
     def __init__(self, spikes, targets, valid, t_lo, t_hi, batch,
                  switch_min=600, switch_max=3000, rng=None, n_gaits=4,
-                 device=None):
+                 device=None, phase=None, warm_steps=0):
         self.t_lo    = int(t_lo)
         self.t_hi    = int(t_hi)
         self.B       = int(batch)
@@ -769,6 +769,17 @@ class StreamSampler:
         self.valid   = torch.as_tensor(
             np.ascontiguousarray(valid).astype(np.float32),
             dtype=torch.float32, device=self.device)
+        # NaNs zeroed here rather than downstream: `valid` is literally
+        # ~isnan(phase), so the mask already excludes exactly those steps, and
+        # carrying NaNs into the loss would poison it via 0*NaN = NaN.
+        ph = (np.zeros(len(spikes), dtype=np.float32) if phase is None
+              else np.nan_to_num(np.asarray(phase, dtype=np.float32)))
+        self.phase = torch.as_tensor(np.ascontiguousarray(ph),
+                                     dtype=torch.float32, device=self.device)
+        # Steps each head has advanced since its state was last zeroed.
+        # Starts at 0 because init_state() really does hand out zero state.
+        self.warm_steps  = int(warm_steps)
+        self.since_reset = np.zeros(self.B, dtype=np.int64)
 
         self.pos   = self.rng.integers(t_lo, t_hi, size=self.B)
         self.gait  = self.rng.integers(0, n_gaits, size=self.B)
@@ -803,6 +814,7 @@ class StreamSampler:
             if self.pos[b] + L > self.t_hi:
                 self._rewind(b, L)
                 reset_mask[b] = 1.0
+                self.since_reset[b] = 0
 
             gs = np.full(L, self.gait[b], dtype=np.int64)
             c  = self.count[b]
@@ -835,10 +847,28 @@ class StreamSampler:
         x = self.spikes[idx]                        # (L, B, n_cpg_neurons)
         y = self.targets[g_t, idx]                              # (L, B, J)
         m = self.valid[idx]                                     # (L, B)
+        ph = self.phase[idx]                                    # (L, B)
+
+        # ── post-reset warm-up mask ──────────────────────────────
+        # A head whose state was just zeroed cannot know where it is in the
+        # cycle yet, so its first `warm_steps` outputs are not something to
+        # train against.  The FORWARD pass still runs on them -- that is how
+        # the state builds -- only the loss is suppressed.  This bites for
+        # roughly one head per ~(range/L) chunks, i.e. ~1% of a batch of 128,
+        # so it is a small correctness fix rather than a big win.
+        warm = np.ones((L, B), dtype=np.float32)
+        if self.warm_steps > 0:
+            for b in range(B):
+                k = max(0, min(L, self.warm_steps - int(self.since_reset[b])))
+                if k > 0:
+                    warm[:k, b] = 0.0
+        self.since_reset += L
 
         return (x, g_t, y, m,
                 torch.as_tensor(sw, dtype=torch.float32, device=dev),
-                torch.as_tensor(reset_mask, dtype=torch.float32, device=dev))
+                torch.as_tensor(reset_mask, dtype=torch.float32, device=dev),
+                ph,
+                torch.as_tensor(warm, dtype=torch.float32, device=dev))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1190,8 +1220,9 @@ class TimingGroupedSNN(nn.Module):
 
     Instead, the firing regime is set explicitly: `calibrate_gains` bisects
     a per-unit multiplier into FiLM's gamma before training so every unit
-    starts inside a target spikes-per-cycle band, and `rate_floor_penalty`
-    keeps them there.  See those functions.
+    starts inside a target spikes-per-cycle band, and `spike_stats_penalty`
+    then holds it at the CPG's own rate and burst concentration.  See those
+    functions.
 
     Inside the sub-networks LN is optional (`sub_ln`) and uses
     elementwise_affine=False: a shared gamma/beta over (G, Hg) would be a
@@ -1201,7 +1232,8 @@ class TimingGroupedSNN(nn.Module):
     State (5 tensors, mixed rank):
         mem_router (B, H_r)
         mem_timing (B, n_timing)
-        mem1, mem2, memo  each (B, G, Hg)
+        mem1, mem2 (B, G, Hg)
+        memo       (B, G, H_o)   -- narrower; see the readout note in __init__
     """
 
     arch = "timing_grouped"
@@ -1212,7 +1244,7 @@ class TimingGroupedSNN(nn.Module):
 
     def __init__(self, hidden_per_group=128, n_gaits=4, max_gaits=16,
                  n_neurons=4, n_timing=N_LEGS, group_cols=None,
-                 n_joints=N_JOINTS, router_hidden=16,
+                 n_joints=N_JOINTS, router_hidden=16, readout_hidden=32,
                  tau_min=2.0, tau_max=256.0,
                  tau_timing_min=2.0, tau_timing_max=64.0,
                  tau_router_min=2.0, tau_router_max=64.0,
@@ -1239,11 +1271,13 @@ class TimingGroupedSNN(nn.Module):
         G   = int(n_timing)
         Hg  = int(hidden_per_group)
         Hr  = int(router_hidden)
+        Ho  = int(readout_hidden)
         C   = len(group_cols[0])            # output columns per group
 
         self.G          = G
         self.Hg         = Hg
         self.Hr         = Hr
+        self.Ho         = Ho
         self.C          = C
         self.n_timing   = G
         self.n_neurons  = int(n_neurons)
@@ -1307,9 +1341,18 @@ class TimingGroupedSNN(nn.Module):
         self.b2 = nn.Parameter(torch.zeros(G, Hg))
 
         # ── block-diagonal analog readout ─────────────────────────
-        self.w_read = nn.Parameter(torch.randn(G, Hg, Hg) / math.sqrt(Hg))
-        self.b_read = nn.Parameter(torch.zeros(G, Hg))
-        self.w_out  = nn.Parameter(torch.randn(G, Hg, C) / math.sqrt(Hg))
+        # Ho, not Hg: memo is a BANK OF LOW-PASS FILTERS (one tau per unit,
+        # see betao_logit) whose weighted sum is the output, so its width is
+        # the size of the temporal basis available for synthesising the output
+        # waveform -- not the output width.  Ho == C would give exactly one
+        # basis function per output column and no redundancy, and because
+        # filter-then-combine differs from combine-then-filter when the taus
+        # differ, projecting down to C BEFORE the membrane would leave only C
+        # distinct (projection, tau) pairs for the whole group.  Ho == Hg (the
+        # original) is the other extreme and was ~40% of the model's params.
+        self.w_read = nn.Parameter(torch.randn(G, Hg, Ho) / math.sqrt(Hg))
+        self.b_read = nn.Parameter(torch.zeros(G, Ho))
+        self.w_out  = nn.Parameter(torch.randn(G, Ho, C) / math.sqrt(Ho))
         self.b_out  = nn.Parameter(torch.zeros(G, C))
 
         self.ln1 = nn.LayerNorm(Hg, elementwise_affine=False)
@@ -1317,7 +1360,7 @@ class TimingGroupedSNN(nn.Module):
 
         self.beta1_logit = nn.Parameter(init_beta_logit((G, Hg), tau_min, tau_max))
         self.beta2_logit = nn.Parameter(init_beta_logit((G, Hg), tau_min, tau_max))
-        self.betao_logit = nn.Parameter(init_beta_logit((G, Hg), 2.0, 40.0))
+        self.betao_logit = nn.Parameter(init_beta_logit((G, Ho), 2.0, 40.0))
 
         self.film1 = nn.Embedding(max_gaits, 2 * G * Hg)
         self.film2 = nn.Embedding(max_gaits, 2 * G * Hg)
@@ -1327,11 +1370,11 @@ class TimingGroupedSNN(nn.Module):
 
     # ---------------------------------------------------------------
     def init_state(self, batch, device, dtype=torch.float32):
-        z = lambda: torch.zeros(batch, self.G, self.Hg,
-                                device=device, dtype=dtype)
+        z = lambda w: torch.zeros(batch, self.G, w, device=device, dtype=dtype)
         mem_r = torch.zeros(batch, self.Hr, device=device, dtype=dtype)
         mem_t = torch.zeros(batch, self.G,  device=device, dtype=dtype)
-        return (mem_r, mem_t, z(), z(), z())
+        # memo is Ho wide, not Hg (see the readout comment in __init__).
+        return (mem_r, mem_t, z(self.Hg), z(self.Hg), z(self.Ho))
 
     # ---------------------------------------------------------------
     def _router(self, x, gait, mem_r):
@@ -1530,7 +1573,7 @@ class SingleStepONNXTiming(nn.Module):
 # acting at different times:
 #
 #   calibrate_gains      once, before training  -- never start dead
-#   rate_floor_penalty   every gradient step    -- don't drift to dead
+#   spike_stats_penalty  every gradient step    -- fire like the CPG does
 #   reinit_dead_units    on detection           -- rescue what died anyway
 #
 # A dead timing unit is not merely a wasted unit: its sub-network's input
@@ -1662,49 +1705,101 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
     return report
 
 
-def rate_floor_penalty(spk, gait, n_gaits, floor_per_step, lam):
+def cpg_spike_stats(spikes, phase, period):
     """
-    One-sided penalty for units firing BELOW a floor.  Added to the loss.
+    The CPG's own firing statistics, per neuron and averaged: spikes per
+    cycle, and circular concentration R of the spike phases.
 
-    spk            : (L, B, U) surrogate spikes from step()'s aux
-    gait           : (L, B) int64 gait label per stream per timestep
-    floor_per_step : minimum acceptable per-timestep firing rate
-    lam            : weight
+    These become the TARGETS for the timing/router layers, which is why they
+    are measured rather than configured -- "fire like the CPG does" needs no
+    hyperparameter, and hardcoding e.g. R=1.0 would be unsatisfiable anyway
+    (10 spikes at 3-step spacing inside a 352-step cycle tops out near 0.99,
+    so a target of 1.0 would apply permanent pressure that can never be met).
+    """
+    ok = ~np.isnan(phase)
+    n_cycles = max(ok.sum() / float(period), 1e-9)
+    rates, Rs = [], []
+    for i in range(spikes.shape[1]):
+        m = (spikes[:, i] > 0) & ok
+        rates.append(m.sum() / n_cycles)
+        if m.sum() == 0:
+            Rs.append(0.0)
+            continue
+        z = np.mean(np.exp(1j * 2.0 * np.pi * phase[m]))
+        Rs.append(abs(z))
+    return float(np.mean(rates)), float(np.mean(Rs))
 
-    Shortfall is expressed as a FRACTION of the floor, so a fully dead unit
-    contributes 1.0 and half-rate contributes 0.25.  Without that
-    normalisation the raw numbers are hopeless to tune: against a floor of
-    1 spike per 352-step cycle, a dead unit's squared raw shortfall is ~8e-6
-    versus a task loss of ~1e-3.  Normalised, `lam` reads directly as "how
-    much loss is one dead unit worth".
 
-    Squared rather than absolute so the gradient scales with the shortfall --
-    a nearly-dead unit is pushed hard, a marginal one nudged -- and so the
-    penalty is smooth where it switches on.
+def spike_stats_penalty(spk, gait, phase, mask, n_gaits,
+                        target_rate_per_step, target_R, lam):
+    """
+    Push each unit to fire LIKE THE CPG: the right number of spikes per
+    cycle, clustered into one burst rather than spread around the cycle.
 
-    One-sided (relu) so a genuinely busy unit is never penalised for it.
+    spk                  : (L, B, U) surrogate spikes from step()'s aux
+    gait                 : (L, B) int64
+    phase                : (L, B) cycle phase in [0,1), NaNs already zeroed
+    mask                 : (L, B) 1 where the sample counts (phase valid AND
+                           past the post-reset warm-up)
+    target_rate_per_step : CPG spikes-per-cycle divided by the period
+    target_R             : the CPG's own circular concentration
+
+    TWO TERMS, because rate alone is not enough.  10 spikes per cycle is
+    satisfied equally well by one tight burst of 10 and by one lone spike
+    every 35 steps -- rate constrains the COUNT, not the CLUSTERING, and what
+    is actually wanted is "one burst per cycle".  So:
+
+      rate term  ((rate - target)/target)^2, two-sided.  Replaces the old
+                 one-sided floor, which only punished silence and therefore
+                 permitted the over-firing it produced.  Relative rather than
+                 absolute so `lam` is scale-free.
+
+      conc term  relu(target_R - R)^2, one-sided, where R is the circular
+                 concentration of the unit's spike phases:
+
+                     R = |sum_t spk_t * exp(i*2*pi*phase_t)| / sum_t spk_t
+
+                 R near 1 means every spike lands at the same cycle phase,
+                 which IS "one burst per cycle".  `phase` is a constant, `spk`
+                 carries the surrogate gradient, so this is differentiable as
+                 written.  One-sided because a burst TIGHTER than the CPG's is
+                 not a problem.
+
+    KNOWN LIMITATION, accepted deliberately: R is computed on the fundamental,
+    so two bursts at opposite phases cancel to R ~ 0 and would be punished
+    hard.  For gaits where each leg swings once per cycle -- all the ones in
+    use -- that is correct.  For a genuinely two-burst-per-cycle gait it is
+    wrong, and the fix would be to score the second Fourier component too.
+    Tracked in architecture_change_todo.md.
 
     Grouped per (gait, unit), NOT averaged over the batch: streams in a chunk
-    carry different gaits, so a batch average would hide a unit that is dead
-    for exactly one gait, which is the failure actually observed.  Gaits
-    absent from the chunk are masked out rather than counted as fully dead.
-
-    LIMITATION: this guarantees "not silent", not "informative".  A unit can
-    satisfy the floor degenerately by growing enough tonic drive to fire on
-    its own schedule while ignoring the CPG.  The check for that is the R
-    column (circular concentration) in timing_report -- healthy rate with low
-    R means the floor has been gamed.
+    carry different gaits, so a batch average would hide a unit misbehaving
+    for exactly one gait.  Gaits absent from the chunk are masked out.
     """
     L, B, U = spk.shape
-    oh   = torch.nn.functional.one_hot(gait, n_gaits).to(spk.dtype)  # (L,B,G)
-    num  = torch.einsum("lbg,lbu->gu", oh, spk)
-    den  = oh.sum(dim=(0, 1))                                        # (G,)
-    rate = num / den.clamp(min=1.0).unsqueeze(1)                     # (G,U)
+    oh  = torch.nn.functional.one_hot(gait, n_gaits).to(spk.dtype)
+    oh  = oh * mask.unsqueeze(-1)                    # (L,B,G), masked
+    cnt = torch.einsum("lbg,lbu->gu", oh, spk)       # spikes per (gait, unit)
+    den = oh.sum(dim=(0, 1))                         # unmasked steps per gait
+    rate = cnt / den.clamp(min=1.0).unsqueeze(1)
 
-    present = (den > 0).to(spk.dtype).unsqueeze(1)                   # (G,1)
-    short   = torch.relu(1.0 - rate / floor_per_step) * present
-    denom   = present.sum().clamp(min=1.0) * U
-    return lam * (short ** 2).sum() / denom
+    present = (den > 0).to(spk.dtype).unsqueeze(1)   # (G,1)
+
+    rate_err = ((rate - target_rate_per_step) / target_rate_per_step) ** 2
+    rate_err = rate_err * present
+
+    ang = 2.0 * math.pi * phase
+    C = torch.einsum("lbg,lbu,lb->gu", oh, spk, torch.cos(ang))
+    S = torch.einsum("lbg,lbu,lb->gu", oh, spk, torch.sin(ang))
+    R = torch.sqrt(C ** 2 + S ** 2 + 1e-8) / cnt.clamp(min=1e-2)
+    # Only shape units that are already firing: for a silent unit R is
+    # meaningless and the rate term is what should be pushing it up.  Detached
+    # hard mask, so no gradient flows through the gate itself.
+    alive = (cnt > 1.0).to(spk.dtype).detach()
+    conc_err = torch.relu(target_R - R) ** 2 * present * alive
+
+    denom = present.sum().clamp(min=1.0) * U
+    return lam * (rate_err.sum() + conc_err.sum()) / denom
 
 
 @torch.no_grad()
@@ -1902,16 +1997,20 @@ def apply_reset(state, reset_mask):
 
 
 def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
-                 gait_w, out_dir, timing_diag=None, n_gaits=4, period=254.0):
+                 gait_w, out_dir, timing_diag=None, n_gaits=4, period=254.0,
+                 target_rate=None, target_R=None):
     """
     `timing_diag` : optional zero-arg callable returning (lines, stats).
                     Called every args.timing_log_every epochs for the
                     timing-grouped arch; None for the dense arch.  Its last
                     return value is handed back so the config can record it.
     `n_gaits`,
-    `period`      : needed by the rate-floor penalty, which groups firing
-                    rates per gait and expresses its floor in spikes per
-                    CPG cycle.
+    `period`      : needed by the spike-statistics penalty, which groups
+                    firing rates per gait and works in spikes per CPG cycle.
+    `target_rate`,
+    `target_R`    : the CPG's own spikes-per-cycle and circular concentration,
+                    measured at startup by cpg_spike_stats. The penalty asks
+                    the timing/router layers to match them.
     """
     best = float("inf")
     best_path = out_dir / "best_model.pt"
@@ -1919,15 +2018,18 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             "floor": []}
     last_timing_stats = []
 
-    # Rate floor is only meaningful for the arch that has a timing layer.
-    use_floor = (args.rate_floor_lambda > 0.0
-                 and hasattr(model, "n_timing"))
-    floor_per_step = args.rate_floor_spk_per_cycle / float(period)
-    if use_floor:
-        print(f"\n  Rate floor active: lambda={args.rate_floor_lambda:g}, "
-              f"floor={args.rate_floor_spk_per_cycle:g} spk/cyc "
-              f"({floor_per_step:.2e}/step), applied per (gait, unit) to the "
-              f"router and timing layers.")
+    # Spike statistics are only meaningful for the arch with a timing layer.
+    use_stats = (args.spike_stats_lambda > 0.0
+                 and hasattr(model, "n_timing")
+                 and target_rate is not None)
+    tgt_rate_step = (target_rate / float(period)) if target_rate else 0.0
+    if use_stats:
+        print(f"\n  Spike-statistics penalty active: "
+              f"lambda={args.spike_stats_lambda:g}, targets measured from the "
+              f"CPG — {target_rate:.2f} spk/cyc ({tgt_rate_step:.2e}/step), "
+              f"concentration R={target_R:.3f}.")
+        print(f"  Applied per (gait, unit) to the router and timing layers. "
+              f"Judge it on free-run RMSE, not on the rate.")
 
     # Consecutive epochs each timing unit has been observed dead, for
     # reinit_dead_units.  Only advanced on epochs where the diagnostic runs.
@@ -1953,27 +2055,38 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             state = model.init_state(args.batch, device)
             tot, gtot, nb, ftot = 0.0, 0.0, 0, 0.0
             for _ in range(args.chunks_per_epoch):
-                x, g, y, m, sw, rst = tr_sampler.next_chunk(args.bptt)
+                (x, g, y, m, sw, rst,
+                 ph, warm) = tr_sampler.next_chunk(args.bptt)
                 x, g, y, m = (x.to(device), g.to(device),
                               y.to(device), m.to(device))
+                ph, warm = ph.to(device), warm.to(device)
                 state = apply_reset(detach_state(state), rst.to(device))
 
-                if use_floor:
+                # `warm` zeroes steps whose head had its state wiped less than
+                # one cycle ago: the forward pass still runs (that is how state
+                # builds) but those outputs are not trained against, because a
+                # network with zero state cannot know where in the cycle it is.
+                m_eff = m * warm
+
+                if use_stats:
                     pred, state, aux = model(x, g, state, return_aux=True)
                 else:
                     pred, state = model(x, g, state)
                     aux = None
-                loss = masked_loss(pred, y, m, g, gait_w)
+                loss = masked_loss(pred, y, m_eff, g, gait_w)
 
                 if aux is not None:
                     # aux = (router spikes, timing spikes), each (L, B, U).
-                    # Both layers get the floor: a dead timing unit kills a
-                    # whole sub-network, and a router layer that goes fully
-                    # silent starves every timing unit at once, leaving the
-                    # timing floor satisfiable only by degenerate tonic drive.
+                    # Both layers are scored: a misbehaving timing unit
+                    # corrupts one sub-network, but a router layer that goes
+                    # silent or saturates starves or floods all of them at
+                    # once.  Same warm mask -- a unit with freshly-zeroed
+                    # state legitimately fires less and should not be
+                    # penalised for it.
                     pen = sum(
-                        rate_floor_penalty(a, g, n_gaits, floor_per_step,
-                                           args.rate_floor_lambda)
+                        spike_stats_penalty(a, g, ph, m_eff, n_gaits,
+                                            tgt_rate_step, target_R,
+                                            args.spike_stats_lambda)
                         for a in aux)
                     loss = loss + pen
                     ftot += float(pen.detach())
@@ -2001,12 +2114,14 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             vtot, vsw_tot, vn, vsw_n = 0.0, 0.0, 0, 0
             with torch.no_grad():
                 for _ in range(args.val_chunks):
-                    x, g, y, m, sw, rst = va_sampler.next_chunk(args.bptt)
+                    (x, g, y, m, sw, rst,
+                     ph, warm) = va_sampler.next_chunk(args.bptt)
                     x, g, y, m = (x.to(device), g.to(device),
                                   y.to(device), m.to(device))
-                    sw = sw.to(device)
+                    sw, warm = sw.to(device), warm.to(device)
                     vstate = apply_reset(vstate, rst.to(device))
                     pred, vstate = model(x, g, vstate)
+                    m = m * warm            # same warm-up exclusion as train
 
                     vtot += masked_loss(pred, y, m, g).item(); vn += 1
 
@@ -2394,6 +2509,23 @@ def main():
                          "it wins, the gaits genuinely don't share "
                          "structure). At n_cpg=6/n_timing=6 the product is "
                          "36; sweep 12/16/24/36.")
+    ap.add_argument("--readout_hidden", type=int, default=32,
+                    help="[timing_grouped] Width of the analog readout "
+                         "membrane per group. Was implicitly --hidden, i.e. a "
+                         "full (G, Hg, Hg) w_read, which at hidden=128 was 40% "
+                         "of the whole model to produce a handful of angles "
+                         "per leg. Nothing requires memo to be as wide as "
+                         "spk2. NOT set to the output width (3): memo is where "
+                         "the temporal filtering happens and each unit has its "
+                         "own tau, so its width is the size of the temporal "
+                         "BASIS available to synthesise the output waveform. "
+                         "Filter-then-combine differs from "
+                         "combine-then-filter when the taus differ, so "
+                         "projecting to 3 before filtering leaves only 3 "
+                         "distinct (projection, tau) pairs for the whole "
+                         "group -- one basis function per output, no "
+                         "redundancy. Sweep 3/8/32/128 to find where it "
+                         "actually binds.")
     ap.add_argument("--tau_router_min", type=float, default=2.0)
     ap.add_argument("--tau_router_max", type=float, default=64.0,
                     help="[timing_grouped] Tau init ceiling for the ROUTER "
@@ -2435,28 +2567,25 @@ def main():
     ap.add_argument("--calibrate_gains", type=int, default=1,
                     help="[timing_grouped] 1 = before training, bisect each "
                          "router/timing unit's FiLM gamma until its firing "
-                         "rate lands inside [--rate_band_lo, --rate_band_hi] "
-                         "spikes per cycle. Forward passes only, a second of "
-                         "compute, and it retires --timing_w_scale as a "
+                         "rate lands within a factor of 2 of the CPG's own "
+                         "spikes-per-cycle (measured at startup, so there is "
+                         "no band to configure). Forward passes only, a second "
+                         "of compute, and it retires --timing_w_scale as a "
                          "number you have to guess. 0 = skip.")
-    ap.add_argument("--rate_band_lo", type=float, default=1.0,
-                    help="[timing_grouped] Calibration target band, lower "
-                         "edge, in spikes per CPG cycle.")
-    ap.add_argument("--rate_band_hi", type=float, default=5.0,
-                    help="[timing_grouped] Calibration target band, upper "
-                         "edge, in spikes per CPG cycle.")
-    ap.add_argument("--rate_floor_lambda", type=float, default=0.01,
-                    help="[timing_grouped] Weight on the one-sided "
-                         "below-floor firing penalty. Shortfall is measured "
-                         "as a fraction of the floor, so this reads directly "
-                         "as 'how much loss is one fully dead unit worth' — "
-                         "0.01 is comparable to the whole task loss early in "
-                         "training and automatically irrelevant once units "
-                         "are alive. 0 disables.")
-    ap.add_argument("--rate_floor_spk_per_cycle", type=float, default=1.0,
-                    help="[timing_grouped] Minimum acceptable firing rate "
-                         "before the penalty engages, in spikes per CPG "
-                         "cycle.")
+    ap.add_argument("--spike_stats_lambda", type=float, default=0.01,
+                    help="[timing_grouped] Weight on the spike-statistics "
+                         "penalty, which pushes router/timing units to fire "
+                         "LIKE THE CPG DOES: right number of spikes per cycle, "
+                         "clustered into one burst. Both targets are measured "
+                         "from the CPG itself at startup, so there is nothing "
+                         "to configure. Errors are relative, so this reads as "
+                         "'how much loss is one maximally-wrong unit worth'. "
+                         "Replaces the old one-sided rate floor, which only "
+                         "punished silence and so permitted the over-firing "
+                         "it produced. 0 disables. NOTE free-run RMSE is the "
+                         "acceptance criterion here, not the firing rate: "
+                         "this is a design-fidelity fix and it should not be "
+                         "allowed to cost accuracy.")
     ap.add_argument("--reinit_dead_after", type=int, default=2,
                     help="[timing_grouped] Re-roll a timing unit after it has "
                          "been silent for EVERY gait across this many "
@@ -2467,15 +2596,18 @@ def main():
                          "since w1's gradient is proportional to the timing "
                          "spike and so was exactly zero the whole time it was "
                          "dead. 0 disables.")
-    ap.add_argument("--sub_ln", type=str, default="both",
+    ap.add_argument("--sub_ln", type=str, default="l2",
                     choices=["none", "l1", "l2", "both"],
                     help="[timing_grouped] Which sub-network layers get "
                          "LayerNorm (elementwise_affine=False; FiLM supplies "
                          "the affine). Never applies to the timing layer. "
-                         "Worth ablating on l1: that layer's only input is "
-                         "one binary channel, so LN normalises away the "
-                         "amplitude of the sole drive and leaves FiLM gamma "
-                         "to restore it.")
+                         "Default l2 (NOT both): sub-net layer 1's only "
+                         "input is one binary channel, so its pre-activation "
+                         "has exactly two possible values and LN normalises "
+                         "away the amplitude of the sole drive it gets, "
+                         "leaving FiLM gamma to put it back. Dropping it also "
+                         "saves LN's retained tensors per timestep. Set "
+                         "'both' to restore the old behaviour.")
 
     ap.add_argument("--hidden",     type=int,   default=128,
                     help="Hidden width. For --arch dense this is the TOTAL "
@@ -2521,8 +2653,15 @@ def main():
                          "fixed batch*bptt. NOTE batch*bptt is the compute "
                          "budget, so a longer bptt at N=6 costs proportionally "
                          "more unless batch drops.")
-    ap.add_argument("--batch",            type=int,   default=256,
-                    help="Stream heads per gradient step. Raised from 32: at "
+    ap.add_argument("--batch",            type=int,   default=128,
+                    help="Stream heads per gradient step. Activation memory "
+                         "is roughly 12 * batch * bptt * n_timing * hidden * "
+                         "4 bytes (TBPTT retains ~12 (B,G,Hg) tensors per "
+                         "timestep), so at hexapod n_timing=6 / bptt=384 / "
+                         "hidden=128 this is ~1.8 GiB at 128 and ~3.6 GiB at "
+                         "256. batch*bptt is the compute budget: if you raise "
+                         "bptt with the period, drop batch to match. "
+                         "Historical note: at "
                          "these sizes the timestep loop is kernel-launch "
                          "bound, so a bigger batch is nearly free in "
                          "wall-clock. If raising further, consider an LR "
@@ -2647,6 +2786,12 @@ def main():
         print(f"      bptt        : {args.bptt} (auto, from measured "
               f"period {period:.0f})")
 
+    # The CPG's own firing statistics become the targets for the router and
+    # timing layers -- "fire like the CPG does" needs no hyperparameter.
+    cpg_rate, cpg_R = cpg_spike_stats(spikes, phase, period)
+    print(f"      CPG stats   : {cpg_rate:.2f} spikes/cycle per neuron, "
+          f"phase concentration R={cpg_R:.3f}")
+
     # ── 3. Upsample ──────────────────────────────────────────────
     print("\n[3/6] Upsampling gait tables ...")
     gait_tables, target_rows = upsample_gait_tables(gait_tables_orig, gait_names)
@@ -2669,13 +2814,20 @@ def main():
         raise ValueError("Not enough timesteps — raise --tmax or lower --bptt.")
 
     # Data lives on the training device; batches are gathered there.
+    # warm_steps = one full CPG cycle: a head whose state was just zeroed
+    # gets that long to build state before its outputs count toward the loss.
+    warm_steps = int(round(period))
+    print(f"      post-reset warm-up: {warm_steps} steps "
+          f"(one cycle) excluded from the loss")
     tr_sampler = StreamSampler(spikes, targets, valid, t_lo, t_split,
                                args.batch, args.switch_min, args.switch_max,
-                               rng, n_gaits=len(gait_tables), device=device)
+                               rng, n_gaits=len(gait_tables), device=device,
+                               phase=phase, warm_steps=warm_steps)
     va_sampler = StreamSampler(spikes, targets, valid, t_split, t_hi,
                                args.batch, args.switch_min, args.switch_max,
                                np.random.default_rng(args.seed + 1),
-                               n_gaits=len(gait_tables), device=device)
+                               n_gaits=len(gait_tables), device=device,
+                               phase=phase, warm_steps=warm_steps)
 
     # ── 5. Model + training ─────────────────────────────────────
     print("\n[5/6] Model ...")
@@ -2685,6 +2837,7 @@ def main():
             max_gaits=args.max_gaits, n_neurons=args.n_cpg_neurons,
             n_timing=args.n_timing, group_cols=group_cols,
             n_joints=n_joints, router_hidden=args.router_hidden,
+            readout_hidden=args.readout_hidden,
             tau_min=args.tau_min, tau_max=args.tau_max,
             tau_timing_min=args.tau_timing_min,
             tau_timing_max=args.tau_timing_max,
@@ -2732,7 +2885,7 @@ def main():
         print(f"      CPG({args.n_cpg_neurons}) -> router"
               f"({args.router_hidden}, LIF) -> timing({args.n_timing}, LIF) "
               f"-> {args.n_timing} x [{args.hidden} -> {args.hidden} -> "
-              f"readout], no cross talk (todo 3a)")
+              f"readout({args.readout_hidden})], no cross talk (todo 3a)")
         prod = args.n_cpg_neurons * args.n_timing
         if args.router_hidden >= prod:
             print(f"      NOTE router_hidden={args.router_hidden} >= "
@@ -2798,9 +2951,12 @@ def main():
     calib = {}
     if args.arch == "timing_grouped" and args.calibrate_gains:
         print("\n      Calibrating router/timing gains ...")
+        # Band derived from the CPG rather than configured, matching the
+        # spike-statistics penalty's targets: calibration puts units in the
+        # right ballpark, the penalty then tunes them to the CPG exactly.
         calib = calibrate_gains(
             model, spikes, len(gait_tables), device, period,
-            lo=args.rate_band_lo, hi=args.rate_band_hi)
+            lo=0.5 * cpg_rate, hi=2.0 * cpg_rate)
 
     # Defined for both branches so the config can always report them.
     best          = float("nan")
@@ -2824,7 +2980,8 @@ def main():
         best, hist, timing_stats = run_training(
             model, tr_sampler, va_sampler, opt, sched,
             device, args, gait_w, out_dir, timing_diag=timing_diag,
-            n_gaits=len(gait_tables), period=period)
+            n_gaits=len(gait_tables), period=period,
+            target_rate=cpg_rate, target_R=cpg_R)
         final_lr = float(opt.param_groups[0]["lr"])
         model.load_state_dict(torch.load(out_dir / "best_model.pt",
                                          map_location=device))
@@ -2887,6 +3044,8 @@ def main():
                              if args.arch == "timing_grouped" else None),
         "router_hidden":    (int(args.router_hidden)
                              if args.arch == "timing_grouped" else None),
+        "readout_hidden":   (int(args.readout_hidden)
+                             if args.arch == "timing_grouped" else None),
         "group_cols":       ([list(g) for g in group_cols]
                              if group_cols is not None else None),
         "gait_names":       gait_names,
@@ -2916,6 +3075,8 @@ def main():
         "per_joint_rmse_deg": rmse.tolist(),
         "timing_layer_stats": timing_stats,
         "gain_calibration":   calib,
+        "cpg_spike_stats":    {"spikes_per_cycle": cpg_rate,
+                               "concentration_R": cpg_R},
 
         # ── full argparse namespace, verbatim ──────────────────────
         "args": vars(args),
@@ -2978,6 +3139,9 @@ def main():
             "router_layernorm": False,
             "router_hidden":    (int(args.router_hidden)
                                  if args.arch == "timing_grouped" else None),
+            "readout_hidden":   (int(args.readout_hidden)
+                                 if args.arch == "timing_grouped" else None),
+            "warm_steps":       warm_steps,
             "router_spiking":   (True if args.arch == "timing_grouped"
                                  else None),
             "tau_router_min":   (float(args.tau_router_min)

@@ -310,8 +310,7 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
 
 **9.** [ ] **Named legs for quadruped and hexapod, for use in visualizations** — *Low*
    > Requested directly. Every leg-indexed label right now is a bare index —
-   `leg{l}` / `T{l}` in visualize.py's plots, `leg{l}=servo(...)` in
-   train.py's startup print — not an anatomical name. `HEXAPOD_LEG_NAMES =
+   `leg{l}` / `T{l}` in visualize.py's plots — not an anatomical name. `HEXAPOD_LEG_NAMES =
    ["LF","LM","LR","RF","RM","RR"]` already exists next to `HEXAPOD_LEG_COLS`
    but nothing reads it yet. Needs:
    > - `QUADRUPED_LEG_NAMES`, the equivalent constant for the 4-leg case
@@ -329,3 +328,36 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    > - Swap the numeric labels for real names in visualize.py's
    >   `plot_alignment`, `plot_phase_fold`, `plot_alignment_summary`, and
    >   `plot_routing`, and in train.py's leg->servo startup print.
+
+**10.** [ ] **The spike-concentration penalty forbids two bursts per cycle** — *Medium*
+   > `spike_stats_penalty` scores burst tightness with the circular
+   concentration R of a unit's spike phases:
+   >
+   > `R = |sum_t spk_t * exp(i*2*pi*phase_t)| / sum_t spk_t`
+   >
+   > That is the magnitude of the FIRST Fourier component, so it measures
+   "all spikes at one cycle phase". Two bursts at opposite phases cancel to
+   R ≈ 0 and get punished as hard as spikes smeared uniformly around the
+   cycle, even though a two-burst pattern is perfectly structured.
+   >
+   > Accepted deliberately for now: every gait currently in use swings each
+   leg exactly once per cycle, so one-burst-per-cycle is the correct target
+   and R is the right statistic. But it is baked into the objective, not a
+   configurable choice, and it will silently fight any gait where a leg
+   should swing twice per cycle (some ripple/wave variants, or any gait
+   defined at double the CPG's fundamental).
+   >
+   > Fix when needed: score the second Fourier component as well, and take
+   the max — `R_k = |sum_t spk_t * exp(i*2*pi*k*phase_t)| / sum_t spk_t` for
+   k in {1, 2}, target `max(R_1, R_2)`. That rewards "clustered at one phase
+   OR at two opposite phases" and leaves the one-burst case scoring exactly
+   as it does today. Cheap — one extra einsum pair. Alternatively expose the
+   harmonic as an arg, but auto-detecting it from the gait table's own
+   spectrum would be more in keeping with how the other targets are derived
+   (measured from data, not configured).
+   >
+   > Verification note: the current two-term penalty was checked numerically
+   before use — a CPG-like burst (10 spikes, 3 steps apart) and the same 10
+   spikes spread evenly over the cycle have IDENTICAL rates but penalties of
+   3.2e-5 vs 9.7e-3, a ~300x separation. That separation is entirely the R
+   term, which is what makes it worth keeping despite this limitation.
