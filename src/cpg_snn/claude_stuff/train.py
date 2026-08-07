@@ -116,6 +116,13 @@ same per-leg amounts.  Change LEG_COLS if your servo harness disagrees.
 On the robot, `set_cmd` writes full_angles[j + SERVO_BASE] = pred[j],
 so gait-table column j lands on servo index j + 8.
 
+LEG_COLS / N_LEGS / N_JOINTS / SERVO_BASE above are the QUADRUPED values
+(n_cpg_neurons=4, n_joints=8).  HEXAPOD_LEG_COLS / HEXAPOD_N_LEGS /
+HEXAPOD_N_JOINTS (n_cpg_neurons=6, n_joints=18; 3 servos/leg, legs in
+LF/LM/LR/RF/RM/RR order) are the hexapod equivalent.  A run resolves
+n_legs/leg_cols/n_joints from whichever matches --n_cpg_neurons via
+`default_leg_layout()`, or from --leg_cols if that's given explicitly.
+
 Usage
 -----
     python train.py --epochs 300 --hidden 256
@@ -132,6 +139,10 @@ Usage
 
     # 6-neuron CPG; see the from_fb_weight caveat above CPG_W_BY_N
     python train.py --n_cpg_neurons 6 --from_fb_weight -1e6
+
+    # hexapod: n_cpg_neurons=6 auto-selects the 16 tripod/ripple gait CSVs
+    # from --gaits_dir (default ../gaits) and HEXAPOD_LEG_COLS for grouping
+    python train.py --arch timing_grouped --n_cpg_neurons 6 --dry_run
 """
 
 import argparse
@@ -169,6 +180,14 @@ LEG_COLS   = [(0, 4), (1, 5), (2, 6), (3, 7)]
 SERVO_BASE = 8
 N_LEGS     = 4
 N_JOINTS   = 8
+
+# Hexapod: 6 legs x 3 servos (coxa, femur, tibia), columns grouped
+# consecutively per leg in that order — leg0 = cols [0,1,2], leg1 = [3,4,5],
+# etc.  Leg order in the CSV is LF, LM, LR, RF, RM, RR.
+HEXAPOD_LEG_COLS  = [[3 * l, 3 * l + 1, 3 * l + 2] for l in range(6)]
+HEXAPOD_LEG_NAMES = ["LF", "LM", "LR", "RF", "RM", "RR"]
+HEXAPOD_N_LEGS    = 6
+HEXAPOD_N_JOINTS  = 18
 
 # Long enough for a 6-neuron CPG; indexed modulo its own length everywhere.
 CPG_PALETTE = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261",
@@ -559,99 +578,79 @@ def cycle_phase(T, onsets):
 # ═══════════════════════════════════════════════════════════════════
 # 3.  Gait tables
 # ═══════════════════════════════════════════════════════════════════
+#
+# Loaded from CSV, ported from train_snn.py's loader: np.loadtxt on
+# gaits_dir/{name}.csv.  The file list is picked from --n_cpg_neurons
+# (4 -> quadruped, 6 -> hexapod) unless overridden with --gait_files.
+#
+# train_snn.py's own list of hexapod file stems (below) was itself dead
+# code there -- it got built, sliced, and then immediately overwritten by
+# the quadruped list before the load loop ran -- but the 16 names are real
+# CSV files, presumably still sitting in the gaits folder, so they are
+# preserved here verbatim rather than re-derived.
+QUADRUPED_GAIT_FILES = ["bittle_wkF", "bittle_bk", "bittle_wkL", "bittle_wkR"]
+HEXAPOD_GAIT_FILES = [
+    "tripod", "tripod_huge", "tripod_right", "tripod_huge_right",
+    "ripple", "ripple_tiny", "ripple_right", "ripple_tiny_right",
+    "tripod_backwards", "tripod_huge_backwards", "tripod_left", "tripod_huge_left",
+    "ripple_backwards", "ripple_tiny_backwards", "ripple_left", "ripple_tiny_left",
+]
+GAIT_FILES_BY_N = {4: QUADRUPED_GAIT_FILES, 6: HEXAPOD_GAIT_FILES}
 
-wkF = np.array([
-    [9,49,67,38,24,20,27,14],[8,50,68,39,28,21,22,14],
-    [10,51,70,41,26,22,18,14],[12,52,69,42,24,24,11,14],
-    [14,52,63,44,22,26,1,15],[16,53,53,45,21,27,-2,15],
-    [18,53,41,46,20,29,-1,15],[21,54,26,47,18,30,6,16],
-    [22,54,23,48,18,32,9,17],[25,54,20,49,16,34,12,18],
-    [26,54,17,51,16,37,17,18],[28,54,14,52,15,39,22,19],
-    [30,52,11,54,14,45,27,19],[32,54,11,54,14,44,29,20],
-    [33,58,13,55,15,36,27,21],[34,61,16,56,15,31,24,23],
-    [36,64,18,56,14,24,23,24],[38,66,20,57,14,20,22,26],
-    [39,67,22,57,14,16,21,28],[41,64,24,57,14,5,20,30],
-    [42,55,26,57,14,-1,19,32],[44,44,28,57,15,-3,18,35],
-    [45,30,29,57,15,1,18,38],[46,21,31,57,15,5,17,40],
-    [47,19,32,56,16,9,17,43],[48,16,35,57,17,12,16,44],
-    [49,12,37,62,18,17,14,35],[49,9,39,66,20,24,14,29],
-    [50,8,40,68,21,28,14,23],[51,10,42,70,22,26,14,19],
-    [52,12,43,70,24,24,15,17],[52,14,44,67,26,22,15,5],
-    [53,16,46,59,27,21,15,-2],[53,18,47,47,29,20,16,-2],
-    [54,21,48,34,30,18,16,1],[54,22,49,24,32,18,17,6],
-    [54,25,50,21,34,16,18,10],[54,26,51,19,37,16,19,12],
-    [54,28,52,15,39,15,20,19],[52,30,54,12,45,14,19,24],
-    [54,32,55,12,44,14,20,27],[58,33,55,11,36,15,22,29],
-    [61,34,56,14,31,15,24,26],[64,36,56,17,24,14,25,24],
-    [66,38,57,18,20,14,27,23],[67,39,57,21,16,14,29,21],
-    [64,41,57,23,5,14,31,20],[55,42,57,24,-1,14,33,20],
-    [44,44,57,26,-3,15,36,19],[30,45,57,28,1,15,39,18],
-    [21,46,56,30,5,15,42,17],[19,47,56,32,9,16,45,17],
-    [16,48,59,33,12,17,41,17],[12,49,64,35,17,18,33,16],
-], dtype=np.float32)
 
-bk = np.array([
-    [36,40,36,62,6,-3,6,1],[34,47,32,63,7,-4,7,4],
-    [30,53,28,59,8,-3,9,9],[26,58,25,57,10,-2,10,10],
-    [22,57,26,55,12,2,6,8],[18,51,29,52,14,8,2,7],
-    [15,51,36,50,15,6,-2,6],[17,48,43,47,9,5,-3,5],
-    [21,45,49,44,5,5,-4,5],[29,43,55,42,2,5,-3,5],
-    [35,39,60,38,-1,6,-1,6],[42,36,63,35,-3,6,1,6],
-    [49,32,62,31,-4,7,6,8],[54,28,58,28,-3,9,10,9],
-    [57,26,57,24,0,10,9,11],[56,21,54,26,3,12,8,4],
-    [51,17,52,31,8,15,6,1],[50,15,49,38,6,14,6,-2],
-    [47,18,47,44,5,8,5,-3],[45,24,44,51,5,4,5,-4],
-    [42,30,41,56,5,1,5,-3],[38,37,37,60,6,-2,6,-1],
-], dtype=np.float32)
+def load_gait_tables(names, gaits_dir):
+    """
+    Load one CSV per name from gaits_dir/{name}.csv.  Identical loader to
+    train_snn.py's (np.loadtxt, comma-delimited, float32); the only change
+    is that the caller decides the name list instead of it being
+    hardcoded, so the same function serves quadruped, hexapod, or a custom
+    --gait_files list.
 
-wkL = np.array([
-    [47,54,58,51,-2,13,-2,2],[45,56,52,52,0,14,-3,2],
-    [45,57,46,52,1,15,-4,2],[45,58,38,53,1,17,-2,2],
-    [46,59,31,54,1,19,1,2],[47,59,24,54,1,22,6,3],
-    [48,60,21,55,2,24,12,3],[49,58,23,56,1,30,16,3],
-    [49,61,25,57,1,30,13,3],[50,67,28,57,1,23,12,4],
-    [51,69,31,58,2,15,11,5],[52,68,34,58,2,8,10,5],
-    [52,65,36,59,2,3,9,6],[53,60,39,61,2,-1,9,5],
-    [54,55,41,62,2,-3,9,3],[54,50,43,62,2,-5,9,2],
-    [54,43,47,60,3,-5,7,1],[55,35,48,58,3,-3,8,1],
-    [56,28,51,57,3,1,8,-1],[57,18,52,55,3,7,9,-1],
-    [57,15,54,53,4,10,10,-2],[58,13,55,50,5,16,11,-2],
-    [58,16,57,49,5,16,12,-2],[59,18,58,46,6,14,14,-2],
-    [59,21,60,44,6,12,14,-2],[60,25,61,43,7,10,16,0],
-    [60,28,62,42,7,9,18,1],[60,31,63,42,10,8,20,3],
-    [62,32,63,42,6,7,24,3],[62,35,63,44,6,6,27,1],
-    [63,38,63,44,3,6,31,1],[61,40,62,45,2,7,35,1],
-    [60,42,65,46,1,7,37,1],[58,45,70,47,0,7,27,1],
-    [57,47,71,48,-1,7,23,2],[54,48,71,49,-1,8,14,1],
-    [53,51,69,49,-2,8,8,1],[50,52,66,50,-2,9,2,1],
-    [49,53,63,51,-2,12,-2,2],
-], dtype=np.float32)
+    Validates that every table has the same column count: upsample_gait_tables
+    interpolates per column, and a width mismatch there fails confusingly far
+    from its actual cause.
+    """
+    gaits_dir = Path(gaits_dir)
+    tables = []
+    for nm in names:
+        p = gaits_dir / f"{nm}.csv"
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Gait file not found: {p}\n"
+                f"  Looked for {len(names)} file(s) in {gaits_dir.resolve()}: "
+                f"{names}\n"
+                f"  Pass --gaits_dir to point at the right folder, or "
+                f"--gait_files to load a different set of names.")
+        tables.append(np.loadtxt(p, delimiter=",", dtype=np.float32))
 
-wkR = -(np.array([
-    [-54,-47,-51,-58,-13,2,-2,2],[-56,-45,-52,-52,-14,0,-2,3],
-    [-57,-45,-52,-46,-15,-1,-2,4],[-58,-45,-53,-38,-17,-1,-2,2],
-    [-59,-46,-54,-31,-19,-1,-2,-1],[-59,-47,-54,-24,-22,-1,-3,-6],
-    [-60,-48,-55,-21,-24,-2,-3,-12],[-58,-49,-56,-23,-30,-1,-3,-16],
-    [-61,-49,-57,-25,-30,-1,-3,-13],[-67,-50,-57,-28,-23,-1,-4,-12],
-    [-69,-51,-58,-31,-15,-2,-5,-11],[-68,-52,-58,-34,-8,-2,-5,-10],
-    [-65,-52,-59,-36,-3,-2,-6,-9],[-60,-53,-61,-39,1,-2,-5,-9],
-    [-55,-54,-62,-41,3,-2,-3,-9],[-50,-54,-62,-43,5,-2,-2,-9],
-    [-43,-54,-60,-47,5,-3,-1,-7],[-35,-55,-58,-48,3,-3,-1,-8],
-    [-28,-56,-57,-51,-1,-3,1,-8],[-18,-57,-55,-52,-7,-3,1,-9],
-    [-15,-57,-53,-54,-10,-4,2,-10],[-13,-58,-50,-55,-16,-5,2,-11],
-    [-16,-58,-49,-57,-16,-5,2,-12],[-18,-59,-46,-58,-14,-6,2,-14],
-    [-21,-59,-44,-60,-12,-6,2,-14],[-25,-60,-43,-61,-10,-7,0,-16],
-    [-28,-60,-42,-62,-9,-7,-1,-18],[-31,-60,-42,-63,-8,-10,-3,-20],
-    [-32,-62,-42,-63,-7,-6,-3,-24],[-35,-62,-44,-63,-6,-6,-1,-27],
-    [-38,-63,-44,-63,-6,-3,-1,-31],[-40,-61,-45,-62,-7,-2,-1,-35],
-    [-42,-60,-46,-65,-7,-1,-1,-37],[-45,-58,-47,-70,-7,0,-1,-27],
-    [-47,-57,-48,-71,-7,1,-2,-23],[-48,-54,-49,-71,-8,1,-1,-14],
-    [-51,-53,-49,-69,-8,2,-1,-8],[-52,-50,-50,-66,-9,2,-1,-2],
-    [-53,-49,-51,-63,-12,2,-2,2],
-], dtype=np.float32))
+    widths = {t.shape[1] for t in tables}
+    if len(widths) > 1:
+        detail = "  ".join(f"{nm}={t.shape[1]}" for nm, t in zip(names, tables))
+        raise ValueError(
+            f"Gait tables have mismatched column counts, cannot form one "
+            f"target array: {detail}")
+    return tables, list(names)
 
-GAIT_TABLES_ORIG = [wkF, bk, wkR, wkL]
-GAIT_NAMES       = ["wkF", "bk", "wkR", "wkL"]
+
+def default_leg_layout(n_cpg_neurons, n_joints):
+    """
+    (n_legs, leg_cols) for a known (n_cpg_neurons, n_joints) combination.
+
+    Quadruped (4, 8): column j and column j+4 share a circular phase offset,
+    confirmed numerically against the four quadruped tables — see the module
+    docstring.  Hexapod (6, 18): rows are ordered leg-major, 3 columns per
+    leg (coxa, femur, tibia), legs in LF/LM/LR/RF/RM/RR order.
+
+    Raises for anything else rather than guessing — pass --leg_cols for a
+    layout this hasn't seen.
+    """
+    if n_cpg_neurons == 4 and n_joints == 8:
+        return N_LEGS, [list(c) for c in LEG_COLS]
+    if n_cpg_neurons == 6 and n_joints == 18:
+        return HEXAPOD_N_LEGS, [list(c) for c in HEXAPOD_LEG_COLS]
+    raise ValueError(
+        f"No known leg layout for n_cpg_neurons={n_cpg_neurons}, "
+        f"n_joints={n_joints}. Pass --leg_cols explicitly.")
 
 
 def upsample_gait_tables(tables, names, target_rows=None, verbose=True):
@@ -1515,13 +1514,19 @@ def timing_report(model, spikes, phase, period, n_gaits, device,
 # 8.  Training
 # ═══════════════════════════════════════════════════════════════════
 
-def make_gait_weights(tables_orig, device):
-    """Upweight gaits whose original table was coarsest (bk: 22 rows)."""
+def make_gait_weights(tables_orig, names, device):
+    """Upweight gaits whose original table was coarsest (bk: 22 rows).
+
+    `names` is for the print only, but is a required (not defaulted)
+    parameter: the caller resolved a specific gait set for this run, and a
+    silent fallback here could print the wrong species' labels next to the
+    right numbers.
+    """
     R = max(t.shape[0] for t in tables_orig)
     w = torch.tensor([R / t.shape[0] for t in tables_orig],
                      dtype=torch.float32, device=device)
     print("      gait loss weights: " +
-          "  ".join(f"{GAIT_NAMES[i]}={w[i].item():.2f}" for i in range(len(w))))
+          "  ".join(f"{names[i]}={w[i].item():.2f}" for i in range(len(w))))
     return w
 
 
@@ -1735,14 +1740,32 @@ def plot_training_curves(hist, out_dir):
 
 @torch.no_grad()
 def plot_reconstruction(model, spikes, targets, valid, device,
-                        out_dir, tgt_range, t0, n_steps=1200, warm=600):
-    """Free-run the network on held-out steps, one plot per gait."""
+                        out_dir, tgt_range, t0, gait_names, leg_cols, n_joints,
+                        n_steps=1200, warm=600):
+    """
+    Free-run the network on held-out steps, one plot per gait.
+
+    `gait_names`, `leg_cols`, `n_joints` are required, explicit parameters —
+    this used to read GAIT_NAMES / LEG_COLS / N_JOINTS off the module, which
+    broke the moment a run could be quadruped OR hexapod: the module
+    constants are the quadruped layout only (see default_leg_layout), and a
+    hexapod run silently plotted under the wrong legend would be worse than
+    an import error.
+
+    `leg_cols` may have any number of equal-size groups (not just 4 groups
+    of 2) -- the subplot grid below sizes itself from len(leg_cols) and the
+    per-group column count, the same squeeze=False + hide-unused pattern
+    plotting_utils.py already uses elsewhere in this repo.
+    """
     lo, hi = tgt_range
     scale, shift = (hi - lo) / 2.0, (hi + lo) / 2.0
     model.eval()
-    rmse = np.zeros((len(GAIT_NAMES), N_JOINTS))
+    rmse = np.zeros((len(gait_names), n_joints))
 
-    for g in range(len(GAIT_NAMES)):
+    n_legs   = len(leg_cols)
+    cols_per = len(leg_cols[0])
+
+    for g in range(len(gait_names)):
         x = torch.tensor(spikes[t0 - warm:t0 + n_steps]).unsqueeze(1).to(device)
         gg = torch.full((x.shape[0], 1), g, dtype=torch.long, device=device)
         pred, _ = model(x, gg)
@@ -1750,9 +1773,10 @@ def plot_reconstruction(model, spikes, targets, valid, device,
         true = targets[g, t0:t0 + n_steps] * scale + shift
         v    = valid[t0:t0 + n_steps]
 
-        fig, axes = plt.subplots(4, 2, figsize=(15, 10), sharex=True)
-        for l in range(N_LEGS):
-            for k, col in enumerate(LEG_COLS[l]):
+        fig, axes = plt.subplots(n_legs, cols_per, figsize=(5 * cols_per, 2.5 * n_legs),
+                                 sharex=True, squeeze=False)
+        for l in range(n_legs):
+            for k, col in enumerate(leg_cols[l]):
                 ax = axes[l][k]
                 r = float(np.sqrt(np.mean((pred[v, col] - true[v, col]) ** 2)))
                 rmse[g, col] = r
@@ -1761,22 +1785,27 @@ def plot_reconstruction(model, spikes, targets, valid, device,
                         label="pred")
                 ax.set_title(f"leg{l}  col{col}   RMSE={r:.2f}°", fontsize=9)
                 ax.grid(alpha=0.25); ax.legend(fontsize=7)
-        axes[-1][0].set_xlabel("timestep"); axes[-1][1].set_xlabel("timestep")
-        plt.suptitle(f"{GAIT_NAMES[g]} — free-run reconstruction "
+        for l in range(n_legs):
+            axes[l][0].set_ylabel(f"leg{l}", fontsize=8)
+        for k in range(cols_per):
+            axes[-1][k].set_xlabel("timestep")
+        plt.suptitle(f"{gait_names[g]} — free-run reconstruction "
                      f"({warm}-step warm-up discarded)", fontweight="bold")
         plt.tight_layout()
-        p = out_dir / f"recon_{GAIT_NAMES[g]}.png"
+        p = out_dir / f"recon_{gait_names[g]}.png"
         plt.savefig(p, dpi=140); plt.close()
         print(f"    [saved] {p}  mean RMSE = {rmse[g].mean():.2f}°")
 
-    fig, ax = plt.subplots(figsize=(10, 3.4))
+    fig, ax = plt.subplots(figsize=(max(6, n_joints * 0.7), n_legs * 0.9 + 2.0))
     im = ax.imshow(rmse, aspect="auto", cmap="YlOrRd", vmin=0)
     plt.colorbar(im, ax=ax, label="RMSE (deg)")
-    ax.set_xticks(range(N_JOINTS))
-    ax.set_xticklabels([f"c{j}\nleg{j%4}" for j in range(N_JOINTS)], fontsize=8)
-    ax.set_yticks(range(len(GAIT_NAMES))); ax.set_yticklabels(GAIT_NAMES)
-    for g in range(len(GAIT_NAMES)):
-        for j in range(N_JOINTS):
+    col_to_leg = {c: l for l, grp in enumerate(leg_cols) for c in grp}
+    ax.set_xticks(range(n_joints))
+    ax.set_xticklabels([f"c{j}\nleg{col_to_leg.get(j, '?')}"
+                        for j in range(n_joints)], fontsize=8)
+    ax.set_yticks(range(len(gait_names))); ax.set_yticklabels(gait_names)
+    for g in range(len(gait_names)):
+        for j in range(n_joints):
             ax.text(j, g, f"{rmse[g, j]:.1f}", ha="center", va="center",
                     fontsize=8,
                     color="white" if rmse[g, j] > rmse.max() * 0.6 else "black")
@@ -1790,8 +1819,10 @@ def plot_reconstruction(model, spikes, targets, valid, device,
 
 @torch.no_grad()
 def plot_transition(model, spikes, targets, device, out_dir, tgt_range,
-                    t0, g_from=0, g_to=1, warm=600, n_steps=1400,
-                    switch_at=600):
+                    t0, gait_names, leg_cols, g_from=0, g_to=1, warm=600,
+                    n_steps=1400, switch_at=600):
+    """See plot_reconstruction's docstring for why gait_names/leg_cols are
+    required parameters rather than module globals."""
     lo, hi = tgt_range
     scale, shift = (hi - lo) / 2.0, (hi + lo) / 2.0
     model.eval()
@@ -1807,16 +1838,19 @@ def plot_transition(model, spikes, targets, device, out_dir, tgt_range,
         targets[g_from, t0:t0 + n_steps],
         targets[g_to,   t0:t0 + n_steps]) * scale + shift
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 9), sharex=True)
-    for l in range(N_LEGS):
-        col = LEG_COLS[l][0]
+    n_legs = len(leg_cols)
+    fig, axes = plt.subplots(n_legs, 1, figsize=(14, 2.2 * n_legs), sharex=True,
+                             squeeze=False)
+    axes = axes[:, 0]
+    for l in range(n_legs):
+        col = leg_cols[l][0]
         axes[l].plot(true[:, col], color="#457b9d", lw=1.8, label="GT")
         axes[l].plot(pred[:, col], color="#e63946", lw=1.4, ls="--", label="pred")
         axes[l].axvline(switch_at, color="k", lw=1.5, ls="-.")
         axes[l].set_ylabel(f"leg{l} c{col} (deg)"); axes[l].grid(alpha=0.25)
         axes[l].legend(fontsize=7)
     axes[-1].set_xlabel("timestep")
-    plt.suptitle(f"Gait switch {GAIT_NAMES[g_from]} -> {GAIT_NAMES[g_to]} "
+    plt.suptitle(f"Gait switch {gait_names[g_from]} -> {gait_names[g_to]} "
                  f"at t={switch_at}", fontweight="bold")
     plt.tight_layout()
     p = out_dir / "transition.png"
@@ -1919,6 +1953,31 @@ def main():
                          "value if analyse_cpg warns about uneven burst "
                          "phase offsets.")
 
+    # gait tables
+    ap.add_argument("--gaits_dir", type=str, default="../gaits",
+                    help="Folder of {name}.csv gait tables, resolved as "
+                         "this_file_dir/<gaits_dir> (same join convention as "
+                         "--out_dir). Default assumes the folder is a "
+                         "sibling of this script's own directory, not a "
+                         "child of it — differs from train_snn.py's "
+                         "'{this_file_dir}/gaits'.")
+    ap.add_argument("--gait_files", type=str, nargs="*", default=None,
+                    help="CSV file stems (no extension) to load as gaits, "
+                         "overriding the --n_cpg_neurons default. Use this "
+                         "to run a subset, a different naming, or a species "
+                         "GAIT_FILES_BY_N has no entry for.")
+    ap.add_argument("--leg_cols", type=str, default=None,
+                    help="JSON list of equal-size column-index groups, one "
+                         "group per leg. Overrides the built-in default for "
+                         "--n_cpg_neurons (4->quadruped LEG_COLS, "
+                         "6->HEXAPOD_LEG_COLS). Use this for a robot neither "
+                         "of those matches.")
+    ap.add_argument("--servo_base", type=int, default=8,
+                    help="Recorded in the config for inference.py's benefit "
+                         "only (see architecture_change_todo.md item 4); "
+                         "8 is the verified quadruped value and is almost "
+                         "certainly wrong for any other robot.")
+
     # architecture
     ap.add_argument("--arch", type=str, default="dense",
                     choices=["dense", "timing_grouped"],
@@ -1929,11 +1988,16 @@ def main():
                          "at matched gradient steps stays possible.")
     ap.add_argument("--n_timing", type=int, default=None,
                     help="[timing_grouped] Number of timing-layer LIF "
-                         f"neurons, and therefore the number of sub-networks. "
-                         f"Must be n_legs ({N_LEGS}, the default) or n_joints "
-                         f"({N_JOINTS}). Independent of --n_cpg_neurons: the "
-                         f"timing layer is densely driven by all CPG spikes, "
-                         f"so the two counts need not match.")
+                         "neurons, and therefore the number of sub-networks. "
+                         "Must equal n_legs or n_joints OF THE RESOLVED GAIT "
+                         "SET (printed at startup as 'gait layout'), not a "
+                         f"fixed number — e.g. n_legs={N_LEGS}/n_joints="
+                         f"{N_JOINTS} for the verified quadruped layout, but "
+                         "whatever --leg_cols implies otherwise. Defaults to "
+                         "n_legs when the layout is known, else n_joints (see "
+                         "--leg_cols). Independent of --n_cpg_neurons: the "
+                         "timing layer is densely driven by all CPG spikes, "
+                         "so the two counts need not match.")
     ap.add_argument("--tau_timing_min", type=float, default=2.0)
     ap.add_argument("--tau_timing_max", type=float, default=64.0,
                     help="[timing_grouped] Tau ceiling for the TIMING layer "
@@ -2042,13 +2106,6 @@ def main():
     ap.add_argument("--out_dir",   type=str, default="outputs")
     args = ap.parse_args()
 
-    # Resolve n_timing before anything reads it, and reject bad values now
-    # rather than after the CPG run.
-    if args.n_timing is None:
-        args.n_timing = N_LEGS
-    group_cols = (build_group_cols(args.n_timing) if args.arch == "timing_grouped"
-                  else None)
-
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     rng = np.random.default_rng(args.seed)
@@ -2058,8 +2115,59 @@ def main():
     print(f"Device : {device}\nOutput : {out_dir.resolve()}")
     print(f"Arch   : {args.arch}\n")
 
+    # ── 0. Gait tables + leg layout ───────────────────────────────
+    # Resolved before the CPG run and before --n_timing's default, since
+    # both depend on n_joints / n_legs, which depend on what got loaded.
+    print("[0/6] Gait tables ...")
+    gaits_dir = Path(this_file_dir + "/" + args.gaits_dir)
+    if args.gait_files is not None:
+        gait_files = list(args.gait_files)
+        print(f"      --gait_files override: {gait_files}")
+    else:
+        gait_files = GAIT_FILES_BY_N.get(args.n_cpg_neurons)
+        if gait_files is None:
+            raise ValueError(
+                f"No default gait file list for n_cpg_neurons="
+                f"{args.n_cpg_neurons} (have entries for "
+                f"{sorted(GAIT_FILES_BY_N)}). Pass --gait_files explicitly.")
+        species = {4: "quadruped", 6: "hexapod"}.get(args.n_cpg_neurons, "?")
+        print(f"      n_cpg_neurons={args.n_cpg_neurons} -> {species} "
+              f"gait set: {gait_files}")
+    gait_tables_orig, gait_names = load_gait_tables(gait_files, gaits_dir)
+    n_joints = gait_tables_orig[0].shape[1]
+    for nm, g in zip(gait_names, gait_tables_orig):
+        print(f"      {nm:>18s} : {g.shape[0]} rows x {g.shape[1]} "
+              f"joints (original)")
+    if len(gait_tables_orig) == args.max_gaits:
+        print(f"      NOTE: n_gaits ({len(gait_tables_orig)}) == max_gaits "
+              f"({args.max_gaits}) — zero headroom to add a gait later "
+              f"without invalidating this checkpoint (todo item 1).")
+
+    if args.leg_cols is not None:
+        leg_cols = [list(c) for c in json.loads(args.leg_cols)]
+        flat = sorted(c for grp in leg_cols for c in grp)
+        if flat != list(range(n_joints)):
+            raise ValueError(
+                f"--leg_cols {leg_cols} is not a partition of "
+                f"0..{n_joints - 1} (flattened, sorted: {flat}).")
+        if len({len(g) for g in leg_cols}) != 1:
+            raise ValueError(f"--leg_cols groups must be equal size, got "
+                             f"{leg_cols}.")
+        n_legs, layout_src = len(leg_cols), "user"
+    else:
+        n_legs, leg_cols = default_leg_layout(args.n_cpg_neurons, n_joints)
+        layout_src = "default"
+    servo_base = args.servo_base
+    print(f"      gait layout: n_legs={n_legs}  n_joints={n_joints}  "
+          f"source={layout_src}  leg_cols={leg_cols}")
+
+    if args.n_timing is None:
+        args.n_timing = n_legs
+    group_cols = (build_group_cols(args.n_timing, leg_cols=leg_cols, n_joints=n_joints)
+                  if args.arch == "timing_grouped" else None)
+
     # ── 1. CPG ──────────────────────────────────────────────────
-    print("[1/6] Bursting-LIF CPG ...")
+    print("\n[1/6] Bursting-LIF CPG ...")
     spikes = run_cpg(N=args.n_cpg_neurons, tmax=args.tmax, warmup=args.warmup,
                      i_app=args.i_app, from_fb_weight=args.from_fb_weight)
 
@@ -2069,15 +2177,18 @@ def main():
 
     phase = cycle_phase(len(spikes), onsets[0])
 
-    # ── 3. Gait tables + leg routing ────────────────────────────
-    print("\n[3/6] Gait tables, upsampling, leg routing ...")
-    for nm, g in zip(GAIT_NAMES, GAIT_TABLES_ORIG):
-        print(f"      {nm:>4s} : {g.shape[0]} rows x {g.shape[1]} joints (original)")
-    gait_tables, target_rows = upsample_gait_tables(GAIT_TABLES_ORIG, GAIT_NAMES)
+    # ── 3. Upsample + leg->servo summary ────────────────────────
+    print("\n[3/6] Upsampling gait tables ...")
+    gait_tables, target_rows = upsample_gait_tables(gait_tables_orig, gait_names)
 
-    print(f"\n      leg->servo: " +
-          ", ".join(f"leg{l}=servo({LEG_COLS[l][0]+SERVO_BASE},"
-                    f"{LEG_COLS[l][1]+SERVO_BASE})" for l in range(N_LEGS)))
+    if leg_cols and len(leg_cols[0]) == 2:
+        print(f"\n      leg->servo: " +
+              ", ".join(f"leg{l}=servo({leg_cols[l][0]+servo_base},"
+                        f"{leg_cols[l][1]+servo_base})" for l in range(n_legs)))
+    else:
+        print(f"\n      leg->servo: leg_cols has {len(leg_cols[0])} column(s) "
+              f"per group (not the 2-per-leg case), servo_base={servo_base}; "
+              f"see leg_cols above for the exact mapping.")
 
     targets, valid, tgt_range = build_targets(phase, gait_tables,
                                               phase_zero=args.phase_zero)
@@ -2112,7 +2223,7 @@ def main():
             hidden_per_group=args.hidden, n_gaits=len(gait_tables),
             max_gaits=args.max_gaits, n_neurons=args.n_cpg_neurons,
             n_timing=args.n_timing, group_cols=group_cols,
-            n_joints=N_JOINTS,
+            n_joints=n_joints,
             tau_min=args.tau_min, tau_max=args.tau_max,
             tau_timing_min=args.tau_timing_min,
             tau_timing_max=args.tau_timing_max,
@@ -2123,7 +2234,7 @@ def main():
                             max_gaits=args.max_gaits,
                             n_neurons=args.n_cpg_neurons,
                             tau_min=args.tau_min, tau_max=args.tau_max,
-                            slope=args.slope, n_joints=N_JOINTS).to(device)
+                            slope=args.slope, n_joints=n_joints).to(device)
 
     # ── Compile the single timestep, NOT forward() ────────────────
     # forward() loops over L (= --bptt, 256-512) timesteps in Python.
@@ -2186,7 +2297,7 @@ def main():
               f"{period:.0f}. The leaky membranes are the ONLY long-timescale "
               f"memory in this model — raise tau_max to >= one period or the "
               f"network cannot hold phase.")
-    gait_w = make_gait_weights(GAIT_TABLES_ORIG, device)
+    gait_w = make_gait_weights(gait_tables_orig, gait_names, device)
 
     # ── Timing-layer diagnostic hook ────────────────────────────
     # Closure so run_training does not need the spike train / phase array.
@@ -2195,7 +2306,7 @@ def main():
         t_diag = max(t_split, t_lo) + 200
         timing_diag = lambda: timing_report(
             model, spikes, phase, period, len(gait_tables), device,
-            t0=t_diag, n_steps=int(6 * period), gait_names=GAIT_NAMES,
+            t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
             indent="      ")
     else:
         timing_diag = None
@@ -2249,9 +2360,12 @@ def main():
     print("\n[6/6] Evaluation & export ...")
     t_eval = max(t_split + 800, t_lo + 800)
     rmse = plot_reconstruction(model, spikes, targets, valid, device,
-                               out_dir, tgt_range, t0=t_eval)
+                               out_dir, tgt_range, t0=t_eval,
+                               gait_names=gait_names, leg_cols=leg_cols,
+                               n_joints=n_joints)
     plot_transition(model, spikes, targets, device, out_dir, tgt_range,
-                    t0=t_eval, g_from=0, g_to=1)
+                    t0=t_eval, gait_names=gait_names, leg_cols=leg_cols,
+                    g_from=0, g_to=1)
 
     epochs_done = len(hist["train"])
     grad_steps  = epochs_done * args.chunks_per_epoch
@@ -2274,16 +2388,23 @@ def main():
         "hidden_is_per_group": args.arch == "timing_grouped",
         "max_gaits":        int(args.max_gaits),
         "n_gaits":          len(gait_tables),
-        "n_legs":           N_LEGS,
-        "n_joints":         N_JOINTS,
+        "n_legs":           int(n_legs),
+        "n_joints":         int(n_joints),
         "n_cpg_neurons":    int(args.n_cpg_neurons),
         "n_timing":         (int(args.n_timing)
                              if args.arch == "timing_grouped" else None),
         "group_cols":       ([list(g) for g in group_cols]
                              if group_cols is not None else None),
-        "gait_names":       GAIT_NAMES,
-        "leg_cols":         [list(c) for c in LEG_COLS],
-        "servo_base":       SERVO_BASE,
+        "gait_names":       gait_names,
+        # Same list as gait_names for CSV-loaded gaits (file stem == display
+        # name, matching train_snn.py's convention) — kept as a separate key
+        # anyway, so a future remap of display names doesn't have to also
+        # change what visualize.py loads from disk.
+        "gait_files":       gait_files,
+        "gaits_dir":        str(gaits_dir.resolve()),
+        "leg_cols":         [list(c) for c in leg_cols],
+        "leg_layout_source": layout_src,
+        "servo_base":       int(servo_base),
         "global_min":       float(tgt_range[0]),
         "global_max":       float(tgt_range[1]),
         "target_rows":      int(target_rows),
@@ -2393,7 +2514,7 @@ def main():
             "train_steps":          int(t_split - t_lo),
             "val_steps":            int(t_hi - t_split),
             "gait_table_rows_orig": [int(g.shape[0])
-                                     for g in GAIT_TABLES_ORIG],
+                                     for g in gait_tables_orig],
             "target_rows":          int(target_rows),
             "target_range_deg":     [float(tgt_range[0]), float(tgt_range[1])],
         },

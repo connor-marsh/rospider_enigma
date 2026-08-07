@@ -72,7 +72,8 @@ from train import (
     LIFCPGStepper, cpg_weight_matrix,
     detect_burst_threshold, burst_onsets,
     upsample_gait_tables, build_group_cols,
-    GAIT_TABLES_ORIG, GAIT_NAMES, N_LEGS, N_JOINTS, CPG_PALETTE,
+    load_gait_tables, GAIT_FILES_BY_N,
+    N_LEGS, N_JOINTS, CPG_PALETTE,
 )
 
 TIMING_PALETTE = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261",
@@ -120,8 +121,13 @@ def build_model_from_cfg(cfg, device):
     )
 
     if arch == "timing_grouped":
-        n_timing   = int(cfg_get(cfg, "n_timing", N_LEGS))
-        group_cols = cfg_get(cfg, "group_cols") or build_group_cols(n_timing)
+        n_timing = int(cfg_get(cfg, "n_timing", N_LEGS))
+        cfg_leg_cols = cfg_get(cfg, "leg_cols")
+        gc_kwargs = {"n_joints": common["n_joints"]}
+        if cfg_leg_cols is not None:
+            gc_kwargs["leg_cols"] = cfg_leg_cols
+        group_cols = cfg_get(cfg, "group_cols") or build_group_cols(
+            n_timing, **gc_kwargs)
         model = TimingGroupedSNN(
             hidden_per_group = int(cfg_get(cfg, "hidden", 256)),
             n_timing         = n_timing,
@@ -715,6 +721,10 @@ def main():
     ap.add_argument("--ckpt",      type=str, default="best_model.pt")
     ap.add_argument("--cfg",       type=str, default="cpg_lif_snn_config.json")
     ap.add_argument("--out_dir",   type=str, default="outputs/visualize")
+    ap.add_argument("--gaits_dir", type=str, default="../gaits",
+                    help="Folder of {name}.csv gait tables, resolved as "
+                         "this_file_dir/<gaits_dir> — same default as "
+                         "train.py's --gaits_dir.")
     ap.add_argument("--gaits",     type=str, nargs="*", default=None,
                     help="Gait names to plot (default: all in the config).")
     ap.add_argument("--n_cycles",   type=float, default=6.0,
@@ -748,13 +758,30 @@ def main():
     print("[1/5] Loading checkpoint + config ...")
     cfg, model, arch = load_run(model_dir, args.ckpt, args.cfg, device)
 
-    all_names  = cfg_get(cfg, "gait_names", GAIT_NAMES)
+    gait_files = cfg_get(cfg, "gait_files")
+    if gait_files is None:
+        # Older config, predates recording "gait_files" — assume it used
+        # the standard set for its species, exactly as train.py's own
+        # fallback does when --gait_files isn't given.
+        n_cpg = int(cfg_get(cfg, "n_cpg_neurons", 4))
+        gait_files = GAIT_FILES_BY_N.get(n_cpg)
+        if gait_files is None:
+            raise ValueError(
+                f"Config has no 'gait_files' and n_cpg_neurons={n_cpg} has "
+                f"no standard gait set (know {sorted(GAIT_FILES_BY_N)}).")
+        print(f"  NOTE: config has no 'gait_files' key — assuming the "
+              f"standard n_cpg_neurons={n_cpg} set: {gait_files}")
+    gaits_dir = Path(this_file_dir + "/" + args.gaits_dir)
+    gait_tables_orig, all_names = load_gait_tables(gait_files, gaits_dir)
+    print(f"  Loaded {len(all_names)} gait CSV(s) from {gaits_dir.resolve()}: "
+          f"{all_names}")
+
     tgt_range  = (float(cfg_get(cfg, "global_min", -124.0)),
                   float(cfg_get(cfg, "global_max", 124.0)))
     phase_zero = float(cfg_get(cfg, "phase_zero", 0.0))
     target_rows = int(cfg_get(cfg, "target_rows",
-                              max(t.shape[0] for t in GAIT_TABLES_ORIG)))
-    gait_tables, _ = upsample_gait_tables(GAIT_TABLES_ORIG, all_names,
+                              max(t.shape[0] for t in gait_tables_orig)))
+    gait_tables, _ = upsample_gait_tables(gait_tables_orig, all_names,
                                           target_rows, verbose=False)
 
     if args.gaits:
@@ -867,8 +894,7 @@ def main():
     if arch == "timing_grouped" and summary:
         plot_alignment_summary(summary, plotted, model.n_timing,
                                out_dir, args.dpi)
-        routing = plot_routing(model, all_names[:cfg_get(cfg, "n_gaits", 4)],
-                               out_dir, args.dpi)
+        routing = plot_routing(model, all_names, out_dir, args.dpi)
     plot_taus(model, period, cfg, out_dir, args.dpi)
 
     # ── 5. dump ─────────────────────────────────────────────────
