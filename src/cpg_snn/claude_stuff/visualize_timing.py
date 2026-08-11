@@ -391,30 +391,47 @@ def _savefig(fig, out_dir, name, dpi):
 def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
                    group_cols, gait_name, out_dir, dpi, t_lo, t_hi):
     """
-    The main figure: CPG raster, timing raster, and one row per group showing
-    that group's gait-table columns with its OWN timing neuron's spikes drawn
-    over them.  Shared x axis, so vertical alignment is the whole point --
-    if timing neuron g fires at a consistent place in leg g's cycle, it is
-    visible directly.
+    The main figure.  Two full-width rasters on top (CPG, then timing layer),
+    then a grid of G rows x C columns: one row per leg, one COLUMN PER JOINT
+    within that leg.
+
+    C is read from group_cols, so it follows the robot -- 3 joints per leg for
+    the hexapod (coxa/femur/tibia), 2 for the quadruped -- with no flag to set.
+
+    Splitting per joint rather than overlaying them matters because the joints
+    within a leg have different amplitudes and shapes; overlaid on one axis the
+    small-amplitude ones were unreadable and a shared y-scale flattened them.
+    Every joint subplot still carries its leg's timing spikes, since one timing
+    neuron drives the whole group, and every axis shares x with the rasters --
+    vertical alignment across the whole figure is the point of the plot.
     """
     n_cpg = spikes.shape[1]
     G     = tspk.shape[1]
+    C     = len(group_cols[0])
     sl    = slice(t_lo, t_hi)
     t     = np.arange(t_lo, t_hi)
 
-    fig = plt.figure(figsize=(17, 3.4 + 1.9 * G))
-    gs  = gridspec.GridSpec(2 + G, 1, hspace=0.55,
+    fig = plt.figure(figsize=(max(14.0, 5.8 * C), 3.2 + 1.75 * G))
+    # top/bottom pinned so the suptitle sits close to the first raster instead
+    # of leaving a band of dead space (bbox_inches="tight" crops the OUTER
+    # margin, not internal gaps).
+    gs  = gridspec.GridSpec(2 + G, C, hspace=0.62, wspace=0.20,
+                            top=0.935, bottom=0.045, left=0.055, right=0.99,
                             height_ratios=[1.1, 1.1] + [1.5] * G)
-    axes = [fig.add_subplot(gs[0])]
-    for i in range(1, 2 + G):
-        axes.append(fig.add_subplot(gs[i], sharex=axes[0]))
 
-    # Shared x axis via sharex= does not auto-hide tick labels on the upper
-    # subplots (that only happens with plt.subplots(sharex=True)), so every
-    # row was showing its own numeric time labels sitting right above the
-    # next row's title. Only the bottom row needs them.
-    for ax in axes[:-1]:
-        ax.tick_params(labelbottom=False)
+    # The two rasters span every column; the leg rows do not.
+    ax_cpg = fig.add_subplot(gs[0, :])
+    ax_tim = fig.add_subplot(gs[1, :], sharex=ax_cpg)
+    ax_leg = [[fig.add_subplot(gs[2 + j, k], sharex=ax_cpg)
+               for k in range(C)] for j in range(G)]
+    all_axes = [ax_cpg, ax_tim] + [a for row in ax_leg for a in row]
+
+    # sharex= does not auto-hide tick labels the way plt.subplots(sharex=True)
+    # does, so without this every row prints its own time labels directly above
+    # the next row's title.  Only the bottom leg row needs them.
+    for a in all_axes:
+        if a not in ax_leg[-1]:
+            a.tick_params(labelbottom=False)
 
     on_win = onsets[(onsets >= t_lo) & (onsets < t_hi)]
 
@@ -423,121 +440,83 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
             ax.axvline(b, color="k", lw=0.9, alpha=0.35, ls="--", zorder=0)
 
     # ── CPG raster ────────────────────────────────────────────────
-    ax = axes[0]
     for i in range(n_cpg):
         idx = np.where(spikes[sl, i] > 0)[0] + t_lo
-        ax.scatter(idx, np.full(len(idx), i), marker="|", s=110, lw=1.5,
-                   color=CPG_PALETTE[i % len(CPG_PALETTE)])
-    ax.set_yticks(range(n_cpg))
-    ax.set_yticklabels([f"CPG {i}" for i in range(n_cpg)], fontsize=8)
-    ax.set_ylim(-0.6, n_cpg - 0.4)
-    cycle_lines(ax)
-    ax.set_title(f"{gait_name} — CPG raster   "
-                 f"(dashed = neuron-0 burst onset, period ≈ {period:.0f} steps)",
-                 fontsize=10, fontweight="bold")
-    ax.grid(axis="x", alpha=0.15)
+        ax_cpg.scatter(idx, np.full(len(idx), i), marker="|", s=110, lw=1.5,
+                       color=CPG_PALETTE[i % len(CPG_PALETTE)])
+    ax_cpg.set_yticks(range(n_cpg))
+    ax_cpg.set_yticklabels([f"CPG {i}" for i in range(n_cpg)], fontsize=8)
+    ax_cpg.set_ylim(-0.6, n_cpg - 0.4)
+    cycle_lines(ax_cpg)
+    ax_cpg.set_title(f"CPG raster   (dashed = neuron-0 burst onset, "
+                     f"period ≈ {period:.0f} steps)", fontsize=9)
+    ax_cpg.grid(axis="x", alpha=0.15)
 
     # ── timing raster ─────────────────────────────────────────────
-    ax = axes[1]
     for j in range(G):
         idx = np.where(tspk[sl, j] > 0)[0] + t_lo
-        ax.scatter(idx, np.full(len(idx), j), marker="|", s=110, lw=1.5,
-                   color=TIMING_PALETTE[j % len(TIMING_PALETTE)])
-    ax.set_yticks(range(G))
-    ax.set_yticklabels([f"T{j}" for j in range(G)], fontsize=8)
-    ax.set_ylim(-0.6, G - 0.4)
-    cycle_lines(ax)
-    ax.set_title("Timing layer raster  (exact — same spikes the sub-networks saw)",
-                 fontsize=9)
-    ax.grid(axis="x", alpha=0.15)
+        ax_tim.scatter(idx, np.full(len(idx), j), marker="|", s=110, lw=1.5,
+                       color=TIMING_PALETTE[j % len(TIMING_PALETTE)])
+    ax_tim.set_yticks(range(G))
+    ax_tim.set_yticklabels([f"T{j}" for j in range(G)], fontsize=8)
+    ax_tim.set_ylim(-0.6, G - 0.4)
+    cycle_lines(ax_tim)
+    ax_tim.set_title("Timing layer raster  (exact — same spikes the "
+                     "sub-networks saw)", fontsize=9)
+    ax_tim.grid(axis="x", alpha=0.15)
 
-    # ── one row per group ─────────────────────────────────────────
+    # ── leg rows x joint columns ──────────────────────────────────
     for j in range(G):
-        ax   = axes[2 + j]
         col_ = TIMING_PALETTE[j % len(TIMING_PALETTE)]
-        cols = group_cols[j]
-
-        for k, c in enumerate(cols):
-            ls = "-" if k == 0 else "-."
-            ax.plot(t, gt[sl, c], color=GT_COLOR, lw=1.7, ls=ls,
-                    label=f"GT c{c}", zorder=3)
-            if pred is not None:
-                ax.plot(t, pred[sl, c], color=PRED_COLOR, lw=1.2, ls="--",
-                        alpha=0.85, label=f"pred c{c}", zorder=4)
-
-        # every timing spike as a faint tick, burst onsets as solid lines
-        idx = np.where(tspk[sl, j] > 0)[0] + t_lo
-        lo, hi = ax.get_ylim()
-        ax.vlines(idx, lo, hi, color=col_, alpha=0.16, lw=1.2, zorder=1)
-        for bst in spike_bursts(idx, burst_thr):
-            ax.axvline(bst[0], color=col_, lw=1.5, alpha=0.85, zorder=2)
-        ax.set_ylim(lo, hi)
-
-        cycle_lines(ax)
-        ax.set_ylabel(f"leg {j}\ncols {cols} (°)", fontsize=8)
-        ax.legend(fontsize=6, ncol=4, loc="upper right")
-        ax.grid(alpha=0.2)
-        ax.set_title(f"leg {j} trajectory vs timing neuron T{j}  "
-                     f"(solid vertical = T{j} burst onset)", fontsize=8)
-
-    axes[-1].set_xlabel("CPG timestep")
-    axes[0].set_xlim(t_lo, t_hi)
-    _savefig(fig, out_dir, f"timing_alignment_{gait_name}.png", dpi)
-
-
-def plot_phase_fold(tspk, phase, gait_tables, gait_idx, group_cols,
-                    gait_name, phase_zero, out_dir, dpi, n_bins=72):
-    """
-    Time folded onto cycle phase.  Removes the 'which cycle' axis so
-    alignment is a single picture per leg: the leg's trajectory over one
-    cycle, with its timing neuron's spike-phase histogram behind it.
-    """
-    G   = tspk.shape[1]
-    tbl = gait_tables[gait_idx]
-    R   = tbl.shape[0]
-    ok  = np.isfinite(phase)
-
-    fig, axes = plt.subplots(G, 1, figsize=(11, 2.5 * G), sharex=True,
-                             squeeze=False)
-    axes = axes[:, 0]
-    x_tbl = ((np.arange(R) / R) - phase_zero) % 1.0
-    order = np.argsort(x_tbl)
-
-    for j in range(G):
-        ax   = axes[j]
-        col_ = TIMING_PALETTE[j % len(TIMING_PALETTE)]
+        spk_idx = np.where(tspk[sl, j] > 0)[0] + t_lo
+        bursts  = spike_bursts(spk_idx, burst_thr)
 
         for k, c in enumerate(group_cols[j]):
-            ax.plot(x_tbl[order], tbl[order, c], color=GT_COLOR, lw=1.9,
-                    ls="-" if k == 0 else "-.", label=f"GT c{c}", zorder=3)
-        ax.set_ylabel(f"leg {j} (°)", fontsize=9)
-        ax.grid(alpha=0.2)
+            ax = ax_leg[j][k]
+            ax.plot(t, gt[sl, c], color=GT_COLOR, lw=1.7, label="GT", zorder=3)
+            title = f"leg {j} · col {c}"
+            if pred is not None:
+                ax.plot(t, pred[sl, c], color=PRED_COLOR, lw=1.2, ls="--",
+                        alpha=0.9, label="pred", zorder=4)
+                r = float(np.sqrt(np.nanmean(
+                    (pred[sl, c] - gt[sl, c]) ** 2)))
+                title += f"   RMSE={r:.2f}°"
 
-        m  = (tspk[:, j] > 0) & ok
-        ax2 = ax.twinx()
-        if m.sum() > 0:
-            ax2.hist(phase[m], bins=n_bins, range=(0.0, 1.0),
-                     color=col_, alpha=0.28, zorder=1)
-            mu, R_ = circular_stats(phase[m])
-            ax2.axvline(mu, color=col_, lw=2.0, ls="-", zorder=2)
-            f_ph = fundamental_phase(tbl[order, group_cols[j][0]])
-            res  = circ_diff(mu, f_ph)
-            ax.set_title(
-                f"T{j}: mean phase {mu:.3f}  R={R_:.2f}  |  "
-                f"leg {j} fundamental {f_ph:.3f}  |  "
-                f"residual {res:+.3f} cyc", fontsize=8)
-        else:
-            ax2.set_title(f"T{j}: NO SPIKES — sub-network {j} gets no input",
-                          fontsize=8, color="#e63946")
-        ax2.set_ylabel("T spikes", fontsize=7)
-        ax2.tick_params(labelsize=6)
-        ax.legend(fontsize=6, loc="upper left")
+            # Timing spikes for THIS leg, on every one of its joint panels:
+            # one timing neuron drives the whole group, so the same spike
+            # train is the relevant overlay for each of its joints.
+            #
+            # Drawn as a RUG along the bottom of the panel rather than as
+            # full-height lines.  Full-height was readable at ~10 spikes per
+            # cycle but the min_count objective drives the rate to 40-60, at
+            # which point full-height bars cover the trace they are meant to be
+            # compared against.  Burst ONSETS stay full-height, since those are
+            # the few landmarks worth reading against the waveform directly.
+            lo, hi = ax.get_ylim()
+            rug = lo + 0.10 * (hi - lo)
+            ax.vlines(spk_idx, lo, rug, color=col_, alpha=0.75, lw=1.0,
+                      zorder=5)
+            for bst in bursts:
+                ax.axvline(bst[0], color=col_, lw=1.3, alpha=0.45, zorder=1)
+            ax.set_ylim(lo, hi)
 
-    axes[-1].set_xlabel("cycle phase  (0 = neuron-0 burst onset)")
-    axes[-1].set_xlim(0.0, 1.0)
-    fig.suptitle(f"{gait_name} — phase-folded timing alignment",
+            cycle_lines(ax)
+            ax.set_title(title, fontsize=8)
+            ax.grid(alpha=0.2)
+            ax.tick_params(labelsize=7)
+            if k == 0:
+                ax.set_ylabel(f"leg {j}\n(°)", fontsize=8)
+            if j == 0 and k == C - 1:
+                ax.legend(fontsize=6, loc="upper right")
+
+    for k in range(C):
+        ax_leg[-1][k].set_xlabel("CPG timestep", fontsize=8)
+    ax_cpg.set_xlim(t_lo, t_hi)
+    fig.suptitle(f"{gait_name} — timing alignment  "
+                 f"(rug along each panel base = that leg's own timing spikes; "
+                 f"full-height line = burst onset)",
                  fontsize=11, fontweight="bold")
-    _savefig(fig, out_dir, f"phase_fold_{gait_name}.png", dpi)
+    _savefig(fig, out_dir, f"timing_alignment_{gait_name}.png", dpi)
 
 
 def plot_alignment_summary(summary, gait_names, G, out_dir, dpi):
