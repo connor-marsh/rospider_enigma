@@ -519,6 +519,61 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     _savefig(fig, out_dir, f"timing_alignment_{gait_name}.png", dpi)
 
 
+def plot_phase_fold(tspk, phase, gait_tables, gait_idx, group_cols,
+                    gait_name, phase_zero, out_dir, dpi, n_bins=72):
+    """
+    Time folded onto cycle phase.  Removes the 'which cycle' axis so
+    alignment is a single picture per leg: the leg's trajectory over one
+    cycle, with its timing neuron's spike-phase histogram behind it.
+    """
+    G   = tspk.shape[1]
+    tbl = gait_tables[gait_idx]
+    R   = tbl.shape[0]
+    ok  = np.isfinite(phase)
+
+    fig, axes = plt.subplots(G, 1, figsize=(11, 2.5 * G), sharex=True,
+                             squeeze=False)
+    axes = axes[:, 0]
+    x_tbl = ((np.arange(R) / R) - phase_zero) % 1.0
+    order = np.argsort(x_tbl)
+
+    for j in range(G):
+        ax   = axes[j]
+        col_ = TIMING_PALETTE[j % len(TIMING_PALETTE)]
+
+        for k, c in enumerate(group_cols[j]):
+            ax.plot(x_tbl[order], tbl[order, c], color=GT_COLOR, lw=1.9,
+                    ls="-" if k == 0 else "-.", label=f"GT c{c}", zorder=3)
+        ax.set_ylabel(f"leg {j} (°)", fontsize=9)
+        ax.grid(alpha=0.2)
+
+        m  = (tspk[:, j] > 0) & ok
+        ax2 = ax.twinx()
+        if m.sum() > 0:
+            ax2.hist(phase[m], bins=n_bins, range=(0.0, 1.0),
+                     color=col_, alpha=0.28, zorder=1)
+            mu, R_ = circular_stats(phase[m])
+            ax2.axvline(mu, color=col_, lw=2.0, ls="-", zorder=2)
+            f_ph = fundamental_phase(tbl[order, group_cols[j][0]])
+            res  = circ_diff(mu, f_ph)
+            ax.set_title(
+                f"T{j}: mean phase {mu:.3f}  R={R_:.2f}  |  "
+                f"leg {j} fundamental {f_ph:.3f}  |  "
+                f"residual {res:+.3f} cyc", fontsize=8)
+        else:
+            ax2.set_title(f"T{j}: NO SPIKES — sub-network {j} gets no input",
+                          fontsize=8, color="#e63946")
+        ax2.set_ylabel("T spikes", fontsize=7)
+        ax2.tick_params(labelsize=6)
+        ax.legend(fontsize=6, loc="upper left")
+
+    axes[-1].set_xlabel("cycle phase  (0 = neuron-0 burst onset)")
+    axes[-1].set_xlim(0.0, 1.0)
+    fig.suptitle(f"{gait_name} — phase-folded timing alignment",
+                 fontsize=11, fontweight="bold")
+    _savefig(fig, out_dir, f"phase_fold_{gait_name}.png", dpi)
+
+
 def plot_alignment_summary(summary, gait_names, G, out_dir, dpi):
     """
     Three heatmaps, gait x timing-neuron: absolute residual, firing rate, and
