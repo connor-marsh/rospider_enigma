@@ -1205,9 +1205,8 @@ class TimingGroupedSNN(nn.Module):
 
     Instead, the firing regime is set explicitly: `calibrate_gains` bisects
     a per-unit multiplier into FiLM's gamma before training so every unit
-    starts inside a target spikes-per-cycle band, and `spike_stats_penalty`
-    then holds it at the CPG's own rate and burst concentration.  See those
-    functions.
+    starts inside a target spikes-per-cycle band, and the chosen
+    SpikeObjective then shapes it from there.  See those.
 
     Inside the sub-networks LN is optional (`sub_ln`) and uses
     elementwise_affine=False: a shared gamma/beta over (G, Hg) would be a
@@ -1231,7 +1230,7 @@ class TimingGroupedSNN(nn.Module):
                  tau_timing_min=2.0, tau_timing_max=64.0,
                  tau_readout_max=40.0,
                  timing_w_scale=0.5, sub_ln="l2", sub_film="both",
-                 timing_reset="zero",
+                 timing_reset="zero", event_gated=True,
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
         if n_gaits > max_gaits:
@@ -1282,6 +1281,7 @@ class TimingGroupedSNN(nn.Module):
         self.sub_ln     = sub_ln
         self.sub_film   = sub_film
         self.timing_reset = timing_reset
+        self.event_gated  = bool(event_gated)
         self.group_cols = group_cols
         self.H          = Hg          # alias for generic callers
 
@@ -1407,15 +1407,47 @@ class TimingGroupedSNN(nn.Module):
 
         spk_t, mem_t = self._timing(x, gait, mem_t)          # (B, G)
 
-        # ---- sub-net layer 1: outer product, no cross-group path -----
-        cur1 = spk_t.unsqueeze(-1) * self.w1 + self.b1        # (B, G, Hg)
+        # ---- event gate -------------------------------------------
+        # With event_gated, sub-network g advances ONLY on steps where its
+        # timing neuron fired.  Membranes still decay every step (that is
+        # deliberate -- it is what makes the OUTPUT change between spikes and
+        # therefore what makes spike PLACEMENT matter to the task loss), but
+        # no current is injected and no sub-network spike is emitted.
+        #
+        # Why this is the point rather than an efficiency tweak: without it,
+        # the task loss is EXACTLY invariant to the timing layer's burst
+        # phase.  A sub-network whose taus span a cycle has a complete
+        # "time since burst" basis, so shifting the burst by any amount is
+        # absorbed by relearning the waveform offset.  Gating removes that
+        # freedom -- the output genuinely cannot track the target between
+        # spikes -- so alignment becomes something the loss can see.
+        #
+        # NOTE the gate multiplies both `cur` and `spk` on each layer, so
+        # gradient reaching spk_t through those paths is scaled up.  Forward
+        # is exact (gate is 0/1, so gate*gate == gate).  Left uncorrected: it
+        # is a scale factor rather than a bug, and a stronger gradient into
+        # the timing layer is desirable here, not a problem.
+        gate = spk_t.unsqueeze(-1) if self.event_gated else None
+
+        # ---- sub-net layer 1 ---------------------------------------
+        # w1 and b1 are now redundant (only their sum enters) because the
+        # gate has replaced the spk_t multiplication that used to separate
+        # them.  Both kept so checkpoint shapes are unchanged.
+        if self.event_gated:
+            cur1 = self.w1 + self.b1                          # (G, Hg)
+        else:
+            cur1 = spk_t.unsqueeze(-1) * self.w1 + self.b1    # (B, G, Hg)
         if self.sub_ln in ("l1", "both"):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
             v1 = self.film1(gait).view(-1, 2, G, Hg)
             cur1 = cur1 * v1[:, 0] + v1[:, 1]
+        if gate is not None:
+            cur1 = gate * cur1
         mem1  = torch.sigmoid(self.beta1_logit) * mem1 + cur1
         spk1  = spike_fn(mem1 - self.thresh, self.slope)
+        if gate is not None:
+            spk1 = gate * spk1
         mem1  = mem1 - self.thresh * spk1
 
         # ---- sub-net layer 2: block diagonal ------------------------
@@ -1425,12 +1457,22 @@ class TimingGroupedSNN(nn.Module):
         if self.sub_film in ("l2", "both"):
             v2 = self.film2(gait).view(-1, 2, G, Hg)
             cur2 = cur2 * v2[:, 0] + v2[:, 1]
+        if gate is not None:
+            cur2 = gate * cur2
         mem2  = torch.sigmoid(self.beta2_logit) * mem2 + cur2
         spk2  = spike_fn(mem2 - self.thresh, self.slope)
+        if gate is not None:
+            spk2 = gate * spk2
         mem2  = mem2 - self.thresh * spk2
 
         # ---- block-diagonal analog readout -------------------------
+        # memo is NOT gated on the decay side: it leaks every timestep, so
+        # between timing spikes the output relaxes toward b_out.  That decay
+        # is the mechanism that penalises spikes placed where the waveform
+        # does not need them.
         curo  = torch.einsum("bgh,ghk->bgk", spk2, self.w_read) + self.b_read
+        if gate is not None:
+            curo = gate * curo
         memo  = torch.sigmoid(self.betao_logit) * memo + curo
 
         y_grp = torch.einsum("bgh,ghc->bgc", memo, self.w_out) + self.b_out
@@ -1537,7 +1579,7 @@ class SingleStepONNXTiming(nn.Module):
 # acting at different times:
 #
 #   calibrate_gains      once, before training  -- never start dead
-#   spike_stats_penalty  every gradient step    -- fire like the CPG does
+#   SpikeObjective       every gradient step    -- shape the spike train
 #   reinit_dead_units    on detection           -- rescue what died anyway
 #
 # A dead timing unit is not merely a wasted unit: its sub-network's input
@@ -1688,76 +1730,190 @@ def cpg_spike_stats(spikes, phase, period):
     return float(np.mean(rates)), float(np.mean(Rs))
 
 
-def spike_stats_penalty(spk, gait, phase, mask, n_gaits,
-                        target_rate_per_step, target_R, lam):
+# ── Spike-statistics objectives (strategy pattern) ───────────────
+#
+# What the timing layer's spike train SHOULD look like is an open research
+# question, and the answer changes with the architecture, so the objective is
+# swappable rather than hardcoded.  Add a subclass, give it a `name`, and it
+# becomes available as `--spike_objective <name>` automatically.
+#
+# All objectives share one signature so run_training never branches:
+#
+#     penalty(spk, gait, phase, mask) -> scalar tensor
+#
+#     spk   : (L, B, U) surrogate spikes from step()'s aux
+#     gait  : (L, B) int64 gait label per stream per timestep
+#     phase : (L, B) cycle phase in [0,1), NaNs already zeroed
+#     mask  : (L, B) 1 where the sample counts (phase valid AND past the
+#             post-reset warm-up)
+#
+# Statistics are grouped per (gait, unit), never averaged over the batch:
+# streams in a chunk carry different gaits, so a batch average would hide a
+# unit misbehaving for exactly one gait.  Gaits absent from a chunk are masked
+# out rather than counted as silent.
+
+
+class SpikeObjective:
+    """Base class.  Subclasses implement `penalty`; `lam == 0` disables."""
+
+    name = "base"
+
+    def __init__(self, lam=0.0, period=254.0, n_gaits=4,
+                 target_rate=None, target_R=None):
+        self.lam        = float(lam)
+        self.period     = float(period)
+        self.n_gaits    = int(n_gaits)
+        self.target_rate = target_rate     # CPG spikes per cycle
+        self.target_R    = target_R        # CPG circular concentration
+
+    # -- shared helper ------------------------------------------------
+    def _grouped(self, spk, gait, mask):
+        """(rate, present, cnt) per (gait, unit).  rate is per-timestep."""
+        oh   = torch.nn.functional.one_hot(gait, self.n_gaits).to(spk.dtype)
+        oh   = oh * mask.unsqueeze(-1)                        # (L,B,G)
+        cnt  = torch.einsum("lbg,lbu->gu", oh, spk)
+        den  = oh.sum(dim=(0, 1))
+        rate = cnt / den.clamp(min=1.0).unsqueeze(1)
+        present = (den > 0).to(spk.dtype).unsqueeze(1)
+        return rate, present, cnt, oh
+
+    @property
+    def enabled(self):
+        return self.lam > 0.0
+
+    def penalty(self, spk, gait, phase, mask):
+        raise NotImplementedError
+
+    def describe(self):
+        return f"{self.name} (lam={self.lam:g})"
+
+
+class NoSpikeObjective(SpikeObjective):
+    """No constraint on the timing layer's spike statistics."""
+
+    name = "none"
+
+    @property
+    def enabled(self):
+        return False
+
+    def penalty(self, spk, gait, phase, mask):
+        return spk.sum() * 0.0
+
+    def describe(self):
+        return "none (timing spike statistics unconstrained)"
+
+
+class CPGMatchSpikeObjective(SpikeObjective):
     """
-    Push each unit to fire LIKE THE CPG: the right number of spikes per
-    cycle, clustered into one burst rather than spread around the cycle.
+    Fire LIKE THE CPG: match its spikes-per-cycle and its burst tightness.
 
-    spk                  : (L, B, U) surrogate spikes from step()'s aux
-    gait                 : (L, B) int64
-    phase                : (L, B) cycle phase in [0,1), NaNs already zeroed
-    mask                 : (L, B) 1 where the sample counts (phase valid AND
-                           past the post-reset warm-up)
-    target_rate_per_step : CPG spikes-per-cycle divided by the period
-    target_R             : the CPG's own circular concentration
+    Two terms, because rate alone is not enough -- 10 spikes per cycle is
+    satisfied equally well by one tight burst and by one lone spike every 35
+    steps, so rate constrains the COUNT but not the CLUSTERING:
 
-    TWO TERMS, because rate alone is not enough.  10 spikes per cycle is
-    satisfied equally well by one tight burst of 10 and by one lone spike
-    every 35 steps -- rate constrains the COUNT, not the CLUSTERING, and what
-    is actually wanted is "one burst per cycle".  So:
+      rate  ((rate - target)/target)^2, two-sided, relative so lam is
+            scale-free.
+      conc  relu(target_R - R)^2, one-sided, where R is the circular
+            concentration of the unit's spike phases,
+                R = |sum_t spk_t exp(i 2pi phase_t)| / sum_t spk_t
+            R near 1 means every spike lands at the same cycle phase, which
+            IS "one burst per cycle".  `phase` is constant and `spk` carries
+            the surrogate gradient, so this is differentiable as written.
+            One-sided because a burst tighter than the CPG's is not a problem.
 
-      rate term  ((rate - target)/target)^2, two-sided.  Replaces the old
-                 one-sided floor, which only punished silence and therefore
-                 permitted the over-firing it produced.  Relative rather than
-                 absolute so `lam` is scale-free.
+    KNOWN LIMITATION (todo item 10): R uses the fundamental only, so two
+    bursts at opposite phases cancel to R ~ 0 and are punished as hard as
+    spikes smeared uniformly.  Correct for gaits where each leg swings once
+    per cycle; wrong for a genuinely two-burst gait.
 
-      conc term  relu(target_R - R)^2, one-sided, where R is the circular
-                 concentration of the unit's spike phases:
-
-                     R = |sum_t spk_t * exp(i*2*pi*phase_t)| / sum_t spk_t
-
-                 R near 1 means every spike lands at the same cycle phase,
-                 which IS "one burst per cycle".  `phase` is a constant, `spk`
-                 carries the surrogate gradient, so this is differentiable as
-                 written.  One-sided because a burst TIGHTER than the CPG's is
-                 not a problem.
-
-    KNOWN LIMITATION, accepted deliberately: R is computed on the fundamental,
-    so two bursts at opposite phases cancel to R ~ 0 and would be punished
-    hard.  For gaits where each leg swings once per cycle -- all the ones in
-    use -- that is correct.  For a genuinely two-burst-per-cycle gait it is
-    wrong, and the fix would be to score the second Fourier component too.
-    Tracked in architecture_change_todo.md.
-
-    Grouped per (gait, unit), NOT averaged over the batch: streams in a chunk
-    carry different gaits, so a batch average would hide a unit misbehaving
-    for exactly one gait.  Gaits absent from the chunk are masked out.
+    NOT COMPATIBLE with event_gated sub-networks: this objective wants every
+    spike at one phase, whereas a gated sub-network needs spikes wherever its
+    output must change.  Kept because it is the objective that produced the
+    CPG-matched bursts, and because the comparison is worth being able to
+    re-run.
     """
-    L, B, U = spk.shape
-    oh  = torch.nn.functional.one_hot(gait, n_gaits).to(spk.dtype)
-    oh  = oh * mask.unsqueeze(-1)                    # (L,B,G), masked
-    cnt = torch.einsum("lbg,lbu->gu", oh, spk)       # spikes per (gait, unit)
-    den = oh.sum(dim=(0, 1))                         # unmasked steps per gait
-    rate = cnt / den.clamp(min=1.0).unsqueeze(1)
 
-    present = (den > 0).to(spk.dtype).unsqueeze(1)   # (G,1)
+    name = "cpg_match"
 
-    rate_err = ((rate - target_rate_per_step) / target_rate_per_step) ** 2
-    rate_err = rate_err * present
+    def penalty(self, spk, gait, phase, mask):
+        rate, present, cnt, oh = self._grouped(spk, gait, mask)
+        tgt = self.target_rate / self.period
 
-    ang = 2.0 * math.pi * phase
-    C = torch.einsum("lbg,lbu,lb->gu", oh, spk, torch.cos(ang))
-    S = torch.einsum("lbg,lbu,lb->gu", oh, spk, torch.sin(ang))
-    R = torch.sqrt(C ** 2 + S ** 2 + 1e-8) / cnt.clamp(min=1e-2)
-    # Only shape units that are already firing: for a silent unit R is
-    # meaningless and the rate term is what should be pushing it up.  Detached
-    # hard mask, so no gradient flows through the gate itself.
-    alive = (cnt > 1.0).to(spk.dtype).detach()
-    conc_err = torch.relu(target_R - R) ** 2 * present * alive
+        rate_err = ((rate - tgt) / tgt) ** 2 * present
 
-    denom = present.sum().clamp(min=1.0) * U
-    return lam * (rate_err.sum() + conc_err.sum()) / denom
+        ang = 2.0 * math.pi * phase
+        C = torch.einsum("lbg,lbu,lb->gu", oh, spk, torch.cos(ang))
+        S = torch.einsum("lbg,lbu,lb->gu", oh, spk, torch.sin(ang))
+        R = torch.sqrt(C ** 2 + S ** 2 + 1e-8) / cnt.clamp(min=1e-2)
+        # Only shape units that are already firing: R is meaningless for a
+        # silent unit and the rate term is what should push it up.  Detached
+        # hard mask, so no gradient flows through the gate itself.
+        alive = (cnt > 1.0).to(spk.dtype).detach()
+        conc_err = torch.relu(self.target_R - R) ** 2 * present * alive
+
+        denom = present.sum().clamp(min=1.0) * spk.shape[2]
+        return self.lam * (rate_err.sum() + conc_err.sum()) / denom
+
+    def describe(self):
+        return (f"cpg_match (lam={self.lam:g}, target "
+                f"{self.target_rate:.2f} spk/cyc, R={self.target_R:.3f})")
+
+
+class MinCountSpikeObjective(SpikeObjective):
+    """
+    Spend as few spikes as possible.  Pay a flat cost per spike and let the
+    TASK loss decide where they are worth spending.
+
+    Only meaningful with event_gated sub-networks, and then it is the whole
+    idea: a gated sub-network's output can only change on a timing spike, so
+    the task loss already forces spikes wherever the waveform must move.
+    Adding a uniform per-spike cost on top means the cheapest solution is to
+    place spikes densely where the target changes fast and sparsely where it
+    creeps -- i.e. an adaptive sampling clock, derived from the data rather
+    than supervised.  Nothing has to be told which phase is "swing".
+
+    LINEAR in the rate, not squared, on purpose: a flat marginal cost per
+    spike is the L1-sparsity form and drives genuine sparsity, whereas a
+    squared cost pushes hard at high rates and then gives up as the rate
+    falls, which is the opposite of what is wanted.
+
+    Reported as DUTY CYCLE (fraction of timesteps with a spike), so `lam`
+    reads directly as "loss cost of a unit spiking every single timestep".
+
+    NO FLOOR TERM, deliberately: the task loss is the floor.  With gating, a
+    silent timing unit starves its sub-network completely -- memo decays,
+    y collapses to b_out -- so silence is heavily punished by the task loss
+    itself.  The risk is the transient: early in training the task gradient
+    through a barely-firing unit is weak, so this penalty can prune a unit to
+    silence before the task loss has learned to need it, and a fully silent
+    unit passes ZERO gradient to w1/w2/w_read/w_out (only b_out still learns),
+    making it unrecoverable.  Mitigations: `--spike_lambda_warmup` ramps lam
+    from 0 so the network learns to use spikes before being charged for them,
+    and `--reinit_dead_after` revives anything that dies anyway.
+    """
+
+    name = "min_count"
+
+    def penalty(self, spk, gait, phase, mask):
+        rate, present, cnt, oh = self._grouped(spk, gait, mask)
+        denom = present.sum().clamp(min=1.0) * spk.shape[2]
+        return self.lam * (rate * present).sum() / denom
+
+    def describe(self):
+        return (f"min_count (lam={self.lam:g}, linear/L1 in duty cycle; "
+                f"the task loss supplies the floor)")
+
+
+SPIKE_OBJECTIVES = {cls.name: cls for cls in (
+    NoSpikeObjective, CPGMatchSpikeObjective, MinCountSpikeObjective)}
+
+
+def make_spike_objective(name, **ctx):
+    if name not in SPIKE_OBJECTIVES:
+        raise ValueError(f"Unknown --spike_objective {name!r}; "
+                         f"available: {sorted(SPIKE_OBJECTIVES)}")
+    return SPIKE_OBJECTIVES[name](**ctx)
 
 
 @torch.no_grad()
@@ -1961,19 +2117,17 @@ def apply_reset(state, reset_mask):
 
 def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                  gait_w, out_dir, timing_diag=None, n_gaits=4, period=254.0,
-                 target_rate=None, target_R=None):
+                 spike_obj=None):
     """
     `timing_diag` : optional zero-arg callable returning (lines, stats).
                     Called every args.timing_log_every epochs for the
                     timing-grouped arch; None for the dense arch.  Its last
                     return value is handed back so the config can record it.
     `n_gaits`,
-    `period`      : needed by the spike-statistics penalty, which groups
-                    firing rates per gait and works in spikes per CPG cycle.
-    `target_rate`,
-    `target_R`    : the CPG's own spikes-per-cycle and circular concentration,
-                    measured at startup by cpg_spike_stats. The penalty asks
-                    the timing layer to match them.
+    `period`      : reporting and diagnostics.
+    `spike_obj`   : a SpikeObjective (strategy). Its `penalty` is added to the
+                    task loss; NoSpikeObjective disables it. Swapping the
+                    objective needs no change here.
     """
     best = float("inf")
     best_path = out_dir / "best_model.pt"
@@ -1982,17 +2136,15 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
     last_timing_stats = []
 
     # Spike statistics are only meaningful for the arch with a timing layer.
-    use_stats = (args.spike_stats_lambda > 0.0
-                 and hasattr(model, "n_timing")
-                 and target_rate is not None)
-    tgt_rate_step = (target_rate / float(period)) if target_rate else 0.0
+    use_stats = (spike_obj is not None and spike_obj.enabled
+                 and hasattr(model, "n_timing"))
     if use_stats:
-        print(f"\n  Spike-statistics penalty active: "
-              f"lambda={args.spike_stats_lambda:g}, targets measured from the "
-              f"CPG — {target_rate:.2f} spk/cyc ({tgt_rate_step:.2e}/step), "
-              f"concentration R={target_R:.3f}.")
-        print(f"  Applied per (gait, unit) to the timing layer. "
-              f"Judge it on free-run RMSE, not on the rate.")
+        print(f"\n  Spike objective: {spike_obj.describe()}")
+        if args.spike_lambda_warmup > 0:
+            print(f"  lambda ramps linearly from 0 over the first "
+                  f"{args.spike_lambda_warmup} epoch(s), so the network learns "
+                  f"to USE spikes before it is charged for them.")
+        print(f"  Judge it on free-run RMSE, not on the spike count.")
 
     # Consecutive epochs each timing unit has been observed dead, for
     # reinit_dead_units.  Only advanced on epochs where the diagnostic runs.
@@ -2016,6 +2168,13 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             # ---- train -------------------------------------------------
             model.train()
             state = model.init_state(args.batch, device)
+            # Linear lambda warm-up.  See MinCountSpikeObjective's
+            # docstring: an L1 spike cost applied before the task loss has
+            # learned to need the spikes can prune a unit into unrecoverable
+            # silence, because a gated sub-network with no input passes zero
+            # gradient to everything except b_out.
+            lam_scale = (min(1.0, epoch / float(args.spike_lambda_warmup))
+                         if args.spike_lambda_warmup > 0 else 1.0)
             tot, gtot, nb, ftot = 0.0, 0.0, 0, 0.0
             for _ in range(args.chunks_per_epoch):
                 (x, g, y, m, sw, rst,
@@ -2039,18 +2198,11 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 loss = masked_loss(pred, y, m_eff, g, gait_w)
 
                 if aux is not None:
-                    # aux = (router spikes, timing spikes), each (L, B, U).
-                    # Both layers are scored: a misbehaving timing unit
-                    # corrupts one sub-network, but a router layer that goes
-                    # silent or saturates starves or floods all of them at
-                    # once.  Same warm mask -- a unit with freshly-zeroed
-                    # state legitimately fires less and should not be
-                    # penalised for it.
-                    pen = sum(
-                        spike_stats_penalty(a, g, ph, m_eff, n_gaits,
-                                            tgt_rate_step, target_R,
-                                            args.spike_stats_lambda)
-                        for a in aux)
+                    # aux = (timing spikes,) each (L, B, U).  Same warm mask as
+                    # the task loss: a unit whose state was just zeroed
+                    # legitimately fires less and should not be charged for it.
+                    pen = lam_scale * sum(
+                        spike_obj.penalty(a, g, ph, m_eff) for a in aux)
                     loss = loss + pen
                     ftot += float(pen.detach())
 
@@ -2560,20 +2712,44 @@ def main():
                          "no band to configure). Forward passes only, a second "
                          "of compute, and it retires --timing_w_scale as a "
                          "number you have to guess. 0 = skip.")
-    ap.add_argument("--spike_stats_lambda", type=float, default=0.01,
-                    help="[timing_grouped] Weight on the spike-statistics "
-                         "penalty, which pushes timing units to fire "
-                         "LIKE THE CPG DOES: right number of spikes per cycle, "
-                         "clustered into one burst. Both targets are measured "
-                         "from the CPG itself at startup, so there is nothing "
-                         "to configure. Errors are relative, so this reads as "
-                         "'how much loss is one maximally-wrong unit worth'. "
-                         "Replaces the old one-sided rate floor, which only "
-                         "punished silence and so permitted the over-firing "
-                         "it produced. 0 disables. NOTE free-run RMSE is the "
-                         "acceptance criterion here, not the firing rate: "
-                         "this is a design-fidelity fix and it should not be "
-                         "allowed to cost accuracy.")
+    ap.add_argument("--spike_objective", type=str, default="min_count",
+                    choices=sorted(SPIKE_OBJECTIVES),
+                    help="[timing_grouped] Which objective shapes the timing "
+                         "layer's spike train. "
+                         "'min_count' (default): pay a flat L1 cost per spike "
+                         "and let the TASK loss decide where spikes are worth "
+                         "spending — with --event_gated this yields an "
+                         "adaptive sampling clock (dense through swing, sparse "
+                         "through stance) with no supervision. "
+                         "'cpg_match': match the CPG's spikes-per-cycle and "
+                         "burst tightness; produces clean CPG-like bursts but "
+                         "conflicts with event gating, since it wants every "
+                         "spike at one phase. "
+                         "'none': unconstrained. "
+                         "New strategies: subclass SpikeObjective, set a "
+                         "`name`, and it appears here automatically.")
+    ap.add_argument("--spike_stats_lambda", type=float, default=0.005,
+                    help="[timing_grouped] Weight on the chosen spike "
+                         "objective. For 'min_count' the penalty IS the duty "
+                         "cycle, so this reads directly as the loss cost of a "
+                         "unit spiking on every single timestep. Sizing it: at "
+                         "~17%% duty (≈60 spk/cyc at period 352, roughly what "
+                         "a 1.5-degree hold error needs) the penalty is "
+                         "8.5e-4, comparable to a converged task loss of "
+                         "~1e-3 — i.e. deliberately balanced so the task loss "
+                         "wins wherever spikes genuinely matter. Raise it if "
+                         "the spike rate stays stubbornly high, LOWER it if "
+                         "units collapse toward silence. 0 disables.")
+    ap.add_argument("--spike_lambda_warmup", type=int, default=10,
+                    help="[timing_grouped] Epochs over which the spike "
+                         "penalty's lambda ramps linearly from 0. Insurance "
+                         "against a specific failure: with --event_gated, a "
+                         "silent timing unit starves its sub-network entirely "
+                         "(memo decays, y collapses to b_out) and passes ZERO "
+                         "gradient to w1/w2/w_read/w_out, so an L1 spike cost "
+                         "applied before the task loss needs the spikes can "
+                         "prune a unit into a state it cannot recover from. "
+                         "0 disables the ramp.")
     ap.add_argument("--reinit_dead_after", type=int, default=2,
                     help="[timing_grouped] Re-roll a timing unit after it has "
                          "been silent for EVERY gait across this many "
@@ -2584,6 +2760,23 @@ def main():
                          "since w1's gradient is proportional to the timing "
                          "spike and so was exactly zero the whole time it was "
                          "dead. 0 disables.")
+    ap.add_argument("--event_gated", type=int, default=1,
+                    help="[timing_grouped] 1 = a sub-network advances ONLY on "
+                         "timesteps where its own timing neuron fired; no "
+                         "current is injected (bias included) and no "
+                         "sub-network spike is emitted otherwise. Membranes "
+                         "still decay every step, so the OUTPUT relaxes toward "
+                         "b_out between spikes. "
+                         "This is the mechanism that makes spike PLACEMENT "
+                         "matter: without it the task loss is EXACTLY "
+                         "invariant to the timing layer's burst phase, since "
+                         "a sub-network whose taus span a cycle can absorb any "
+                         "shift by relearning the waveform offset — which is "
+                         "why alignment never emerged from end-to-end "
+                         "training. It is also the event-driven form the "
+                         "hardware target wants, so alignment and efficiency "
+                         "turn out to be the same requirement. 0 restores the "
+                         "always-on behaviour.")
     ap.add_argument("--sub_film", type=str, default="both",
                     choices=["none", "l1", "l2", "both"],
                     help="[timing_grouped] Which sub-network layers get "
@@ -2866,6 +3059,7 @@ def main():
             timing_w_scale=args.timing_w_scale,
             sub_ln=args.sub_ln, sub_film=args.sub_film,
             timing_reset=args.timing_reset,
+            event_gated=bool(args.event_gated),
             slope=args.slope, timing_slope=args.timing_slope).to(device)
     else:
         model = StatefulSNN(hidden=args.hidden, n_gaits=len(gait_tables),
@@ -2909,7 +3103,19 @@ def main():
               f"-> {args.n_timing} x [{args.hidden} -> {args.hidden} -> "
               f"readout({args.readout_hidden})], no cross talk (todo 3a)")
         print(f"      timing reset={args.timing_reset}  "
-              f"sub_film={args.sub_film}  sub_ln={args.sub_ln}")
+              f"sub_film={args.sub_film}  sub_ln={args.sub_ln}  "
+              f"event_gated={bool(args.event_gated)}")
+        if args.event_gated:
+            print(f"      event gating ON: each sub-network advances only on "
+                  f"its own timing spike; membranes still decay, so the "
+                  f"output relaxes toward b_out in between — which is what "
+                  f"makes spike placement visible to the task loss.")
+        if args.event_gated and args.spike_objective == "cpg_match":
+            print(f"      WARNING: --spike_objective cpg_match wants every "
+                  f"spike at ONE cycle phase, while event gating needs spikes "
+                  f"wherever the output must change. These two pull in "
+                  f"opposite directions; 'min_count' is the matching "
+                  f"objective for a gated network.")
         print(f"      group -> gait-table cols : " +
               "  ".join(f"g{i}={grp}" for i, grp in enumerate(group_cols)))
         for k, v in model.param_breakdown().items():
@@ -2967,12 +3173,34 @@ def main():
     calib = {}
     if args.arch == "timing_grouped" and args.calibrate_gains:
         print("\n      Calibrating timing-layer gains ...")
-        # Band derived from the CPG rather than configured, matching the
-        # spike-statistics penalty's targets: calibration puts units in the
-        # right ballpark, the penalty then tunes them to the CPG exactly.
+        # Band derived from the CPG, but scaled to suit the objective.
+        # cpg_match wants the CPG's own rate, so calibrate around it.
+        # An EVENT-GATED network with min_count needs far more spikes than the
+        # CPG emits -- a sub-network can only update when its timing neuron
+        # fires, and ~10 spikes per 352-step cycle cannot render a moving
+        # waveform (a zero-order-hold analysis on a gait-shaped waveform puts
+        # the requirement nearer 40-60/cycle for ~1.5 degrees of error).
+        # Starting at the CPG's rate would begin in a starved regime where the
+        # task gradient is weak, exactly when L1 pressure is arriving.  So
+        # start high and let the L1 term prune downward.
+        if args.event_gated and args.spike_objective == "min_count":
+            band_lo, band_hi = 2.0 * cpg_rate, 8.0 * cpg_rate
+            print(f"      (event-gated + min_count: calibrating to "
+                  f"{band_lo:.0f}-{band_hi:.0f} spk/cyc, well above the CPG's "
+                  f"{cpg_rate:.1f}, so the network starts able to render the "
+                  f"waveform and prunes from there)")
+        else:
+            band_lo, band_hi = 0.5 * cpg_rate, 2.0 * cpg_rate
         calib = calibrate_gains(
             model, spikes, len(gait_tables), device, period,
-            lo=0.5 * cpg_rate, hi=2.0 * cpg_rate)
+            lo=band_lo, hi=band_hi)
+
+    # ── Spike objective (strategy) ──────────────────────────────
+    spike_obj = make_spike_objective(
+        args.spike_objective,
+        lam=args.spike_stats_lambda, period=period,
+        n_gaits=len(gait_tables),
+        target_rate=cpg_rate, target_R=cpg_R)
 
     # Defined for both branches so the config can always report them.
     best          = float("nan")
@@ -2997,7 +3225,7 @@ def main():
             model, tr_sampler, va_sampler, opt, sched,
             device, args, gait_w, out_dir, timing_diag=timing_diag,
             n_gaits=len(gait_tables), period=period,
-            target_rate=cpg_rate, target_R=cpg_R)
+            spike_obj=spike_obj)
         final_lr = float(opt.param_groups[0]["lr"])
         model.load_state_dict(torch.load(out_dir / "best_model.pt",
                                          map_location=device))
@@ -3155,6 +3383,10 @@ def main():
             "tau_readout_max":  (float(args.tau_readout_max)
                                  if args.arch == "timing_grouped" else None),
             "timing_reset":     (args.timing_reset
+                                 if args.arch == "timing_grouped" else None),
+            "event_gated":      (bool(args.event_gated)
+                                 if args.arch == "timing_grouped" else None),
+            "spike_objective":  (spike_obj.describe()
                                  if args.arch == "timing_grouped" else None),
             "sub_film":         (args.sub_film
                                  if args.arch == "timing_grouped" else None),
