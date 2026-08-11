@@ -843,7 +843,7 @@ def main():
                          "train.py's --gaits_dir.")
     ap.add_argument("--gaits",     type=str, nargs="*", default=None,
                     help="Gait names to plot (default: all in the config).")
-    ap.add_argument("--n_cycles",   type=float, default=6.0,
+    ap.add_argument("--n_cycles",   type=float, default=3.0,
                     help="Gait cycles shown on the time-axis figures.")
     ap.add_argument("--warm_cycles", type=float, default=4.0,
                     help="Cycles of free-run discarded before recording, so "
