@@ -361,3 +361,142 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    spikes spread evenly over the cycle have IDENTICAL rates but penalties of
    3.2e-5 vs 9.7e-3, a ~300x separation. That separation is entirely the R
    term, which is what makes it worth keeping despite this limitation.
+
+**11.** [ ] **Find a gait-conditioning scheme that isn't a per-gait weight table** — *High*
+   > `w_in_gait` is back: an `Embedding(max_gaits, n_cpg_neurons * n_timing)`
+   giving each gait its own free CPG→timing routing matrix, nothing shared.
+   It is the version that demonstrably separates gaits, and it is not the
+   version we want long-term.
+   >
+   > **What's wrong with it.** `n_gaits` appears in a parameter shape.
+   Nothing transfers between gaits — an added gait starts from a random
+   routing, and unused `max_gaits` rows are random noise rather than inert
+   identities (item 1). Per-gait capacity grows linearly in the gait count.
+   And it cannot express "these two gaits share a footfall order but differ
+   in amplitude" even when that is true, because the two rows are
+   independent by construction.
+   >
+   > **What was tried and failed.** A shared pair of weight matrices with a
+   per-gait FiLM gate on a 16-unit LIF hidden layer, i.e.
+   `W_eff(g) = W2 diag(gamma_g) W1`. Expressiveness was verified in advance:
+   400 random gates over a shared router produced 248 distinct routings, 247
+   of them many-to-one, including 30 tripod-shaped 2-driver patterns. Despite
+   that, the trained result had **near-identical timing phases across gaits
+   and near-identical measured routing matrices**. Two probable mechanisms,
+   both pointing the same way:
+   > - *Competing capacity.* `film1`+`film2` carry ~3,072 params per gait
+   >   against the router gate's ~44, and sit 1–2 spiking layers from the loss
+   >   rather than 3–4. Each spiking layer attenuates gradient by the
+   >   surrogate derivative `1/(slope·|x|+1)²` (~1e-3 at slope 25), so the
+   >   sub-network gate's gradient is orders of magnitude larger. Gradient
+   >   descent put gait knowledge where it was cheapest, and the timing layer
+   >   collapsed to a gait-independent clock.
+   > - *Gradient averaging.* With `W1`/`W2` shared, gradients from gaits
+   >   wanting different routings land in the same weights and partially
+   >   cancel, resolving toward one compromise routing. A per-gait table
+   >   removes the averaging: gait *g*'s weights only ever see gait *g*'s
+   >   gradient.
+   >
+   > **Directions worth trying, cheapest first.**
+   > - **Remove the competition instead of strengthening the router.**
+   >   `--sub_film none` forces the sub-networks to infer gait solely from
+   >   their timing neuron's spike train. Now implemented but untested. Run it
+   >   with `--spike_stats_lambda 0`: the penalty pins rate and burst
+   >   concentration to the CPG's values for every gait, leaving phase as the
+   >   only axis able to carry gait, and if a leg's phase is legitimately the
+   >   same in two gaits while its waveform differs, the two constraints are
+   >   jointly unsatisfiable.
+   > - **Shared base + per-gait delta**, `w_in = w_shared + w_delta[gait]`
+   >   with `w_delta` zero-init and weight-decayed, so gaits start tied and
+   >   pay only for differences they need. Keeps per-gait gradients unaveraged
+   >   while making sharing the default rather than the constraint.
+   > - **Larger gate init noise.** Gaits currently start within 5% of each
+   >   other (`1.0 + 0.05*randn`). Combined with weak gradients they may never
+   >   separate. One-line change, worth trying before abandoning any gated
+   >   scheme.
+   > - **Auxiliary loss directly on timing-phase separation** — e.g. reward
+   >   pairwise distance between gaits' phase vectors. Makes separation an
+   >   objective rather than hoping it emerges. Risk: it is a made-up target,
+   >   and the right phases are exactly what we don't know.
+   > - **Hybrid discrete/continuous conditioning** (item 2) subsumes much of
+   >   this and is probably the right end state.
+   >
+   > **Diagnostic now in place:** `timing_report` prints a "phase separation
+   across gaits" number (max deviation on the unit circle). Below ~0.1 means
+   the gaits are not being distinguished. Rate and R being identical across
+   gaits is expected and is not evidence of collapse — the spike-statistics
+   penalty pins both.
+
+**12.** [x] **Timing-layer bursts didn't match the CPG's** — *Medium*
+   > Observed: timing units either hit R≈1.0 (burst tighter than the CPG's) or
+   sat at R≈0.8–0.9 with one small burst plus scattered spikes, and none
+   produced one CPG-sized burst per cycle. Suspected, correctly, that timing
+   units were firing on *consecutive* timesteps while the CPG fires every
+   *other* timestep.
+   >
+   > **Cause: subtractive reset.** The CPG (`LIFGeneralArray`) sets
+   `v[spike] = 0`; the timing layer subtracted the threshold instead, leaving
+   `mem - thresh` behind. When that residual is still above threshold the unit
+   fires again on the next step with no input at all. Since CPG spikes arrive
+   every 2nd step (`refrac_main=1`), the result was ISIs of 2,1,1,2,1,1,… —
+   consecutive spikes filling the gaps — and **15 spikes per burst instead of
+   10**, so one mechanism caused both the over-firing and the too-tight R.
+   >
+   > **Fix: `--timing_reset zero`, now the default.** Measured: reset-to-zero
+   gives clean spacing-2 ISIs, 10 spikes, and R = 0.99475 — which is *exactly*
+   the CPG's own R. No loss term needed for burst width.
+   >
+   > Also ruled out along the way: making the concentration term two-sided.
+   R is far too insensitive at high concentration to discriminate burst
+   spacing — spacing 1 gives R = 0.99869 vs spacing 2's 0.99475, a squared
+   difference of 1.55e-05, contributing ~1.6e-07 to the loss at λ=0.01.
+   Structural fix, not a loss fix.
+
+**13.** [ ] **Derive footfall phases by inverse kinematics, and consider using them to train the timing layer** — *High*
+   > The gait CSVs are joint angles, not foot positions, so the **fundamental
+   phase of a joint column is not the footfall phase**. Trying to read
+   footfall timing off the tables directly does not work: some columns rise
+   and fall continuously through the cycle with no distinguishable "start",
+   and even where a clear feature exists there is no guarantee it corresponds
+   to touchdown or liftoff. `visualize.py`'s `fundamental_phase` is fine as an
+   arbitrary-but-consistent reference for comparing a timing neuron against
+   its own leg across runs, and it is explicitly NOT a biomechanical event —
+   don't let it drift into being read as one.
+   >
+   > **What would actually work:** forward kinematics on the joint angles to
+   get each foot's trajectory in the body frame, then read stance/swing from
+   the foot's vertical position or its velocity relative to the body. That
+   needs link lengths and the joint-axis convention for the specific robot,
+   which is the only real cost here — the maths is small. Output would be a
+   per-gait, per-leg touchdown phase, i.e. the footfall pattern, computed
+   rather than asserted.
+   >
+   > **Two separate uses, worth keeping distinct:**
+   > - *Diagnostic.* Compare each timing neuron's measured spike phase against
+   >   its leg's real touchdown phase. That is the honest version of the
+   >   alignment residual, and the direct successor to the 0.116–0.133-cycle
+   >   measurement that killed the old fixed routing permutation.
+   > - *Supervision.* Pretrain or auxiliary-train the timing layer to fire at
+   >   the derived touchdown phases. This is the label-free version of the
+   >   separate-training idea (train CPG→timing first, then the sub-networks)
+   >   that came out of lab discussion — no hand-labelled timing data, since
+   >   the labels are computed from the gait tables that already exist. It
+   >   would very likely fix the gait-differentiation failure in item 11
+   >   outright, because it makes phase separation an explicit objective
+   >   rather than something hoped to emerge. Cost: it is no longer end-to-end,
+   >   which was the thing worth preserving, so prefer an auxiliary loss that
+   >   stays on alongside the task loss over a hard two-stage freeze.
+   >
+   > **Ceiling to be aware of before investing in this.** Achievable timing
+   phases are currently quantised to the CPG's burst phases: with
+   `timing_reset="zero"` and no input between bursts, a timing unit's membrane
+   peaks at the end of its burst and then only decays, so it cannot cross
+   threshold 30 steps later during silence — no value of `tau_timing_max`
+   enables that. Measured N=6 burst phases are {0.000, 0.148, 0.321, 0.497,
+   0.670, 0.821}, i.e. the k/6 grid, so any required footfall phase more than
+   about ±0.05 cycle off that grid is unreachable and IK-derived targets would
+   be asking for something the architecture cannot produce. Being addressed
+   separately by tuning the CPG toward more continuous activity with smaller
+   inter-burst gaps (coworker, later) — that work is a prerequisite for
+   IK-derived supervision being fully usable, though the diagnostic use is
+   valuable immediately.

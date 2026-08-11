@@ -56,6 +56,7 @@ Outputs (into --out_dir)
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 
@@ -110,6 +111,12 @@ def build_model_from_cfg(cfg, device):
     printed summary is honest about what the run used."""
     arch = cfg_get(cfg, "arch", "dense")
 
+    # Only reached for configs missing these keys (they are recorded now).
+    # Derived the same way train.py derives them, so an old config still gets
+    # self-consistent values rather than quadruped-specific constants.
+    _P = float(cfg_get(cfg, "cpg_period_steps", 254.0))
+    _n_cpg = int(cfg_get(cfg, "n_cpg_neurons", 4))
+
     common = dict(
         n_gaits   = int(cfg_get(cfg, "n_gaits", 4)),
         max_gaits = int(cfg_get(cfg, "max_gaits", 16)),
@@ -128,21 +135,22 @@ def build_model_from_cfg(cfg, device):
             gc_kwargs["leg_cols"] = cfg_leg_cols
         group_cols = cfg_get(cfg, "group_cols") or build_group_cols(
             n_timing, **gc_kwargs)
-        # router_hidden default 16 matches train.py; a config from before the
-        # router existed has no such key and cannot be loaded into this class
-        # at all (its checkpoint has w_in_gait, which no longer exists), so
-        # load_run's strict=False report is what will flag that.
+        # A config from the (reverted) shared-router era has router_hidden
+        # set and a checkpoint containing w_r/w_t, neither of which exists in
+        # this class any more -- load_run's strict=False report will flag it.
         model = TimingGroupedSNN(
             hidden_per_group = int(cfg_get(cfg, "hidden", 256)),
             n_timing         = n_timing,
             group_cols       = group_cols,
             tau_timing_min   = float(cfg_get(cfg, "tau_timing_min", 2.0)),
-            tau_timing_max   = float(cfg_get(cfg, "tau_timing_max", 64.0)),
-            router_hidden    = int(cfg_get(cfg, "router_hidden", 16)),
+            tau_timing_max   = float(cfg_get(cfg, "tau_timing_max",
+                                               _P / _n_cpg)),
             readout_hidden   = int(cfg_get(cfg, "readout_hidden", 32)),
-            tau_router_min   = float(cfg_get(cfg, "tau_router_min", 2.0)),
-            tau_router_max   = float(cfg_get(cfg, "tau_router_max", 64.0)),
+            tau_readout_max  = float(cfg_get(cfg, "tau_readout_max",
+                                               _P / (2.0 * math.pi))),
             timing_slope     = float(cfg_get(cfg, "timing_slope", 5.0)),
+            timing_reset     = str(cfg_get(cfg, "timing_reset", "zero")),
+            sub_film         = str(cfg_get(cfg, "sub_film", "both")),
             timing_w_scale   = float(cfg_get(cfg, "timing_w_scale", 0.5)),
             # sub_ln changes FORWARD BEHAVIOUR, not shapes, so a wrong value
             # loads cleanly and then quietly computes something else.
@@ -693,12 +701,16 @@ def plot_taus(model, period, cfg, out_dir, dpi):
     if hasattr(model, "beta_t_logit"):
         series.append(("timing", tau(model.beta_t_logit),
                        float(cfg_get(cfg, "tau_timing_min", 2.0)),
-                       float(cfg_get(cfg, "tau_timing_max", 64.0))))
+                       float(cfg_get(cfg, "tau_timing_max",
+                                     period / max(int(cfg_get(
+                                         cfg, "n_cpg_neurons", 4)), 1)))))
     tmin = float(cfg_get(cfg, "tau_min", 2.0))
     tmax = float(cfg_get(cfg, "tau_max", 256.0))
     series += [("hidden 1", tau(model.beta1_logit), tmin, tmax),
                ("hidden 2", tau(model.beta2_logit), tmin, tmax),
-               ("readout",  tau(model.betao_logit), 2.0, 40.0)]
+               ("readout",  tau(model.betao_logit), 2.0,
+                float(cfg_get(cfg, "tau_readout_max",
+                              period / (2.0 * math.pi))))]
 
     fig, axes = plt.subplots(1, len(series), figsize=(3.5 * len(series), 3.4))
     if len(series) == 1:
@@ -746,7 +758,7 @@ def plot_membranes(mems, state_names, gait_name, out_dir, dpi,
     # covered by the exact rasters elsewhere. This plot is about the
     # sub-networks, whose spikes are NOT recoverable (see module docstring).
     rows = [(k, nm) for k, nm in enumerate(state_names)
-            if nm not in ("mem_timing", "mem_router")]
+            if nm != "mem_timing"]
     fig, axes = plt.subplots(len(rows), 1, figsize=(14, 2.4 * len(rows)),
                              sharex=True, squeeze=False)
     axes = axes[:, 0]
