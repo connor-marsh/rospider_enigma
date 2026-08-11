@@ -795,7 +795,13 @@ def main():
                     help="Directory holding the checkpoint and config.")
     ap.add_argument("--ckpt",      type=str, default="best_model.pt")
     ap.add_argument("--cfg",       type=str, default="cpg_lif_snn_config.json")
-    ap.add_argument("--out_dir",   type=str, default="outputs/visualize")
+    ap.add_argument("--out_dir",   type=str, default=None,
+                    help="Where plots and timing_summary.json are written. "
+                         "Default None = <model_dir>/visualize, so nothing "
+                         "needs to change between runs besides --model_dir. "
+                         "Resolved relative to this_file_dir only if given "
+                         "explicitly as a relative path; the default is "
+                         "always relative to the resolved model_dir instead.")
     ap.add_argument("--gaits_dir", type=str, default="../gaits",
                     help="Folder of {name}.csv gait tables, resolved as "
                          "this_file_dir/<gaits_dir> — same default as "
@@ -824,7 +830,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     this_file_dir = os.path.dirname(os.path.abspath(__file__))
     model_dir = Path(this_file_dir + "/" + args.model_dir)
-    out_dir   = Path(this_file_dir + "/" + args.out_dir)
+    out_dir   = (model_dir / "visualize" if args.out_dir is None
+                else Path(this_file_dir + "/" + args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device : {device}\nModel  : {model_dir}\nOutput : "
           f"{out_dir.resolve()}\n")

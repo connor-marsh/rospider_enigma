@@ -2441,7 +2441,7 @@ def main():
                          "of those matches.")
 
     # architecture
-    ap.add_argument("--arch", type=str, default="dense",
+    ap.add_argument("--arch", type=str, default="timing_grouped",
                     choices=["dense", "timing_grouped"],
                     help="dense: StatefulSNN, one fully connected network. "
                          "timing_grouped: TimingGroupedSNN — CPG -> small "
