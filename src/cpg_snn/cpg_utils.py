@@ -2,7 +2,6 @@
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -516,3 +515,18 @@ def encode_spike_events(spike_times, spike_neurons, gait_period, N=4, use_phase=
           f"  ({N} one-hot + sin/cos abs-phase + sin/cos rel-phase)"
           f"  [gait flag added per-event in build_dataset]")
     return base_feats, abs_phase
+
+
+# main function visualizes CPG
+if __name__ == "__main__":
+    spike_times, spike_neurons, spike_array, vms = run_blif_cpg(N=6, t_max = 10000, cpg_start_time=2000)
+    fig, axes = plt.subplots(1, 1)
+    n_show = 2000
+    for i in range(spike_array.shape[0]):
+        axes.plot(spike_array[i, :n_show], label=f"Neuron {i+1} spikes")
+    axes.legend()
+
+
+    plt.suptitle("BLIF CPG Spikes", fontsize=12)
+    plt.tight_layout()
+    plt.show()
