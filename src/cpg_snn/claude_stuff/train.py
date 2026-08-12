@@ -3086,7 +3086,7 @@ def main():
                          "bound, so a bigger batch is nearly free in "
                          "wall-clock. If raising further, consider an LR "
                          "rescale (sqrt rule for Adam).")
-    ap.add_argument("--lr",               type=float, default=2e-3,
+    ap.add_argument("--lr",               type=float, default=4e-3,
                     help="Kept at 2e-3 after raising batch 32->128 so the "
                          "first benchmark was a clean comparison. Adam's "
                          "sqrt-scaling rule suggests ~4e-3 at batch 128 — "
