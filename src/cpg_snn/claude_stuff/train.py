@@ -3107,6 +3107,10 @@ def main():
                          "neuron-0 burst onset, in cycles.")
 
     # misc
+    ap.add_argument("--freeze_blocks", type=str, default="",
+                    help="Comma-separated grad_blocks names to freeze "
+                         "(requires_grad=False), e.g. "
+                         "'sub_l1,sub_l2,sub_film'. Empty = train everything.")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--log_every", type=int, default=1)
     ap.add_argument("--timing_log_every", type=int, default=10,
@@ -3312,6 +3316,22 @@ def main():
     # compile a second graph, and toggling .train()/.eval() may add one
     # more.  That is 2-3 graphs total, comfortably under the 8-recompile
     # limit past which Dynamo silently falls back to eager.
+    if args.freeze_blocks:
+        want = {b.strip() for b in args.freeze_blocks.split(",") if b.strip()}
+        all_blocks = grad_blocks(model)
+        unknown = want - set(all_blocks)
+        if unknown:
+            raise ValueError(f"--freeze_blocks: unknown {sorted(unknown)}; "
+                             f"available {sorted(all_blocks)}")
+        n_frozen = 0
+        for b in want:
+            for p in all_blocks[b]:
+                p.requires_grad_(False)
+                n_frozen += p.numel()
+        n_tot = sum(p.numel() for p in model.parameters())
+        print(f"      FROZEN {sorted(want)}: {n_frozen:,} params "
+              f"({100*n_frozen/n_tot:.0f}% of model) held at init")
+
     model._step_eager = model.step
     if device.type == "cuda":
         model.step = torch.compile(model.step, dynamic=False)
@@ -3435,7 +3455,8 @@ def main():
     timing_stats  = []
 
     if not args.dry_run:
-        opt   = torch.optim.Adam(model.parameters(), lr=args.lr)
+        opt   = torch.optim.Adam(
+            [p for p in model.parameters() if p.requires_grad], lr=args.lr)
         # bite #3: T_max must equal the number of sched.step() calls, and
         # sched.step() now fires once per GRADIENT STEP (inside the chunk
         # loop) rather than once per epoch. With T_max=epochs the cosine
@@ -3607,6 +3628,7 @@ def main():
                                  if args.arch == "timing_grouped" else None),
             "timing_reset":     (args.timing_reset
                                  if args.arch == "timing_grouped" else None),
+            "freeze_blocks":    (args.freeze_blocks or None),
             "event_gated":      (bool(args.event_gated)
                                  if args.arch == "timing_grouped" else None),
             "spike_objective":  (spike_obj.describe()
