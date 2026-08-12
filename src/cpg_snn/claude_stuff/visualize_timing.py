@@ -165,7 +165,6 @@ def build_model_from_cfg(cfg, device):
             timing_reset     = str(cfg_get(cfg, "timing_reset", "subtract")),
             sub_film         = str(cfg_get(cfg, "sub_film", "both")),
             event_gated      = bool(cfg_get(cfg, "event_gated", False)),
-            timing_w_scale   = float(cfg_get(cfg, "timing_w_scale", 0.5)),
             # sub_ln changes FORWARD BEHAVIOUR, not shapes, so a wrong value
             # loads cleanly and then quietly computes something else.
             sub_ln           = str(cfg_get(cfg, "sub_ln", "l2")),

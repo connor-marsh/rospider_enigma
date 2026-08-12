@@ -927,6 +927,23 @@ def spike_fn(x, slope=25.0):
     return hard + (surr - surr.detach())
 
 
+# Init scales that used to be the single --timing_w_scale arg.  Split and
+# made internal because the arg was doing two unrelated jobs and neither
+# needed user input:
+#   _W_IN_INIT : CPG->timing weights.  calibrate_gains rescales these before
+#                training, so this only sets relative shape and the sign of
+#                the mean -- there is nothing for a user to tune.
+#   _W1_INIT   : timing->sub-net layer 1.  Deliberately uncalibrated (see the
+#                note at self.w1), and learnable, so this is a starting point
+#                rather than a setting.
+# Historical note: under the older sub_ln="both" default, layer 1 had
+# LayerNorm and LN is exactly scale-invariant with b1 init at zero, so the
+# shared arg had LITERALLY no effect there.  It only became live when the
+# default changed to "l2".
+_W_IN_INIT = 0.5
+_W1_INIT   = 0.5
+
+
 def init_beta_logit(shape, tau_min, tau_max, generator=None):
     """
     Log-uniform membrane time constants -> beta = exp(-1/tau), stored as a
@@ -1160,8 +1177,12 @@ class TimingGroupedSNN(nn.Module):
     Per-gait input weights, and why the shared router was reverted
     -------------------------------------------------------------
     `w_in_gait` is an Embedding(max_gaits, n_neurons * n_timing) reshaped to
-    a per-gait (n_neurons, n_timing) matrix.  Each gait gets its own free
-    routing matrix; nothing is shared between them.
+    a per-gait (n_neurons, n_timing) matrix, and `b_t` is a matching
+    Embedding(max_gaits, n_timing) per-gait bias.  Each gait gets its own free
+    routing matrix and its own bias; nothing is shared between them.  There is
+    no FiLM on this layer -- see the init block for why its gamma was provably
+    redundant against a free per-gait matrix, and why its beta survives as the
+    per-gait bias.
 
     A shared alternative was built and measured: one pair of weight matrices
     with a per-gait FiLM gate on a 16-unit LIF hidden layer in between, so
@@ -1242,7 +1263,7 @@ class TimingGroupedSNN(nn.Module):
                  tau_min=2.0, tau_max=256.0,
                  tau_timing_min=2.0, tau_timing_max=64.0,
                  tau_readout_max=40.0,
-                 timing_w_scale=0.5, sub_ln="l2", sub_film="both",
+                 sub_ln="l2", sub_film="both",
                  timing_reset="zero", event_gated=True,
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
@@ -1311,24 +1332,47 @@ class TimingGroupedSNN(nn.Module):
         # nothing shared.  See the class docstring for why the shared-router
         # alternative was tried and reverted.
         #
-        # Positive mean so every timing unit starts with net POSITIVE drive.
-        # Not cosmetic: gain calibration multiplies the current, and
-        # multiplying a negative current by a larger positive gain moves it
-        # FURTHER from threshold, so a unit born with net-negative drive
-        # cannot be rescued by calibration at all.  Sign is fixed at init;
-        # only then can calibration fix magnitude.
+        # There is NO FiLM on this layer.  There used to be, and its gamma was
+        # provably redundant: with W already a free per-gait matrix,
+        #     gamma_g * (x W_g + b) + beta_g  ==  x (W_g gamma_g) + (gamma_g b + beta_g)
+        # so gamma is exactly absorbable into W_g and adds no expressiveness
+        # (verified numerically to 1e-16).  FiLM's beta was NOT redundant --
+        # it supplied a PER-GAIT bias where b_t was gait-shared -- so that
+        # capability is kept, expressed directly as a per-gait bias embedding
+        # below rather than hidden inside a gate.  If the per-gait weight
+        # table is ever replaced by a shared scheme, gamma becomes
+        # load-bearing again and FiLM should come back here.
+        #
+        # INIT SCALE is arbitrary: calibrate_gains rescales these columns to
+        # hit a target firing rate before training starts, so whatever is set
+        # here only fixes the relative SHAPE.  A positive mean matters though,
+        # and is not cosmetic: calibration multiplies the current, and
+        # multiplying a net-negative current by a larger positive gain moves it
+        # FURTHER from threshold, so a unit born net-negative cannot be
+        # rescued by calibration at all.  Sign is fixed here; magnitude is
+        # calibration's job.
         self.w_in_gait = nn.Embedding(max_gaits, self.n_neurons * G)
-        nn.init.normal_(self.w_in_gait.weight, mean=0.0, std=timing_w_scale)
-        self.w_in_gait.weight.data += timing_w_scale
-        self.b_t  = nn.Parameter(torch.zeros(G))
-        self.film_t = nn.Embedding(max_gaits, 2 * G)
-        nn.init.zeros_(self.film_t.weight)
-        self.film_t.weight.data[:, :G] = 1.0 + 0.05 * torch.randn(max_gaits, G)
+        nn.init.normal_(self.w_in_gait.weight, mean=_W_IN_INIT, std=_W_IN_INIT)
+
+        # Per-gait bias.  Note this is tonic drive -- present on silent steps
+        # too -- which is exactly why it is wanted here: with
+        # timing_reset="zero" a timing unit can only fire when input arrives,
+        # so bias is the ONLY mechanism by which it can spike BETWEEN CPG
+        # bursts.  Under event gating that maintenance firing is what the
+        # sub-networks need, so tonic drive is load-bearing rather than the
+        # liability it would be for a CPG-locked burster.
+        self.b_t = nn.Embedding(max_gaits, G)
+        nn.init.zeros_(self.b_t.weight)
         self.beta_t_logit = nn.Parameter(
             init_beta_logit((G,), tau_timing_min, tau_timing_max))
 
         # ── sub-network layer 1: ONE binary spike -> Hg units ─────
-        self.w1 = nn.Parameter(torch.randn(G, Hg) * timing_w_scale)
+        # Fixed init scale, deliberately NOT calibrated.  A dead timing
+        # neuron silences a whole sub-network, which is why that layer gets
+        # calibration; a few dead units out of Hg here are noise, and w1 plus
+        # film1's gamma are both learnable so the init only sets the
+        # optimisation path, not what is reachable.
+        self.w1 = nn.Parameter(torch.randn(G, Hg) * _W1_INIT)
         self.b1 = nn.Parameter(torch.zeros(G, Hg))
 
         # ── sub-network layer 2: block diagonal (G, Hg, Hg) ───────
@@ -1392,9 +1436,7 @@ class TimingGroupedSNN(nn.Module):
         `LIFGeneralArray` (the CPG) does exactly this: `v[spike] = 0`.
         """
         W   = self.w_in_gait(gait).view(-1, self.n_neurons, self.G)
-        cur = torch.bmm(x.unsqueeze(1), W).squeeze(1) + self.b_t
-        v   = self.film_t(gait)
-        cur = cur * v[:, :self.G] + v[:, self.G:]
+        cur = torch.bmm(x.unsqueeze(1), W).squeeze(1) + self.b_t(gait)
         mem_t = torch.sigmoid(self.beta_t_logit) * mem_t + cur
         spk_t = spike_fn(mem_t - self.thresh, self.timing_slope)
         if self.timing_reset == "zero":
@@ -1538,8 +1580,8 @@ class TimingGroupedSNN(nn.Module):
         """Grouped parameter counts, for the startup print."""
         n = lambda *ps: int(sum(p.numel() for p in ps))
         return {
-            "timing":  n(self.w_in_gait.weight, self.b_t, self.beta_t_logit,
-                         self.film_t.weight),
+            "timing":  n(self.w_in_gait.weight, self.b_t.weight,
+                         self.beta_t_logit),
             "sub_l1":  n(self.w1, self.b1, self.beta1_logit),
             "sub_l2":  n(self.w2, self.b2, self.beta2_logit),
             "readout": n(self.w_read, self.b_read, self.w_out, self.b_out,
@@ -1633,8 +1675,14 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
                     lo=1.0, hi=5.0, iters=18, g_lo=1e-3, g_hi=1e3,
                     verbose=True):
     """
-    Set each timing unit's FiLM gamma so its firing rate starts inside
-    [lo, hi] spikes per cycle.
+    Scale each timing unit's CPG->timing weight column so its firing rate
+    starts inside [lo, hi] spikes per cycle.
+
+    This is what `--timing_w_scale` used to be for, done by measurement
+    instead of by a user-supplied number.  It writes directly into
+    `w_in_gait` (it used to go through FiLM's gamma, which was only ever a
+    convenient handle -- and that gamma is gone now, being provably
+    absorbable into a free per-gait matrix).
 
     HOW.  Rate is monotone non-decreasing in a unit's own gain: more input
     current can only add threshold crossings, never remove them.  So a
@@ -1642,92 +1690,100 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
     function of gain (it jumps by whole spikes, with flat stretches between),
     which is exactly why the target is a band rather than an exact value.
 
-    Units are independent: timing unit l's current depends only on column l
-    of the per-gait weight matrix and on its own gamma.  So all units bisect
-    in parallel.
+    Units are independent: timing unit l's current depends only on column l of
+    each gait's weight matrix and on its own bias.  So all units bisect in
+    parallel, and scaling column l cannot disturb any other unit.
 
-    WHY GAIN AND NOT BIAS.  Adding a positive constant to the bias would also
-    raise the rate, monotonically and with no sign caveat.  But bias is tonic
-    drive -- present during CPG silence too -- so the unit would free-run on
-    its own clock instead of responding to CPG bursts: alive and
-    uninformative.  Gain amplifies whatever phase preference the unit already
-    has; bias manufactures activity from nothing.
+    WHY WEIGHTS AND NOT BIAS.  Adding a positive constant to the bias would
+    also raise the rate, monotonically and with no sign caveat.  But bias is
+    tonic drive, present during CPG silence too, so raising it manufactures
+    activity that is unrelated to the CPG rhythm -- alive and uninformative.
+    Scaling the weights amplifies whatever phase preference the unit already
+    has.  (The per-gait bias is still free to LEARN tonic drive, which under
+    event gating is how a unit fires between bursts at all; the point is only
+    that calibration should not be the thing that sets it.)
 
     WHY IT CAN STILL FAIL.  Gain cannot fix a wrong sign.  If a unit's net
     input current is negative, multiplying by a larger positive gain moves it
-    FURTHER from threshold, and the bisection will ride to g_hi and give up.
-    The positive-mean init on `w_in_gait` exists to prevent that.  Units that
+    FURTHER from threshold, and the bisection rides to g_hi and gives up.  The
+    positive-mean init on `w_in_gait` exists to prevent that.  Units that
     cannot be brought into band are reported, not silently left.
 
-    WHICH GAIT.  Gamma is written identically into every gait row (plus the
-    small init noise, preserved), so one gain per unit.  The rate targeted is
-    the MINIMUM over gaits, because the failure that matters is
+    WHICH GAIT.  One gain per unit, applied to that unit's column in EVERY
+    gait's matrix, so the relative shape across gaits is preserved.  The rate
+    targeted is the MINIMUM over gaits, because the failure that matters is
     dead-for-one-particular-gait, not dead-on-average.
     """
-    if not hasattr(model, "film_t"):
+    if not hasattr(model, "w_in_gait"):
         return {}
 
-    report = {}
-    for layer, emb, n_units in (("timing", model.film_t, model.G),):
-        base = emb.weight.data[:, :n_units].clone()     # keep per-gait noise
-        # Normalise the noise to mean 1 per unit so the multiplier is clean.
-        unit_mean = base.mean(dim=0, keepdim=True).clamp(min=1e-6)
-        shape = base / unit_mean
+    MG, n_cpg, G = model.max_gaits, model.n_neurons, model.G
+    # (max_gaits, n_cpg, n_timing) view; column l is timing unit l's inputs.
+    W = model.w_in_gait.weight.data.view(MG, n_cpg, G)
+    base = W.clone()
 
-        lo_g = torch.full((n_units,), g_lo, device=device)
-        hi_g = torch.full((n_units,), g_hi, device=device)
+    lo_g = torch.full((G,), g_lo, device=device)
+    hi_g = torch.full((G,), g_hi, device=device)
 
-        def rates_at(gain):
-            emb.weight.data[:, :n_units] = shape * gain.unsqueeze(0)
-            r = measure_rates(model, spikes, n_gaits, device, period=period)
-            return torch.as_tensor(r, device=device).min(dim=0).values
+    def rates_at(gain):
+        # gain is (G,); broadcast over (max_gaits, n_cpg, G) so each timing
+        # unit's whole column is scaled in every gait at once.
+        W.copy_(base * gain.view(1, 1, G))
+        r = measure_rates(model, spikes, n_gaits, device, period=period)
+        return torch.as_tensor(r, device=device).min(dim=0).values
 
-        for _ in range(iters):
-            mid = torch.sqrt(lo_g * hi_g)               # geometric midpoint
-            r   = rates_at(mid)
-            too_quiet = r < lo
-            too_loud  = r > hi
-            lo_g = torch.where(too_quiet, mid, lo_g)
-            hi_g = torch.where(too_loud,  mid, hi_g)
-            if not (too_quiet | too_loud).any():
-                break
+    for _ in range(iters):
+        mid = torch.sqrt(lo_g * hi_g)                   # geometric midpoint
+        r   = rates_at(mid)
+        too_quiet = r < lo
+        too_loud  = r > hi
+        lo_g = torch.where(too_quiet, mid, lo_g)
+        hi_g = torch.where(too_loud,  mid, hi_g)
+        if not (too_quiet | too_loud).any():
+            break
 
-        final_gain  = torch.sqrt(lo_g * hi_g)
-        final_rates = rates_at(final_gain)
-        ok = ((final_rates >= lo * 0.5) & (final_rates <= hi * 2.0))
-        report[layer] = {
-            "gain":       [float(v) for v in final_gain.cpu()],
-            "min_rate":   [float(v) for v in final_rates.cpu()],
-            "in_band":    [bool(v) for v in ok.cpu()],
-        }
-        if verbose:
-            fmt = lambda v: " ".join(f"{x:6.2f}" for x in v)
-            print(f"      calibrated {layer:>6s}: "
-                  f"gain [{fmt(report[layer]['gain'])}]")
-            print(f"                 {'':>6s}  "
-                  f"min spk/cyc across gaits "
-                  f"[{fmt(report[layer]['min_rate'])}]")
-            bad = [i for i, v in enumerate(ok.cpu()) if not v]
-            if bad:
-                print(f"      WARNING: {layer} unit(s) {bad} could not be "
-                      f"brought into [{lo}, {hi}] spk/cyc by gain alone — "
-                      f"likely net-negative input current, which gain cannot "
-                      f"fix. The rate floor will keep pushing; if they stay "
-                      f"dead, --timing_w_scale or the w_in_gait positive "
-                      f"mean is the thing to look at.")
+    # sqrt(lo*hi) is safe to return rather than tracking the last verified
+    # gain separately: once a unit is in band NEITHER bound updates again, so
+    # its midpoint is frozen at exactly the value that was measured in band.
+    # (Checked -- tracking it separately gives bit-identical gains.)
+    final_gain  = torch.sqrt(lo_g * hi_g)
+    final_rates = rates_at(final_gain)
+    ok = ((final_rates >= lo * 0.5) & (final_rates <= hi * 2.0))
+    report = {"timing": {
+        "gain":     [float(v) for v in final_gain.cpu()],
+        "min_rate": [float(v) for v in final_rates.cpu()],
+        "in_band":  [bool(v) for v in ok.cpu()],
+    }}
+    if verbose:
+        fmt = lambda v: " ".join(f"{x:6.2f}" for x in v)
+        print(f"      calibrated timing: gain [{fmt(report['timing']['gain'])}]")
+        print(f"                         min spk/cyc across gaits "
+              f"[{fmt(report['timing']['min_rate'])}]")
+        bad = [i for i, v in enumerate(ok.cpu()) if not v]
+        if bad:
+            print(f"      WARNING: timing unit(s) {bad} could not be brought "
+                  f"into [{lo}, {hi}] spk/cyc by scaling alone — likely "
+                  f"net-negative input current, which a positive gain cannot "
+                  f"fix. The spike objective will keep pushing; if they stay "
+                  f"dead, the _W_IN_INIT positive mean is the thing to look "
+                  f"at.")
     return report
 
 
 def cpg_spike_stats(spikes, phase, period):
     """
-    The CPG's own firing statistics, per neuron and averaged: spikes per
+    The CPG's own firing statistics, per neuron then averaged: spikes per
     cycle, and circular concentration R of the spike phases.
 
-    These become the TARGETS for the timing layer, which is why they
-    are measured rather than configured -- "fire like the CPG does" needs no
-    hyperparameter, and hardcoding e.g. R=1.0 would be unsatisfiable anyway
-    (10 spikes at 3-step spacing inside a 352-step cycle tops out near 0.99,
-    so a target of 1.0 would apply permanent pressure that can never be met).
+    These become the TARGETS for the timing layer, which is why they are
+    MEASURED rather than configured -- "fire like the CPG does" needs no
+    hyperparameter.  Hardcoding a value would also be wrong: R=1.0 is
+    unsatisfiable, since 10 spikes at 2-step spacing inside a 352-step cycle
+    top out near 0.995, so a target of 1.0 would apply permanent pressure that
+    can never be met.
+
+    Also used to size the calibration band, so the timing layer starts in the
+    right neighbourhood before any training happens.
     """
     ok = ~np.isnan(phase)
     n_cycles = max(ok.sum() / float(period), 1e-9)
@@ -1940,7 +1996,7 @@ def reinit_dead_units(model, dead, generator=None, verbose=True):
     matters most:
       - w_in_gait  : that unit's column of every gait's routing matrix, with
                      positive mean restored, so it gets net positive drive
-      - film_t gamma for l, back to ~1 across gait rows
+      - b_t        : that unit's per-gait bias, back to zero
       - w1[l]      : THE SUB-NETWORK'S INPUT WEIGHTS.  d(cur1)/d(w1) is
                      proportional to the timing spike, so w1[l] received
                      exactly zero gradient for the whole dead period and is
@@ -1960,15 +2016,15 @@ def reinit_dead_units(model, dead, generator=None, verbose=True):
     MG, nn_, G = model.max_gaits, model.n_neurons, model.G
     W = model.w_in_gait.weight.view(MG, nn_, G)
     for l in dead:
-        W[:, :, l] = (torch.randn(MG, nn_, generator=generator).to(dev) * 0.5
-                      + 0.5)
-        model.film_t.weight[:, l] = 1.0 + 0.05 * torch.randn(
-            MG, generator=generator).to(dev)
-        model.w1[l] = torch.randn(model.Hg, generator=generator).to(dev) * 0.5
+        W[:, :, l] = (torch.randn(MG, nn_, generator=generator).to(dev)
+                      * _W_IN_INIT + _W_IN_INIT)
+        model.b_t.weight[:, l] = 0.0
+        model.w1[l] = (torch.randn(model.Hg, generator=generator).to(dev)
+                       * _W1_INIT)
     if verbose:
         print(f"      [reinit] timing unit(s) {dead}: re-rolled w_in_gait "
-              f"column (all gaits), film_t gamma, and sub-net w1 (which had "
-              f"received zero gradient while dead)")
+              f"column (all gaits), zeroed its per-gait bias, and re-rolled "
+              f"sub-net w1 (which had received zero gradient while dead)")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2710,21 +2766,14 @@ def main():
                          "Taus stay learnable, so this is an init range, not "
                          "a cap; raise it if you want to test the "
                          "hold-across-the-cycle hypothesis directly.")
-    ap.add_argument("--timing_w_scale", type=float, default=0.5,
-                    help="[timing_grouped] Init std for the per-gait CPG-> "
-                         "timing weights and for sub-net layer 1. There is NO "
-                         "LayerNorm on the timing layer, so this sets the "
-                         "firing regime directly against thresh=1.0 — check "
-                         "the spk/cyc column of the timing report and raise "
-                         "it if units are dead, lower it if saturated.")
     ap.add_argument("--calibrate_gains", type=int, default=1,
                     help="[timing_grouped] 1 = before training, bisect each "
-                         "timing unit's FiLM gamma until its firing "
-                         "rate lands within a factor of 2 of the CPG's own "
-                         "spikes-per-cycle (measured at startup, so there is "
-                         "no band to configure). Forward passes only, a second "
-                         "of compute, and it retires --timing_w_scale as a "
-                         "number you have to guess. 0 = skip.")
+                         "timing unit's CPG->timing weight column until its "
+                         "firing rate lands within a factor of 2 of the CPG's "
+                         "own spikes-per-cycle (measured at startup, so there "
+                         "is no band to configure). Forward passes only, a "
+                         "second of compute, and it is why there is no "
+                         "--timing_w_scale to guess at. 0 = skip.")
     ap.add_argument("--spike_objective", type=str, default="min_count",
                     choices=sorted(SPIKE_OBJECTIVES),
                     help="[timing_grouped] Which objective shapes the timing "
@@ -2768,7 +2817,7 @@ def main():
                          "been silent for EVERY gait across this many "
                          "consecutive timing reports (so the wall-clock "
                          "trigger scales with --timing_log_every). Re-rolls "
-                         "that unit's w_in_gait column, its FiLM gamma, AND the "
+                         "that unit's w_in_gait column, its bias, AND the "
                          "sub-network's w1 — that last one is the point, "
                          "since w1's gradient is proportional to the timing "
                          "spike and so was exactly zero the whole time it was "
@@ -3072,7 +3121,6 @@ def main():
             tau_timing_min=args.tau_timing_min,
             tau_timing_max=args.tau_timing_max,
             tau_readout_max=args.tau_readout_max,
-            timing_w_scale=args.timing_w_scale,
             sub_ln=args.sub_ln, sub_film=args.sub_film,
             timing_reset=args.timing_reset,
             event_gated=bool(args.event_gated),
@@ -3257,8 +3305,8 @@ def main():
                 print(ln)
     else:
         print("      --dry_run: skipping training.")
-        # Still worth seeing: at init this says whether timing_w_scale has
-        # put the layer in a firing regime at all before you spend an hour.
+        # Still worth seeing: at init this says whether calibration put the
+        # layer in a firing regime at all before you spend an hour.
         if timing_diag is not None:
             print("      Timing layer at initialisation:")
             lines, timing_stats = timing_diag()
@@ -3388,8 +3436,6 @@ def main():
             "tau_timing_min":   (float(args.tau_timing_min)
                                  if args.arch == "timing_grouped" else None),
             "tau_timing_max":   (float(args.tau_timing_max)
-                                 if args.arch == "timing_grouped" else None),
-            "timing_w_scale":   (float(args.timing_w_scale)
                                  if args.arch == "timing_grouped" else None),
             "sub_ln":           (args.sub_ln
                                  if args.arch == "timing_grouped" else None),
