@@ -2184,6 +2184,79 @@ def apply_reset(state, reset_mask):
     return tuple(s * keep.view(-1, *([1] * (s.dim() - 1))) for s in state)
 
 
+def grad_blocks(model):
+    """
+    Group parameters into coarse blocks for per-block gradient reporting.
+
+    Derived from parameter NAMES rather than hardcoded lists, so it works for
+    both architectures without either one having to know about the other.
+    Order of the checks matters: "w_in_gait" also startswith "w_in", so the
+    timing block is tested before the dense arch's input block.
+
+    Why per-block at all: the single |grad| scalar hides which parts of the
+    model are actually receiving signal.  A near-zero norm on the timing block
+    specifically would mean the timing layer is not learning, which is a
+    completely different problem from a uniformly small gradient (and under
+    Adam a uniformly small gradient is not a problem at all -- the update is
+    scale-invariant in the gradient).
+    """
+    rules = (
+        ("timing",    ("w_in_gait", "b_t", "beta_t_logit")),
+        ("input",     ("w_in",)),                    # dense arch only
+        ("sub_l1",    ("w1", "b1", "beta1_logit")),
+        ("sub_l2",    ("w2", "b2", "beta2_logit")),
+        ("readout",   ("w_read", "b_read", "w_out", "b_out", "betao_logit")),
+        ("sub_film",  ("film1", "film2")),
+        ("layernorm", ("ln1", "ln2")),
+    )
+    blocks = {}
+    for pname, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        block = "other"
+        for bname, prefixes in rules:
+            if pname.startswith(prefixes):
+                block = bname
+                break
+        blocks.setdefault(block, []).append(p)
+    return blocks
+
+
+class MetricsWriter:
+    """
+    Append one row per epoch to out_dir/metrics.csv.
+
+    Appended and flushed every epoch rather than written at the end, because
+    Ctrl+C is a normal way to finish a run here -- the config's `history` only
+    lands on a clean(ish) exit, so a partially-interrupted run would otherwise
+    leave nothing comparable behind.  Columns are fixed from the first row, so
+    a key appearing later is dropped rather than shifting the table.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.cols = None
+        self.fh = None
+
+    def write(self, row):
+        if self.fh is None:
+            self.cols = list(row.keys())
+            self.fh = open(self.path, "w")
+            self.fh.write(",".join(self.cols) + "\n")
+        vals = []
+        for c in self.cols:
+            v = row.get(c, "")
+            vals.append("" if v is None else
+                        (f"{v:.6g}" if isinstance(v, float) else str(v)))
+        self.fh.write(",".join(vals) + "\n")
+        self.fh.flush()
+
+    def close(self):
+        if self.fh is not None:
+            self.fh.close()
+            self.fh = None
+
+
 def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                  gait_w, out_dir, timing_diag=None, n_gaits=4, period=254.0,
                  spike_obj=None):
@@ -2201,8 +2274,28 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
     best = float("inf")
     best_path = out_dir / "best_model.pt"
     hist = {"train": [], "val": [], "val_sw": [], "gnorm": [], "sec": [],
-            "floor": []}
+            "floor": [], "upd": []}
     last_timing_stats = []
+
+    # Per-block gradient norms and the per-epoch parameter update norm.
+    #
+    # |upd| is the metric |grad| cannot be: under Adam the update is
+    # lr*m/(sqrt(v)+eps), which is scale-invariant in the gradient, so a small
+    # |grad| says nothing about whether the model is moving. |upd| measures the
+    # movement directly. Expected scale is ~lr*sqrt(N) per gradient step, so
+    # roughly lr*sqrt(N)*sqrt(chunks) per epoch if steps are uncorrelated.
+    blocks = grad_blocks(model)
+    for b in blocks:
+        hist[f"g_{b}"] = []
+    n_par = sum(p.numel() for p in model.parameters())
+    exp_upd = args.lr * math.sqrt(n_par) * math.sqrt(args.chunks_per_epoch)
+    metrics = MetricsWriter(out_dir / "metrics.csv")
+    print(f"\n  Per-epoch metrics -> {out_dir / 'metrics.csv'}")
+    print(f"  Gradient blocks: {', '.join(sorted(blocks))}")
+    print(f"  |upd| = per-epoch ||delta theta||. Order-of-magnitude "
+          f"expectation at lr={args.lr:g} is ~{exp_upd:.2f}")
+    print(f"  (Adam's step is scale-invariant in the gradient, so |upd| -- not "
+          f"|grad| -- is what says whether the model is moving.)")
 
     # Spike statistics are only meaningful for the arch with a timing layer.
     use_stats = (spike_obj is not None and spike_obj.enabled
@@ -2220,8 +2313,9 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
     dead_streak = {}
 
     print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val':>10}  "
-          f"{'Val(post-sw)':>13}  {'LR':>9}  {'|grad|':>8}  {'sec':>6}")
-    print("  " + "-" * 78)
+          f"{'Val(post-sw)':>13}  {'LR':>9}  {'|grad|':>8}  {'|upd|':>8}"
+          f"  {'sec':>6}")
+    print("  " + "-" * 88)
     print(f"  (Ctrl+C stops training and exports.  |grad| is the PRE-clip "
           f"norm, clip={args.clip:g};")
     print(f"   routinely much larger than clip means most updates are being "
@@ -2233,6 +2327,9 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             # epoch.  Read before the timing report below, so an occasional
             # diagnostic epoch does not show up as a spike in this column.
             t_epoch = time.perf_counter()
+            theta0 = torch.cat([p.detach().reshape(-1)
+                                for p in model.parameters()]).clone()
+            bacc = {b: torch.zeros((), device=device) for b in blocks}
 
             # ---- train -------------------------------------------------
             model.train()
@@ -2280,6 +2377,18 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 # Returns the total norm BEFORE clipping — free to read,
                 # and the only way to tell whether clip=1.0 is quietly
                 # truncating nearly every update (i.e. masking a too-hot LR).
+                # Before clip_grad_norm_, which rescales grads IN PLACE --
+                # taken here so these are comparable to the pre-clip |grad|.
+                # Accumulated as device tensors and synced once per epoch
+                # rather than per chunk.
+                with torch.no_grad():
+                    for b, plist in blocks.items():
+                        gs = [p.grad.detach() for p in plist
+                              if p.grad is not None]
+                        if gs:
+                            bacc[b] += torch.linalg.vector_norm(
+                                torch.stack([torch.linalg.vector_norm(g)
+                                             for g in gs]))
                 gnorm = nn.utils.clip_grad_norm_(model.parameters(), args.clip)
                 opt.step()
                 # Stepped per GRADIENT STEP, not per epoch: the LR schedule
@@ -2331,6 +2440,15 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             hist["sec"].append(epoch_s)
             hist["floor"].append(tr_floor)
 
+            with torch.no_grad():
+                theta1 = torch.cat([p.detach().reshape(-1)
+                                    for p in model.parameters()])
+                upd = float(torch.linalg.vector_norm(theta1 - theta0))
+            hist["upd"].append(upd)
+            gblk = {b: float(bacc[b]) / max(nb, 1) for b in blocks}
+            for b in blocks:
+                hist[f"g_{b}"].append(gblk[b])
+
             flag = ""
             if va_loss < best:
                 best = va_loss
@@ -2340,7 +2458,25 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             if epoch % args.log_every == 0 or epoch == 1:
                 print(f"  {epoch:>6}  {tr_loss:>10.6f}  {va_loss:>10.6f}  "
                       f"{vsw:>13.6f}  {opt.param_groups[0]['lr']:>9.2e}"
-                      f"  {tr_gnorm:>8.2f}  {epoch_s:>6.1f}{flag}")
+                      f"  {tr_gnorm:>8.3f}  {upd:>8.3f}  {epoch_s:>6.1f}{flag}")
+
+            metrics.write({
+                "epoch": epoch, "train": tr_loss, "val": va_loss,
+                "val_post_switch": vsw, "lr": opt.param_groups[0]["lr"],
+                "grad_norm": tr_gnorm, "update_norm": upd,
+                "spike_penalty": tr_floor, "sec": epoch_s,
+                "best": int(flag.strip() == "*"),
+                **{f"grad_{b}": gblk[b] for b in sorted(blocks)},
+            })
+
+            # Per-block gradient breakdown, on the diagnostic cadence so the
+            # main table stays scannable. The fraction is what to read: a block
+            # at ~0% is not learning, which the total |grad| cannot show.
+            if epoch % args.timing_log_every == 0 or epoch == 1:
+                tot = sum(gblk.values()) or 1.0
+                print("      grad by block: " + "   ".join(
+                    f"{b}={gblk[b]:.3g} ({100*gblk[b]/tot:.0f}%)"
+                    for b in sorted(blocks, key=lambda k: -gblk[k])))
 
             # Timing layer: cheap (timing units only, batch 1) but it prints
             # n_gaits lines, so it runs on its own slower cadence.
@@ -2375,14 +2511,15 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
         # so an aborted run still produces deployable artifacts.
         done = len(hist["train"])
         print()
-        print("  " + "-" * 78)
+        print("  " + "-" * 88)
         print(f"  [INTERRUPT] Ctrl+C received during epoch {done + 1}.")
         print(f"              {done} epoch(s) completed and recorded; the "
               f"partial epoch is discarded.")
         print(f"              Best val MSE so far : {best:.6f}")
         print( "              Stopping training and proceeding to export.")
 
-    print("  " + "-" * 78)
+    metrics.close()
+    print("  " + "-" * 88)
     if hist["sec"]:
         tot = sum(hist["sec"])
         print(f"  {len(hist['sec'])} epoch(s) in {tot:.1f}s  "
@@ -3269,7 +3406,7 @@ def main():
     # Defined for both branches so the config can always report them.
     best          = float("nan")
     hist          = {"train": [], "val": [], "val_sw": [],
-                     "gnorm": [], "sec": []}
+                     "gnorm": [], "sec": [], "floor": [], "upd": []}
     final_lr      = float(args.lr)
     timing_stats  = []
 
