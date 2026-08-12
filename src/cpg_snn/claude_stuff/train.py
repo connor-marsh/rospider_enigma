@@ -2287,6 +2287,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
     blocks = grad_blocks(model)
     for b in blocks:
         hist[f"g_{b}"] = []
+        hist[f"u_{b}"] = []
     n_par = sum(p.numel() for p in model.parameters())
     exp_upd = args.lr * math.sqrt(n_par) * math.sqrt(args.chunks_per_epoch)
     metrics = MetricsWriter(out_dir / "metrics.csv")
@@ -2296,6 +2297,11 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
           f"expectation at lr={args.lr:g} is ~{exp_upd:.2f}")
     print(f"  (Adam's step is scale-invariant in the gradient, so |upd| -- not "
           f"|grad| -- is what says whether the model is moving.)")
+    print(f"  u/g per block is the diagnostic: Adam normalises PER PARAMETER, so")
+    print(f"  a block moves at ~lr per weight no matter how small its gradient.")
+    print(f"  u/g >> 1 means a block is moving far more than its share of the")
+    print(f"  signal warrants -- i.e. random-walking on noise, which perturbs")
+    print(f"  the representation the downstream layers are trying to use.")
 
     # Spike statistics are only meaningful for the arch with a timing layer.
     use_stats = (spike_obj is not None and spike_obj.enabled
@@ -2327,8 +2333,11 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             # epoch.  Read before the timing report below, so an occasional
             # diagnostic epoch does not show up as a spike in this column.
             t_epoch = time.perf_counter()
-            theta0 = torch.cat([p.detach().reshape(-1)
-                                for p in model.parameters()]).clone()
+            # Per-block snapshot (one full copy of the params, same cost as
+            # the old single flat concat) so the update norm can be attributed
+            # per block rather than only reported in aggregate.
+            theta0 = {b: [p.detach().clone() for p in plist]
+                      for b, plist in blocks.items()}
             bacc = {b: torch.zeros((), device=device) for b in blocks}
 
             # ---- train -------------------------------------------------
@@ -2441,13 +2450,20 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             hist["floor"].append(tr_floor)
 
             with torch.no_grad():
-                theta1 = torch.cat([p.detach().reshape(-1)
-                                    for p in model.parameters()])
-                upd = float(torch.linalg.vector_norm(theta1 - theta0))
+                ublk = {}
+                for b, plist in blocks.items():
+                    ublk[b] = float(torch.linalg.vector_norm(torch.stack([
+                        torch.linalg.vector_norm(p.detach() - p0)
+                        for p, p0 in zip(plist, theta0[b])])))
+            # grad_blocks partitions every trainable parameter into exactly one
+            # block, so the Euclidean total over blocks IS the full update norm
+            # -- no separate whole-model pass needed.
+            upd = math.sqrt(sum(v * v for v in ublk.values()))
             hist["upd"].append(upd)
             gblk = {b: float(bacc[b]) / max(nb, 1) for b in blocks}
             for b in blocks:
                 hist[f"g_{b}"].append(gblk[b])
+                hist[f"u_{b}"].append(ublk[b])
 
             flag = ""
             if va_loss < best:
@@ -2467,16 +2483,24 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 "spike_penalty": tr_floor, "sec": epoch_s,
                 "best": int(flag.strip() == "*"),
                 **{f"grad_{b}": gblk[b] for b in sorted(blocks)},
+                **{f"upd_{b}": ublk[b] for b in sorted(blocks)},
             })
 
-            # Per-block gradient breakdown, on the diagnostic cadence so the
-            # main table stays scannable. The fraction is what to read: a block
-            # at ~0% is not learning, which the total |grad| cannot show.
+            # Per-block breakdown, on the diagnostic cadence so the main
+            # table stays scannable.  Read u/g: a block with 1% of the gradient
+            # and 60% of the movement is diffusing, not learning.
             if epoch % args.timing_log_every == 0 or epoch == 1:
-                tot = sum(gblk.values()) or 1.0
-                print("      grad by block: " + "   ".join(
-                    f"{b}={gblk[b]:.3g} ({100*gblk[b]/tot:.0f}%)"
-                    for b in sorted(blocks, key=lambda k: -gblk[k])))
+                gtot = sum(gblk.values()) or 1.0
+                utot = sum(ublk.values()) or 1.0
+                print(f"      {'block':<10}{'|grad|':>11}{'g%':>7}"
+                      f"{'|upd|':>10}{'u%':>7}{'u/g':>8}{'upd/param':>11}")
+                for b in sorted(blocks, key=lambda k: -ublk[k]):
+                    gs, us = 100*gblk[b]/gtot, 100*ublk[b]/utot
+                    npar = sum(p.numel() for p in blocks[b])
+                    print(f"      {b:<10}{gblk[b]:>11.3g}{gs:>6.1f}%"
+                          f"{ublk[b]:>10.4g}{us:>6.1f}%"
+                          f"{(us/gs if gs > 1e-9 else float('inf')):>8.1f}"
+                          f"{ublk[b]/math.sqrt(max(npar,1)):>11.2e}")
 
             # Timing layer: cheap (timing units only, batch 1) but it prints
             # n_gaits lines, so it runs on its own slower cadence.
