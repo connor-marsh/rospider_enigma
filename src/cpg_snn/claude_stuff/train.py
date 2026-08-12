@@ -600,6 +600,19 @@ HEXAPOD_GAIT_FILES = [
 GAIT_FILES_BY_N = {4: QUADRUPED_GAIT_FILES, 6: HEXAPOD_GAIT_FILES}
 
 
+def outputs_path(this_file_dir, rel=""):
+    """
+    this_file_dir/outputs[/rel].
+
+    Used for --out_dir (train.py, visualize.py) and --model_dir
+    (visualize.py) so a bare name like "test1" always lands at
+    outputs/test1 instead of needing the "outputs/" prefix typed out every
+    time.  rel="" (the default for all three args) resolves to
+    this_file_dir/outputs itself, unchanged from the old default.
+    """
+    return Path(this_file_dir, "outputs", rel) if rel else Path(this_file_dir, "outputs")
+
+
 def load_gait_tables(names, gaits_dir):
     """
     Load one CSV per name from gaits_dir/{name}.csv.  Identical loader to
@@ -2893,7 +2906,10 @@ def main():
                          "negligible (timing units only, batch 1).")
     ap.add_argument("--dry_run",   action="store_true",
                     help="Build data + diagnostics, skip training.")
-    ap.add_argument("--out_dir",   type=str, default="outputs")
+    ap.add_argument("--out_dir",   type=str, default="",
+                    help="Resolved as outputs/<out_dir> — e.g. --out_dir "
+                         "test1 writes to outputs/test1. Default '' means "
+                         "outputs/ itself.")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -2901,7 +2917,7 @@ def main():
     rng = np.random.default_rng(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     this_file_dir = os.path.dirname(os.path.abspath(__file__))
-    out_dir = Path(this_file_dir + "/" + args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = outputs_path(this_file_dir, args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device : {device}\nOutput : {out_dir.resolve()}")
     print(f"Arch   : {args.arch}\n")
 

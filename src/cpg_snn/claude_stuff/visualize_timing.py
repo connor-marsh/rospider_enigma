@@ -73,7 +73,7 @@ from train import (
     LIFCPGStepper, cpg_weight_matrix,
     detect_burst_threshold, burst_onsets,
     upsample_gait_tables, build_group_cols,
-    load_gait_tables, GAIT_FILES_BY_N,
+    load_gait_tables, GAIT_FILES_BY_N, outputs_path,
     N_LEGS, N_JOINTS, CPG_PALETTE, CPG_FROM_FB_WEIGHT,
 )
 
@@ -138,18 +138,31 @@ def build_model_from_cfg(cfg, device):
         # A config from the (reverted) shared-router era has router_hidden
         # set and a checkpoint containing w_r/w_t, neither of which exists in
         # this class any more -- load_run's strict=False report will flag it.
+        #
+        # readout_hidden / tau_readout_max fall back to what was ACTUALLY
+        # true before those became separate options, not to their current
+        # smarter defaults: readout_hidden didn't exist yet, and the readout
+        # membrane was simply Hg wide (see the "Ho == Hg (the original)"
+        # comment in TimingGroupedSNN.__init__), so its fallback here is
+        # "hidden", not 32. tau_readout_max was hardcoded 40.0 (see the
+        # module's own note on this in --tau_readout_max's help text), not
+        # period/(2*pi) -- that derivation is newer than the option.
+        # timing_slope similarly falls back to "slope": the constructor's own
+        # timing_slope=None branch does exactly this, so a config predating
+        # the separate --timing_slope arg had the timing layer using --slope.
+        _hidden = int(cfg_get(cfg, "hidden", 256))
         model = TimingGroupedSNN(
-            hidden_per_group = int(cfg_get(cfg, "hidden", 256)),
+            hidden_per_group = _hidden,
             n_timing         = n_timing,
             group_cols       = group_cols,
             tau_timing_min   = float(cfg_get(cfg, "tau_timing_min", 2.0)),
             tau_timing_max   = float(cfg_get(cfg, "tau_timing_max",
                                                _P / _n_cpg)),
-            readout_hidden   = int(cfg_get(cfg, "readout_hidden", 32)),
-            tau_readout_max  = float(cfg_get(cfg, "tau_readout_max",
-                                               _P / (2.0 * math.pi))),
-            timing_slope     = float(cfg_get(cfg, "timing_slope", 5.0)),
-            timing_reset     = str(cfg_get(cfg, "timing_reset", "zero")),
+            readout_hidden   = int(cfg_get(cfg, "readout_hidden", _hidden)),
+            tau_readout_max  = float(cfg_get(cfg, "tau_readout_max", 40.0)),
+            timing_slope     = float(cfg_get(cfg, "timing_slope",
+                                               cfg_get(cfg, "slope", 25.0))),
+            timing_reset     = str(cfg_get(cfg, "timing_reset", "subtract")),
             sub_film         = str(cfg_get(cfg, "sub_film", "both")),
             event_gated      = bool(cfg_get(cfg, "event_gated", False)),
             timing_w_scale   = float(cfg_get(cfg, "timing_w_scale", 0.5)),
@@ -743,9 +756,12 @@ def plot_taus(model, period, cfg, out_dir, dpi):
     tmax = float(cfg_get(cfg, "tau_max", 256.0))
     series += [("hidden 1", tau(model.beta1_logit), tmin, tmax),
                ("hidden 2", tau(model.beta2_logit), tmin, tmax),
+               # 40.0 (not period-derived) matches build_model_from_cfg's
+               # fallback: that was the literal hardcoded value before this
+               # became a derived option, so it's the right thing to draw as
+               # the init-range marker for a config that predates it.
                ("readout",  tau(model.betao_logit), 2.0,
-                float(cfg_get(cfg, "tau_readout_max",
-                              period / (2.0 * math.pi))))]
+                float(cfg_get(cfg, "tau_readout_max", 40.0)))]
 
     fig, axes = plt.subplots(1, len(series), figsize=(3.5 * len(series), 3.4))
     if len(series) == 1:
@@ -826,17 +842,19 @@ def plot_membranes(mems, state_names, gait_name, out_dir, dpi,
 def main():
     ap = argparse.ArgumentParser(
         description="Visualise the timing layer of a trained CPG-SNN run.")
-    ap.add_argument("--model_dir", type=str, default="outputs",
-                    help="Directory holding the checkpoint and config.")
+    ap.add_argument("--model_dir", type=str, default="",
+                    help="Directory holding the checkpoint and config, "
+                         "resolved as outputs/<model_dir> — e.g. --model_dir "
+                         "test1 reads from outputs/test1. Default '' means "
+                         "outputs/ itself.")
     ap.add_argument("--ckpt",      type=str, default="best_model.pt")
     ap.add_argument("--cfg",       type=str, default="cpg_lif_snn_config.json")
     ap.add_argument("--out_dir",   type=str, default=None,
-                    help="Where plots and timing_summary.json are written. "
-                         "Default None = <model_dir>/visualize, so nothing "
-                         "needs to change between runs besides --model_dir. "
-                         "Resolved relative to this_file_dir only if given "
-                         "explicitly as a relative path; the default is "
-                         "always relative to the resolved model_dir instead.")
+                    help="Where plots and timing_summary.json are written, "
+                         "resolved as outputs/<out_dir> (same rule as "
+                         "--model_dir). Default None = <model_dir>/visualize, "
+                         "so nothing needs to change between runs besides "
+                         "--model_dir.")
     ap.add_argument("--gaits_dir", type=str, default="../gaits",
                     help="Folder of {name}.csv gait tables, resolved as "
                          "this_file_dir/<gaits_dir> — same default as "
@@ -864,9 +882,9 @@ def main():
     np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     this_file_dir = os.path.dirname(os.path.abspath(__file__))
-    model_dir = Path(this_file_dir + "/" + args.model_dir)
+    model_dir = outputs_path(this_file_dir, args.model_dir)
     out_dir   = (model_dir / "visualize" if args.out_dir is None
-                else Path(this_file_dir + "/" + args.out_dir))
+                else outputs_path(this_file_dir, args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device : {device}\nModel  : {model_dir}\nOutput : "
           f"{out_dir.resolve()}\n")
