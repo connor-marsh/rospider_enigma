@@ -66,4 +66,4 @@ src/cpg_snn/outputs
 
 !src/cpg_snn/saved_models
 
-src/cpg_snn/claude_stuff/outputs
+src/cpg_snn/*/outputs
