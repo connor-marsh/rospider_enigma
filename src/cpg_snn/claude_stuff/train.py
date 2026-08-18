@@ -419,6 +419,12 @@ class LIFCPGStepper:
                 f"CPG weight matrix is {self.W.shape}, expected "
                 f"({self.N}, {self.N}).")
         self.i_app = float(i_app)
+        # Stored so fake_step_chunk (below) can reuse the exact constants
+        # that configure self.core, instead of redeclaring its own copy of
+        # every default.
+        self.refrac_main  = int(refrac_main)
+        self.vth_fb       = float(vth_fb)
+        self.to_fb_weight = float(to_fb_weight)
         self.core  = BurstingLIF(N, vth_main, du_main, dv_main, refrac_main,
                                  vth_fb, du_fb, dv_fb, refrac_fb,
                                  from_fb_weight, to_fb_weight)
@@ -437,13 +443,36 @@ class LIFCPGStepper:
             out[k] = self.step()
         return out
 
+    def fake_step_chunk(self, n_steps):
+        """
+        Synthetic stand-in for step_chunk: N evenly-spaced, BACK-TO-BACK
+        bursts per cycle -- no inter-burst gap -- instead of the real CPG's
+        bursts separated by silence.
+
+        Temporary.  For testing whether training benefits from a
+        continuous-activity CPG ahead of the real oscillator being retuned to
+        produce this directly (see architecture_change_todo.md). Uses the
+        same refrac_main / vth_fb / to_fb_weight this instance's self.core
+        was actually built with, so the burst width matches step_chunk's even
+        though the gap between bursts does not.
+        """
+        n_spikes = int((self.vth_fb // self.to_fb_weight)
+                       * (self.refrac_main + 1))
+        period = n_spikes * self.N
+        pattern = np.zeros((self.N, n_steps), dtype=np.float32)
+        for i in range(self.N):
+            start = i * n_spikes
+            for t in range(start, n_steps, period):
+                pattern[i, t:t + n_spikes:self.refrac_main + 1] = 1.0
+        return pattern.T
+
     def reset(self):
         self.core.reset()
         self.inter_neuron_current.fill(0.0)
         self.t = 0
 
 
-def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0):
+def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False):
     """Warm up, then collect the spike train used for training.
 
     `N` is deliberately positional-with-no-default: it selects the coupling
@@ -453,13 +482,19 @@ def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0):
     from_fb_weight is not a parameter here: it is fixed at
     CPG_FROM_FB_WEIGHT (see LIFCPGStepper) for every N, so there is nothing
     for a caller to get wrong by omission.
+
+    fake_cpg=True substitutes fake_step_chunk's back-to-back, no-gap bursts
+    for the real oscillator's output -- see that method's docstring.
     """
     cpg = LIFCPGStepper(N=N, i_app=i_app)
     print(f"  N={N}  i_app={i_app}  from_fb_weight={CPG_FROM_FB_WEIGHT:g}")
+    if fake_cpg:
+        print(f"  FAKE CPG: back-to-back bursts, no inter-burst gap "
+              f"(see fake_step_chunk)")
     print(f"  Warming up CPG ({warmup} steps) ...")
     cpg.step_chunk(warmup)
     print(f"  Collecting {tmax} steps ...")
-    spikes = cpg.step_chunk(tmax)
+    spikes = cpg.fake_step_chunk(tmax) if fake_cpg else cpg.step_chunk(tmax)
 
     counts = spikes.sum(0).astype(int)
     print(f"  Spikes per neuron : {counts.tolist()}")
@@ -2793,6 +2828,13 @@ def main():
                          "randomised by StreamSampler independently of this.")
     ap.add_argument("--warmup", type=int,   default=2_000)
     ap.add_argument("--i_app",  type=float, default=8.0)
+    ap.add_argument("--fake_cpg", type=int, default=1,
+                    help="1 = substitute LIFCPGStepper.fake_step_chunk's "
+                         "back-to-back, no-inter-burst-gap spike pattern for "
+                         "the real oscillator. Temporary, for testing whether "
+                         "training benefits from a continuous-activity CPG "
+                         "ahead of the real one being retuned to produce this "
+                         "directly.")
     ap.add_argument("--n_cpg_neurons", type=int, default=4,
                     choices=sorted(CPG_W_BY_N),
                     help="CPG size. Selects the coupling matrix from "
@@ -3188,7 +3230,7 @@ def main():
     # ── 1. CPG ──────────────────────────────────────────────────
     print("\n[1/6] Bursting-LIF CPG ...")
     spikes = run_cpg(N=args.n_cpg_neurons, tmax=args.tmax, warmup=args.warmup,
-                     i_app=args.i_app)
+                     i_app=args.i_app, fake_cpg=bool(args.fake_cpg))
 
     print("\n[2/6] Burst structure & phase ...")
     onsets, period, neuron_offsets, burst_thresholds = analyse_cpg(spikes, out_dir)
@@ -3530,6 +3572,7 @@ def main():
         "n_legs":           int(n_legs),
         "n_joints":         int(n_joints),
         "n_cpg_neurons":    int(args.n_cpg_neurons),
+        "fake_cpg":         bool(args.fake_cpg),
         "n_timing":         (int(args.n_timing)
                              if args.arch == "timing_grouped" else None),
         "readout_hidden":   (int(args.readout_hidden)
