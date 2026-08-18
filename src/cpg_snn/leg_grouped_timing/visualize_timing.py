@@ -219,6 +219,11 @@ def replay_cpg(cfg, n_steps):
     Every parameter comes out of cfg["cpg"], including the weight matrix, so
     this is reproducible even if train.py's defaults change later.  The warm-up
     is replayed too: burst phase depends on it.
+
+    cfg["fake_cpg"] selects fake_step_chunk's back-to-back no-gap bursts, so a
+    model trained on the synthetic pattern is visualised against that same
+    pattern rather than the real oscillator.  Defaults to False for configs
+    written before that option existed.
     """
     c = dict(cfg.get("cpg", {}))
     N = int(c.get("N") or cfg_get(cfg, "n_cpg_neurons", 4))
@@ -238,12 +243,14 @@ def replay_cpg(cfg, n_steps):
         from_fb_weight = float(c.get("from_fb_weight", CPG_FROM_FB_WEIGHT)),
         to_fb_weight   = float(c.get("to_fb_weight", 10.0)))
 
+    fake = bool(cfg_get(cfg, "fake_cpg", False))
     warmup = int(c.get("warmup", 2000))
     cpg.step_chunk(warmup)
-    spikes = cpg.step_chunk(n_steps)
+    spikes = cpg.fake_step_chunk(n_steps) if fake else cpg.step_chunk(n_steps)
 
     counts = spikes.sum(0).astype(int)
-    print(f"  CPG replayed: N={N}  warmup={warmup}  steps={n_steps}  "
+    print(f"  CPG replayed: N={N}  warmup={warmup}  steps={n_steps}"
+          f"{'  FAKE (back-to-back bursts)' if fake else ''}  "
           f"spikes/neuron={counts.tolist()}")
     if counts.min() == 0:
         print("  WARNING: a CPG neuron never fired during the replay window.")
