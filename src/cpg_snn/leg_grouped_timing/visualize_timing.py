@@ -164,7 +164,12 @@ def build_model_from_cfg(cfg, device):
                                                cfg_get(cfg, "slope", 25.0))),
             timing_reset     = str(cfg_get(cfg, "timing_reset", "subtract")),
             sub_film         = str(cfg_get(cfg, "sub_film", "both")),
-            event_gated      = bool(cfg_get(cfg, "event_gated", False)),
+            # gate_mode replaced the old boolean event_gated. Map the old
+            # key when only it is present: True was the "decay" behaviour
+            # (membranes leak every step), and absent entirely means ungated.
+            gate_mode        = str(cfg_get(
+                cfg, "gate_mode",
+                "decay" if cfg_get(cfg, "event_gated", False) else "none")),
             # sub_ln changes FORWARD BEHAVIOUR, not shapes, so a wrong value
             # loads cleanly and then quietly computes something else.
             sub_ln           = str(cfg_get(cfg, "sub_ln", "l2")),
@@ -236,7 +241,7 @@ def replay_cpg(cfg, n_steps):
         du_main        = float(c.get("du_main", 0.1)),
         dv_main        = float(c.get("dv_main", 0.3)),
         refrac_main    = int(c.get("refrac_main", 1)),
-        vth_fb         = float(c.get("vth_fb", 100.0)),
+        vth_fb         = 200,#float(c.get("vth_fb", 100.0)),
         du_fb          = float(c.get("du_fb", 1.0)),
         dv_fb          = float(c.get("dv_fb", 0.0)),
         refrac_fb      = int(c.get("refrac_fb", 1)),
@@ -815,7 +820,7 @@ def plot_membranes(mems, state_names, gait_name, out_dir, dpi,
     # covered by the exact rasters elsewhere. This plot is about the
     # sub-networks, whose spikes are NOT recoverable (see module docstring).
     rows = [(k, nm) for k, nm in enumerate(state_names)
-            if nm != "mem_timing"]
+            if nm not in ("mem_timing", "since_upd")]
     fig, axes = plt.subplots(len(rows), 1, figsize=(14, 2.4 * len(rows)),
                              sharex=True, squeeze=False)
     axes = axes[:, 0]
