@@ -162,6 +162,7 @@ from scipy.interpolate import interp1d
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 torch.set_float32_matmul_precision('high')
 
 import matplotlib
@@ -486,7 +487,7 @@ def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False):
     fake_cpg=True substitutes fake_step_chunk's back-to-back, no-gap bursts
     for the real oscillator's output -- see that method's docstring.
     """
-    cpg = LIFCPGStepper(N=N, i_app=i_app)
+    cpg = LIFCPGStepper(N=N, i_app=i_app, vth_fb=200)
     print(f"  N={N}  i_app={i_app}  from_fb_weight={CPG_FROM_FB_WEIGHT:g}")
     if fake_cpg:
         print(f"  FAKE CPG: back-to-back bursts, no inter-burst gap "
@@ -1282,15 +1283,18 @@ class TimingGroupedSNN(nn.Module):
     parameter tied ACROSS groups, which breaks "fully disconnected".  FiLM
     follows and supplies per-group per-gait affine anyway.
 
-    State (4 tensors, mixed rank):
+    State (5 tensors, mixed rank):
         mem_timing (B, n_timing)
+        since_upd  (B, n_timing)   timesteps since each sub-net last advanced
         mem1, mem2 (B, G, Hg)
         memo       (B, G, H_o)   -- narrower; see the readout note in __init__
     """
 
     arch = "timing_grouped"
-    state_names_in  = ("mem_timing_in",  "mem1_in",  "mem2_in",  "memo_in")
-    state_names_out = ("mem_timing_out", "mem1_out", "mem2_out", "memo_out")
+    state_names_in  = ("mem_timing_in", "since_upd_in",
+                       "mem1_in",  "mem2_in",  "memo_in")
+    state_names_out = ("mem_timing_out", "since_upd_out",
+                       "mem1_out", "mem2_out", "memo_out")
 
     def __init__(self, hidden_per_group=128, n_gaits=4, max_gaits=16,
                  n_neurons=4, n_timing=N_LEGS, group_cols=None,
@@ -1299,7 +1303,7 @@ class TimingGroupedSNN(nn.Module):
                  tau_timing_min=2.0, tau_timing_max=64.0,
                  tau_readout_max=40.0,
                  sub_ln="l2", sub_film="both",
-                 timing_reset="zero", event_gated=True,
+                 timing_reset="zero", gate_mode="freeze",
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
         if n_gaits > max_gaits:
@@ -1350,7 +1354,10 @@ class TimingGroupedSNN(nn.Module):
         self.sub_ln     = sub_ln
         self.sub_film   = sub_film
         self.timing_reset = timing_reset
-        self.event_gated  = bool(event_gated)
+        if gate_mode not in ("none", "decay", "freeze"):
+            raise ValueError(f"gate_mode must be none|decay|freeze, got "
+                             f"{gate_mode!r}")
+        self.gate_mode = gate_mode
         self.group_cols = group_cols
         self.H          = Hg          # alias for generic callers
 
@@ -1447,8 +1454,13 @@ class TimingGroupedSNN(nn.Module):
     def init_state(self, batch, device, dtype=torch.float32):
         z = lambda w: torch.zeros(batch, self.G, w, device=device, dtype=dtype)
         mem_t = torch.zeros(batch, self.G, device=device, dtype=dtype)
+        # since_upd: timesteps elapsed since each sub-network last advanced.
+        # Only used by gate_mode="freeze", but always present so the state
+        # shape and the ONNX signature do not depend on the mode.  Zero means
+        # "no elapsed time", so the first update applies no decay.
+        since = torch.zeros(batch, self.G, device=device, dtype=dtype)
         # memo is Ho wide, not Hg (see the readout comment in __init__).
-        return (mem_t, z(self.Hg), z(self.Hg), z(self.Ho))
+        return (mem_t, since, z(self.Hg), z(self.Hg), z(self.Ho))
 
     # ---------------------------------------------------------------
     def _timing(self, x, gait, mem_t):
@@ -1484,7 +1496,7 @@ class TimingGroupedSNN(nn.Module):
         """
         x     : (B, n_neurons) float — CPG spikes this timestep
         gait  : (B,) int64
-        state : (mem_timing, mem1, mem2, memo)
+        state : (mem_timing, since_upd, mem1, mem2, memo)
 
         Returns (y, state, aux) where aux = (spk_timing,).
         `aux` exists so the spike-statistics penalty can see the spikes without
@@ -1492,38 +1504,65 @@ class TimingGroupedSNN(nn.Module):
         since spk_timing already feeds `y` it is in the graph regardless.  Kept
         as a 1-tuple so callers iterate over it uniformly.
         """
-        mem_t, mem1, mem2, memo = state
+        mem_t, since, mem1, mem2, memo = state
         G, Hg = self.G, self.Hg
 
         spk_t, mem_t = self._timing(x, gait, mem_t)          # (B, G)
 
         # ---- event gate -------------------------------------------
-        # With event_gated, sub-network g advances ONLY on steps where its
-        # timing neuron fired.  Membranes still decay every step (that is
-        # deliberate -- it is what makes the OUTPUT change between spikes and
-        # therefore what makes spike PLACEMENT matter to the task loss), but
-        # no current is injected and no sub-network spike is emitted.
+        # gate_mode:
+        #   "none"   ungated. Biases flow every step, sub-net spikes fire
+        #            freely, membranes decay every step. The task loss is then
+        #            EXACTLY invariant to the timing layer's burst phase (a
+        #            sub-net whose taus span a cycle has a complete
+        #            "time since burst" basis, so any shift is absorbed by
+        #            relearning the waveform offset).
+        #   "decay"  input gated (bias included), sub-net spikes gated, but
+        #            membranes still leak every step. Output relaxes toward
+        #            b_out between spikes, so a weighted sum of Ho decaying
+        #            exponentials can still reconstruct most of the waveform
+        #            from ONE injection -- measured ~183 steps of usable coast.
+        #            That is why spike placement mattered only weakly.
+        #   "freeze" nothing moves without a spike. On a silent step the
+        #            sub-network is bit-for-bit unchanged and the output is
+        #            HELD. On a spiking step the accumulated leak is applied
+        #            as beta**since_upd, then current is injected.
         #
-        # Why this is the point rather than an efficiency tweak: without it,
-        # the task loss is EXACTLY invariant to the timing layer's burst
-        # phase.  A sub-network whose taus span a cycle has a complete
-        # "time since burst" basis, so shifting the burst by any amount is
-        # absorbed by relearning the waveform offset.  Gating removes that
-        # freedom -- the output genuinely cannot track the target between
-        # spikes -- so alignment becomes something the loss can see.
+        # Why beta**since_upd rather than just skipping the decay: it makes the
+        # state AT EACH UPDATE exactly equal to what per-step decay would have
+        # produced, so the internal dynamics are unchanged and this is a pure
+        # zero-order hold on the OUTPUT, not a different model. It is also the
+        # form that allows genuinely sparse updates at deployment.
+        #
+        # This only became viable once fake_cpg removed the inter-burst gaps:
+        # with the real CPG's long silences, a frozen sub-network would hold a
+        # stale output across a third of the cycle.
         #
         # NOTE the gate multiplies both `cur` and `spk` on each layer, so
-        # gradient reaching spk_t through those paths is scaled up.  Forward
-        # is exact (gate is 0/1, so gate*gate == gate).  Left uncorrected: it
-        # is a scale factor rather than a bug, and a stronger gradient into
-        # the timing layer is desirable here, not a problem.
-        gate = spk_t.unsqueeze(-1) if self.event_gated else None
+        # gradient reaching spk_t through those paths is scaled up. Forward is
+        # exact (gate is 0/1, so gate*gate == gate). Left uncorrected: it is a
+        # scale factor, and stronger gradient into the timing layer is wanted.
+        gated  = self.gate_mode != "none"
+        freeze = self.gate_mode == "freeze"
+        gate = spk_t.unsqueeze(-1) if gated else None
+        if freeze:
+            # Detached: since_upd is a counter, not a differentiable path, and
+            # the hard 0/1 spike is what determines whether an update happened.
+            g_hard = gate.detach()
+            dt = since.unsqueeze(-1).detach()                  # (B, G, 1)
+            dec1 = torch.exp(F.logsigmoid(self.beta1_logit) * dt)
+            dec2 = torch.exp(F.logsigmoid(self.beta2_logit) * dt)
+            deco = torch.exp(F.logsigmoid(self.betao_logit) * dt)
+        else:
+            dec1 = torch.sigmoid(self.beta1_logit)
+            dec2 = torch.sigmoid(self.beta2_logit)
+            deco = torch.sigmoid(self.betao_logit)
 
         # ---- sub-net layer 1 ---------------------------------------
-        # w1 and b1 are now redundant (only their sum enters) because the
-        # gate has replaced the spk_t multiplication that used to separate
-        # them.  Both kept so checkpoint shapes are unchanged.
-        if self.event_gated:
+        # w1 and b1 are redundant when gated (only their sum enters) because
+        # the gate replaced the spk_t multiplication that used to separate
+        # them. Both kept so checkpoint shapes are unchanged.
+        if gated:
             cur1 = self.w1 + self.b1                          # (G, Hg)
         else:
             cur1 = spk_t.unsqueeze(-1) * self.w1 + self.b1    # (B, G, Hg)
@@ -1532,13 +1571,14 @@ class TimingGroupedSNN(nn.Module):
         if self.sub_film in ("l1", "both"):
             v1 = self.film1(gait).view(-1, 2, G, Hg)
             cur1 = cur1 * v1[:, 0] + v1[:, 1]
-        if gate is not None:
+        if gated:
             cur1 = gate * cur1
-        mem1  = torch.sigmoid(self.beta1_logit) * mem1 + cur1
-        spk1  = spike_fn(mem1 - self.thresh, self.slope)
-        if gate is not None:
+        new1 = dec1 * mem1 + cur1
+        mem1 = torch.lerp(mem1, new1, g_hard) if freeze else new1
+        spk1 = spike_fn(mem1 - self.thresh, self.slope)
+        if gated:
             spk1 = gate * spk1
-        mem1  = mem1 - self.thresh * spk1
+        mem1 = mem1 - self.thresh * spk1
 
         # ---- sub-net layer 2: block diagonal ------------------------
         cur2 = torch.einsum("bgh,ghk->bgk", spk1, self.w2) + self.b2
@@ -1547,27 +1587,32 @@ class TimingGroupedSNN(nn.Module):
         if self.sub_film in ("l2", "both"):
             v2 = self.film2(gait).view(-1, 2, G, Hg)
             cur2 = cur2 * v2[:, 0] + v2[:, 1]
-        if gate is not None:
+        if gated:
             cur2 = gate * cur2
-        mem2  = torch.sigmoid(self.beta2_logit) * mem2 + cur2
-        spk2  = spike_fn(mem2 - self.thresh, self.slope)
-        if gate is not None:
+        new2 = dec2 * mem2 + cur2
+        mem2 = torch.lerp(mem2, new2, g_hard) if freeze else new2
+        spk2 = spike_fn(mem2 - self.thresh, self.slope)
+        if gated:
             spk2 = gate * spk2
-        mem2  = mem2 - self.thresh * spk2
+        mem2 = mem2 - self.thresh * spk2
 
         # ---- block-diagonal analog readout -------------------------
-        # memo is NOT gated on the decay side: it leaks every timestep, so
-        # between timing spikes the output relaxes toward b_out.  That decay
-        # is the mechanism that penalises spikes placed where the waveform
-        # does not need them.
-        curo  = torch.einsum("bgh,ghk->bgk", spk2, self.w_read) + self.b_read
-        if gate is not None:
+        curo = torch.einsum("bgh,ghk->bgk", spk2, self.w_read) + self.b_read
+        if gated:
             curo = gate * curo
-        memo  = torch.sigmoid(self.betao_logit) * memo + curo
+        newo = deco * memo + curo
+        memo = torch.lerp(memo, newo, g_hard) if freeze else newo
+
+        # since_upd: 0 at an update, else +1.  (1 - gate)*since + 1 gives
+        # exactly "timesteps elapsed since the last update" at the next update:
+        # update at t leaves 1, each silent step adds 1, so an update at t+k
+        # reads k.  Detached, integer-valued in practice.
+        if freeze:
+            since = (1.0 - g_hard.squeeze(-1)) * since + 1.0
 
         y_grp = torch.einsum("bgh,ghc->bgc", memo, self.w_out) + self.b_out
         y     = y_grp.flatten(1).index_select(1, self.out_perm)
-        return y, (mem_t, mem1, mem2, memo), (spk_t,)
+        return y, (mem_t, since, mem1, mem2, memo), (spk_t,)
 
     def forward(self, x_seq, gait_seq, state=None, return_aux=False):
         """
@@ -1642,7 +1687,7 @@ class SingleStepONNX(nn.Module):
 
 class SingleStepONNXTiming(nn.Module):
     """
-    As SingleStepONNX but for TimingGroupedSNN's 4-tensor state.
+    As SingleStepONNX but for TimingGroupedSNN's 5-tensor state.
 
     Written as an explicit signature rather than *state: torch.onnx.export
     traces varargs unreliably, and the input names have to line up
@@ -1653,10 +1698,10 @@ class SingleStepONNXTiming(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, spikes, gait, mem_timing, mem1, mem2, memo):
-        y, (mt, m1, m2, mo), _ = self.model.step(
-            spikes, gait, (mem_timing, mem1, mem2, memo))
-        return y, mt, m1, m2, mo
+    def forward(self, spikes, gait, mem_timing, since_upd, mem1, mem2, memo):
+        y, (mt, su, m1, m2, mo), _ = self.model.step(
+            spikes, gait, (mem_timing, since_upd, mem1, mem2, memo))
+        return y, mt, su, m1, m2, mo
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1931,7 +1976,7 @@ class CPGMatchSpikeObjective(SpikeObjective):
     spikes smeared uniformly.  Correct for gaits where each leg swings once
     per cycle; wrong for a genuinely two-burst gait.
 
-    NOT COMPATIBLE with event_gated sub-networks: this objective wants every
+    NOT COMPATIBLE with gated sub-networks: this objective wants every
     spike at one phase, whereas a gated sub-network needs spikes wherever its
     output must change.  Kept because it is the objective that produced the
     CPG-matched bursts, and because the comparison is worth being able to
@@ -1969,7 +2014,7 @@ class MinCountSpikeObjective(SpikeObjective):
     Spend as few spikes as possible.  Pay a flat cost per spike and let the
     TASK loss decide where they are worth spending.
 
-    Only meaningful with event_gated sub-networks, and then it is the whole
+    Only meaningful with gated sub-networks, and then it is the whole
     idea: a gated sub-network's output can only change on a timing spike, so
     the task loss already forces spikes wherever the waveform must move.
     Adding a uniform per-spike cost on top means the cheapest solution is to
@@ -2983,7 +3028,7 @@ def main():
                          "layer's spike train. "
                          "'min_count' (default): pay a flat L1 cost per spike "
                          "and let the TASK loss decide where spikes are worth "
-                         "spending — with --event_gated this yields an "
+                         "spending — with --gate_mode decay/freeze this yields an "
                          "adaptive sampling clock (dense through swing, sparse "
                          "through stance) with no supervision. "
                          "'cpg_match': match the CPG's spikes-per-cycle and "
@@ -3008,7 +3053,7 @@ def main():
     ap.add_argument("--spike_lambda_warmup", type=int, default=10,
                     help="[timing_grouped] Epochs over which the spike "
                          "penalty's lambda ramps linearly from 0. Insurance "
-                         "against a specific failure: with --event_gated, a "
+                         "against a specific failure: when gated, a "
                          "silent timing unit starves its sub-network entirely "
                          "(memo decays, y collapses to b_out) and passes ZERO "
                          "gradient to w1/w2/w_read/w_out, so an L1 spike cost "
@@ -3025,23 +3070,28 @@ def main():
                          "since w1's gradient is proportional to the timing "
                          "spike and so was exactly zero the whole time it was "
                          "dead. 0 disables.")
-    ap.add_argument("--event_gated", type=int, default=1,
-                    help="[timing_grouped] 1 = a sub-network advances ONLY on "
-                         "timesteps where its own timing neuron fired; no "
-                         "current is injected (bias included) and no "
-                         "sub-network spike is emitted otherwise. Membranes "
-                         "still decay every step, so the OUTPUT relaxes toward "
-                         "b_out between spikes. "
-                         "This is the mechanism that makes spike PLACEMENT "
-                         "matter: without it the task loss is EXACTLY "
-                         "invariant to the timing layer's burst phase, since "
-                         "a sub-network whose taus span a cycle can absorb any "
-                         "shift by relearning the waveform offset — which is "
-                         "why alignment never emerged from end-to-end "
-                         "training. It is also the event-driven form the "
-                         "hardware target wants, so alignment and efficiency "
-                         "turn out to be the same requirement. 0 restores the "
-                         "always-on behaviour.")
+    ap.add_argument("--gate_mode", type=str, default="freeze",
+                    choices=["none", "decay", "freeze"],
+                    help="[timing_grouped] How much a sub-network may do "
+                         "without a spike from its own timing neuron. "
+                         "'none': ungated -- biases flow every step, so the "
+                         "task loss is EXACTLY invariant to the timing layer's "
+                         "burst phase and alignment cannot emerge. "
+                         "'decay': input and sub-net spikes gated, membranes "
+                         "still leak every step -- the output can still be "
+                         "reconstructed from one injection by a sum of "
+                         "decaying exponentials (~183 steps of usable coast "
+                         "measured), so spike placement matters only weakly. "
+                         "'freeze' (default): nothing moves without a spike; "
+                         "the output is HELD and the accumulated leak is "
+                         "applied as beta**since_upd at the next update. That "
+                         "makes the state at each update identical to per-step "
+                         "decay, so it is a pure zero-order hold on the "
+                         "OUTPUT, and it is the form that permits genuinely "
+                         "sparse updates at deployment. Only viable with "
+                         "--fake_cpg, since the real CPG's inter-burst "
+                         "silences would hold a stale output for a third of "
+                         "the cycle.")
     ap.add_argument("--sub_film", type=str, default="both",
                     choices=["none", "l1", "l2", "both"],
                     help="[timing_grouped] Which sub-network layers get "
@@ -3330,7 +3380,7 @@ def main():
             tau_readout_max=args.tau_readout_max,
             sub_ln=args.sub_ln, sub_film=args.sub_film,
             timing_reset=args.timing_reset,
-            event_gated=bool(args.event_gated),
+            gate_mode=args.gate_mode,
             slope=args.slope, timing_slope=args.timing_slope).to(device)
     else:
         model = StatefulSNN(hidden=args.hidden, n_gaits=len(gait_tables),
@@ -3391,13 +3441,23 @@ def main():
               f"readout({args.readout_hidden})], no cross talk (todo 3a)")
         print(f"      timing reset={args.timing_reset}  "
               f"sub_film={args.sub_film}  sub_ln={args.sub_ln}  "
-              f"event_gated={bool(args.event_gated)}")
-        if args.event_gated:
+              f"gate_mode={args.gate_mode}")
+        if args.gate_mode == "freeze":
+            print(f"      gate_mode=freeze: sub-networks are BIT-FOR-BIT "
+                  f"unchanged on silent steps and the output is HELD; the "
+                  f"accumulated leak is applied as beta**since_upd at the next "
+                  f"update, so the output is a pure zero-order hold.")
+            if not args.fake_cpg:
+                print(f"      WARNING: gate_mode=freeze without --fake_cpg. The "
+                      f"real CPG has long inter-burst silences, so a frozen "
+                      f"sub-network will hold a stale output across a large "
+                      f"fraction of the cycle.")
+        if args.gate_mode == "decay":
             print(f"      event gating ON: each sub-network advances only on "
                   f"its own timing spike; membranes still decay, so the "
                   f"output relaxes toward b_out in between — which is what "
                   f"makes spike placement visible to the task loss.")
-        if args.event_gated and args.spike_objective == "cpg_match":
+        if args.gate_mode != "none" and args.spike_objective == "cpg_match":
             print(f"      WARNING: --spike_objective cpg_match wants every "
                   f"spike at ONE cycle phase, while event gating needs spikes "
                   f"wherever the output must change. These two pull in "
@@ -3470,7 +3530,7 @@ def main():
         # Starting at the CPG's rate would begin in a starved regime where the
         # task gradient is weak, exactly when L1 pressure is arriving.  So
         # start high and let the L1 term prune downward.
-        if args.event_gated and args.spike_objective == "min_count":
+        if args.gate_mode != "none" and args.spike_objective == "min_count":
             band_lo, band_hi = 2.0 * cpg_rate, 8.0 * cpg_rate
             print(f"      (event-gated + min_count: calibrating to "
                   f"{band_lo:.0f}-{band_hi:.0f} spk/cyc, well above the CPG's "
@@ -3672,7 +3732,7 @@ def main():
             "timing_reset":     (args.timing_reset
                                  if args.arch == "timing_grouped" else None),
             "freeze_blocks":    (args.freeze_blocks or None),
-            "event_gated":      (bool(args.event_gated)
+            "gate_mode":        (args.gate_mode
                                  if args.arch == "timing_grouped" else None),
             "spike_objective":  (spike_obj.describe()
                                  if args.arch == "timing_grouped" else None),
