@@ -1590,7 +1590,7 @@ def plot_delta_detail(model, spikes, targets, valid, device, out_dir,
             for k in range(n_sc):
                 tag = "c" if k == 0 else ("f" if k == n_sc - 1 else str(k))
                 for d, (arr, cols) in enumerate(((up_a, ups), (dn_a, dns))):
-                    row = (n_sc - 1 - k) * 2 + (1 - d)
+                    row = (1 - d) * n_sc + (n_sc - 1 - k)
                     ts_ = np.where(arr[:, k, j] > 0)[0]
                     r.scatter(ts_, np.full_like(ts_, row, dtype=float),
                               marker="|", s=70, lw=1.1,
@@ -2384,13 +2384,21 @@ def main():
     # All of these free-run at batch 1, a shape the training loop never
     # uses; eager keeps them from each costing a Dynamo graph.
     with eager_step(model):
+        # 5 cycles, not train.py's fixed 1200 steps: the period here is
+        # sized to the gait rather than inherited, so a step count that
+        # framed ~5 cycles at period 254 frames 15+ at period 80 and the
+        # waveform becomes unreadable.
+        recon_steps = int(round(5 * period))
         rmse = plot_reconstruction(model, spikes, targets, valid, device,
                                    out_dir, tgt_range, t0=t_eval,
                                    gait_names=gait_names, leg_cols=leg_cols,
-                                   n_joints=n_joints)
+                                   n_joints=n_joints, n_steps=recon_steps)
+        # One switch, with ~2 cycles either side of it.
         plot_transition(model, spikes, targets, device, out_dir, tgt_range,
                         t0=t_eval, gait_names=gait_names, leg_cols=leg_cols,
-                        g_from=0, g_to=1)
+                        g_from=0, g_to=1,
+                        n_steps=int(round(4 * period)),
+                        switch_at=int(round(2 * period)))
         plot_delta_detail(model, spikes, targets, valid, device, out_dir,
                           tgt_range, t_eval, gait_names, n_joints, period)
         drift = plot_drift(model, spikes, targets, valid, device, out_dir,
