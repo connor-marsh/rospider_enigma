@@ -9,11 +9,13 @@ train.py's networks emit joint angles DIRECTLY: an analog leaky membrane
 compares those numbers to the gait table.
 
 Here the network never emits an angle.  It emits INCREMENTS.  There are
-`2 * n_joints` spiking output neurons -- an "up" neuron and a "down"
-neuron per joint -- and the commanded angle is a running accumulator:
+`2 * n_scales * n_joints` spiking output neurons -- an "up" and a "down"
+neuron per DELTA SCALE per joint -- and the commanded angle is a running
+accumulator:
 
     angle[t] = pose + acc[t]
-    acc[t]   = (1 - leak) * acc[t-1] + delta_j * (up_j[t] - down_j[t])
+    acc[t]   = (1 - leak) * acc[t-1]
+               + sum_s delta[s,j] * (up[s,j,t] - down[s,j,t])
 
 `pose` is the standing pose (row 0 of one gait table, optionally
 learnable) and `delta_j` is a learnable per-joint step size.  Two neurons
@@ -29,7 +31,25 @@ Consequences worth being explicit about
     by `delta`, and reporting RMSE without that floor next to it is
     meaningless.  See `joint_kinematics` and the startup table.
 
-2.  `delta_j` has a hard FEASIBILITY BOUND.  An output neuron can fire at
+1b. The delta LADDER (slow-twitch / fast-twitch).  A single delta has to
+    satisfy two conflicting demands: big enough to reach peak velocity
+    (>= vmax, see below) and small enough that its ripple is acceptable.
+    When the ratio between those is large the only single-scale fix is a
+    longer period -- and `bptt` and `tau_max` both track the period, so it
+    gets expensive fast (on the real gait tables, a 1 degree floor wanted
+    period 512).  A ladder of `--delta_scales` magnitudes, each
+    `--delta_ratio` finer than the last, decouples them:
+
+        velocity ceiling = sum_s delta[s]      (all scales can fire at once)
+        resolution       = min_s delta[s]      (finest increment available)
+        required period  falls by ratio^(n_scales-1)
+
+    The scales are independently learnable, so the ratio is an
+    initialisation rather than a constraint -- which also means they can
+    collapse onto each other and waste half the output layer, so
+    `delta_report` prints the learned ratio and warns.
+
+2.  `delta[0]` has a hard FEASIBILITY BOUND.  An output neuron can fire at
     most once per timestep, so the fastest the accumulator can move is
     `delta_j` units/step.  If the gait needs the joint to move faster
     than that anywhere in the cycle, no amount of training can track it:
@@ -90,7 +110,8 @@ Architecture (deliberately boring)
       -> `--n_layers` (3) dense LIF layers of `--hidden` (64) units,
          LayerNorm(affine=False) + per-gait FiLM, heterogeneous learnable
          taus over [tau_min, tau_max]
-      -> 2 * n_joints spiking LIF output neurons, fully connected, NO
+      -> 2 * n_scales * n_joints spiking LIF output neurons (an up
+         and a down neuron per delta scale per joint), fully connected, NO
          LayerNorm (LN across the output dim would normalise away the very
          drive magnitude that sets firing rate, and would couple every
          joint's rate to every other joint's), subtract-reset so rate is
@@ -215,59 +236,92 @@ def joint_kinematics(gait_tables, period, tgt_range):
     }
 
 
-def report_kinematics(kin, delta, period, n_joints):
+def report_kinematics(kin, delta_lad, period, n_joints):
     """
     Print the feasibility / floor / budget table and return it as a dict.
 
     This is the single most useful thing in the file: it says BEFORE
-    training whether the chosen delta can physically track the gait, what
-    RMSE floor it implies, and how many spikes per cycle the output
-    neurons therefore have to produce.  A run whose final RMSE sits at the
-    printed floor is not underfitting -- it is delta-limited, and the fix
-    is a smaller delta, not more epochs.
+    training whether the chosen deltas can physically track the gait, what
+    RMSE floor they imply, and how many spikes per cycle the output neurons
+    therefore have to produce.  A run whose final RMSE sits at the printed
+    floor is not underfitting -- it is delta-limited, and the fix is a finer
+    delta or a longer period, not more epochs.
+
+    `delta_lad` is (n_scales, n_joints), coarse first.  With a ladder the
+    three quantities decouple, which is the whole reason for it:
+
+      velocity ceiling  sum over scales of delta (every scale can fire up on
+                        the same step), so peak duty is measured against the
+                        SUM, not against the coarse delta alone.
+      resolution        the FINEST delta -- nothing stops a joint being
+                        trimmed in the smallest increment available.
+      spike budget      travel / (2 * sum(delta)) per neuron, which comes out
+                        EQUAL for every scale once the travel is split in
+                        proportion to each scale's delta. That equal-budget
+                        split is what the calibration targets, so no scale
+                        starts starved relative to another.
     """
     s      = kin["scale"]
     vmax   = kin["vmax"]
     travel = kin["travel"]
-    duty   = vmax / np.maximum(delta, 1e-12)
+    n_scales = delta_lad.shape[0]
+
+    total  = delta_lad.sum(axis=0)                  # velocity ceiling
+    finest = delta_lad[-1]                          # resolution
+    duty   = vmax / np.maximum(total, 1e-12)
     # Tracking error of a first-order quantiser is ~uniform over one step,
     # so RMSE ~ delta / sqrt(12).  Approximate: it ignores the neuron's own
     # latency, so treat it as a lower bound rather than a prediction.
-    floor  = delta / math.sqrt(12.0)
-    budget = travel / np.maximum(2.0 * delta, 1e-12)
+    floor  = finest / math.sqrt(12.0)
+    budget = travel / np.maximum(2.0 * total, 1e-12)
 
-    print(f"      {'joint':>5}  {'p2p':>8}  {'vmax':>10}  {'delta':>8}"
-          f"  {'peak duty':>10}  {'RMSE floor':>11}  {'spk/cyc/dir':>12}")
-    print("      " + "-" * 76)
+    hdr = (f"      {'joint':>5}  {'p2p':>8}  {'vmax':>10}"
+           + "".join(f"  {('delta[' + str(i) + ']'):>9}"
+                     for i in range(n_scales))
+           + f"  {'peak duty':>10}  {'RMSE floor':>11}  {'spk/cyc/dir':>12}")
+    print(hdr)
+    print("      " + "-" * (len(hdr) - 6))
     for j in range(n_joints):
         warn = "  <-- INFEASIBLE" if duty[j] > 1.0 else (
                "  <-- >70% duty" if duty[j] > 0.7 else "")
         print(f"      {j:>5}  {kin['p2p'][j]*s:>7.1f}°"
-              f"  {vmax[j]*s:>7.3f}°/st  {delta[j]*s:>7.3f}°"
-              f"  {100*duty[j]:>9.1f}%  {floor[j]*s:>10.3f}°"
+              f"  {vmax[j]*s:>7.3f}°/st"
+              + "".join(f"  {delta_lad[i][j]*s:>8.3f}°"
+                        for i in range(n_scales))
+              + f"  {100*duty[j]:>9.1f}%  {floor[j]*s:>10.3f}°"
               f"  {budget[j]:>12.1f}{warn}")
-    print("      " + "-" * 76)
+    print("      " + "-" * (len(hdr) - 6))
     print(f"      mean RMSE floor {float(np.mean(floor))*s:.3f}°   "
-          f"mean budget {float(np.mean(budget)):.1f} spk/cyc/direction   "
+          f"worst {float(np.max(floor))*s:.3f}°   "
+          f"mean budget {float(np.mean(budget)):.1f} spk/cyc/dir/scale   "
           f"(max possible {period:.0f})")
+    if n_scales > 1:
+        print(f"      ladder: velocity ceiling is the SUM of scales "
+              f"({float(np.mean(total/delta_lad[0])):.2f}x the coarse delta), "
+              f"resolution is the finest ({float(np.mean(delta_lad[0]/finest)):.0f}x "
+              f"finer than coarse)")
     if (duty > 1.0).any():
         bad = [int(j) for j in np.where(duty > 1.0)[0]]
         print(f"      WARNING: joint(s) {bad} need the accumulator to move "
-              f"faster than one delta per step. Raise --delta_init_scale, "
-              f"or accept that those joints will lag at the fastest part of "
-              f"the swing until the learnable delta grows.")
+              f"faster than every scale firing at once. Raise "
+              f"--delta_init_scale, or accept that those joints will lag at "
+              f"the fastest part of the swing until the learnable deltas "
+              f"grow.")
     return {
         "vmax_deg_per_step": (vmax * s).tolist(),
         "p2p_deg":           (kin["p2p"] * s).tolist(),
         "travel_deg":        (travel * s).tolist(),
-        "delta_deg":         (delta * s).tolist(),
+        "delta_deg":         (delta_lad * s).tolist(),
+        "delta_total_deg":   (total * s).tolist(),
+        "delta_finest_deg":  (finest * s).tolist(),
         "peak_duty":         duty.tolist(),
         "rmse_floor_deg":    (floor * s).tolist(),
         "spikes_per_cycle_per_direction": budget.tolist(),
     }
 
 
-def required_period_for_floor(gait_tables, floor_target_deg, delta_scale):
+def required_period_for_floor(gait_tables, floor_target_deg, delta_scale,
+                              n_scales=2, delta_ratio=4.0):
     """
     Minimum CPG period (timesteps per gait cycle) whose delta-quantisation
     RMSE floor is at or under `floor_target_deg`, for the WORST joint.
@@ -297,8 +351,16 @@ def required_period_for_floor(gait_tables, floor_target_deg, delta_scale):
     maxrowdiff = float(d.max())                     # deg between adjacent rows
     per_joint  = d.max(axis=(0, 1))                 # (J,) worst per joint
 
+    # The floor is set by the FINEST delta, not the coarse one. The coarse
+    # delta is pinned by the velocity requirement (it has to be able to
+    # reach vmax), but the resolution is whatever the smallest increment is
+    # -- so with a ladder of n_scales the required period drops by
+    # ratio^(n_scales-1). That factor is the whole point of multi-scale: it
+    # buys resolution without buying period, and period is expensive
+    # (bptt and tau_max both track it).
+    fine_factor = float(delta_ratio) ** (int(n_scales) - 1)
     P_req = (delta_scale * maxrowdiff * R
-             / (float(floor_target_deg) * math.sqrt(12.0)))
+             / (fine_factor * float(floor_target_deg) * math.sqrt(12.0)))
     return {
         "period_required": float(P_req),
         "maxrowdiff_deg":  maxrowdiff,
@@ -307,7 +369,25 @@ def required_period_for_floor(gait_tables, floor_target_deg, delta_scale):
         "per_joint_maxrowdiff_deg": per_joint.tolist(),
         "floor_target_deg": float(floor_target_deg),
         "delta_scale":      float(delta_scale),
+        "n_scales":         int(n_scales),
+        "delta_ratio":      float(delta_ratio),
+        "fine_factor":      fine_factor,
     }
+
+
+def delta_scale_ladder(delta_coarse, n_scales, ratio):
+    """
+    (n_scales, n_joints) delta ladder: coarse, coarse/ratio, coarse/ratio^2...
+
+    Slow-twitch / fast-twitch, as it were: the coarse scale is sized by what
+    the joint needs to KEEP UP (it must be able to reach peak velocity), the
+    fine scale by what it needs to SETTLE (resolution in the flat parts of
+    the waveform). One delta cannot serve both when the ratio between peak
+    velocity and acceptable ripple is large, which is exactly the bind that
+    forced the period up.
+    """
+    d0 = np.asarray(delta_coarse, dtype=np.float64)
+    return np.stack([d0 / (float(ratio) ** s) for s in range(int(n_scales))])
 
 
 def _measure_period(spk):
@@ -513,7 +593,7 @@ class DeltaSNN(nn.Module):
                  slope=25.0, out_slope=5.0, thresh=1.0,
                  delta_init=None, pose_init=None, pose_learnable=True,
                  out_reset="subtract", out_gait_bias=True, angle_leak=0.0,
-                 out_mem_clip=0.0):
+                 out_mem_clip=0.0, n_scales=2):
         super().__init__()
         if n_gaits > max_gaits:
             raise ValueError(
@@ -522,11 +602,16 @@ class DeltaSNN(nn.Module):
                 f"shape and so invalidates old checkpoints.")
         if n_layers < 1:
             raise ValueError(f"--n_layers must be >= 1, got {n_layers}.")
+        if n_scales < 1:
+            raise ValueError(f"--delta_scales must be >= 1, got {n_scales}.")
 
         self.H          = int(hidden)
         self.n_layers   = int(n_layers)
         self.J          = int(n_joints)
         self.n_joints   = int(n_joints)          # export_onnx reads this name
+        self.n_scales   = int(n_scales)
+        # 2 directions x n_scales x n_joints
+        self.n_out      = 2 * self.n_scales * self.J
         self.n_neurons  = int(n_neurons)
         self.n_gaits    = int(n_gaits)
         self.max_gaits  = int(max_gaits)
@@ -579,23 +664,37 @@ class DeltaSNN(nn.Module):
             nn.init.zeros_(e.weight)
             e.weight.data[:, :H] = 1.0              # gamma := 1, beta := 0
 
-        # ── spiking output layer: [up_0..up_{J-1}, dn_0..dn_{J-1}] ─
-        self.w_out = nn.Parameter(torch.randn(H, 2 * self.J) / math.sqrt(H))
-        self.b_out = nn.Parameter(torch.zeros(2 * self.J))
+        # ── spiking output layer ──────────────────────────────────
+        # Flat index = (scale * 2 + direction) * J + joint, so the layout is
+        #   [c_up(J), c_dn(J), f_up(J), f_dn(J), ...]
+        # coarse-first. At n_scales=1 that degenerates to the original
+        # [up(J), dn(J)], which keeps the single-scale architecture
+        # reachable as a strict special case rather than a separate branch.
+        self.w_out = nn.Parameter(torch.randn(H, self.n_out) / math.sqrt(H))
+        self.b_out = nn.Parameter(torch.zeros(self.n_out))
         self.beta_out_logit = nn.Parameter(
-            init_beta_logit((2 * self.J,), tau_out_min, tau_out_max))
+            init_beta_logit((self.n_out,), tau_out_min, tau_out_max))
         if self.use_gait_bias:
-            self.gb_out = nn.Embedding(max_gaits, 2 * self.J)
+            self.gb_out = nn.Embedding(max_gaits, self.n_out)
             nn.init.zeros_(self.gb_out.weight)
 
-        # ── delta (learnable, per joint, positive by construction) ─
+        # ── delta ladder (learnable, per scale per joint) ──────────
+        # Shape (n_scales, J). The scales are INDEPENDENTLY learnable rather
+        # than a coarse delta times a fixed ratio: pinning the ratio would
+        # make the fine scale's resolution hostage to the coarse scale's
+        # velocity requirement, which is the coupling the ladder exists to
+        # break. The cost is that nothing forces them to stay separated --
+        # they could collapse onto each other and waste half the output
+        # layer -- so delta_report prints the learned ratio to catch that.
         if delta_init is None:
-            delta_init = np.full(self.J, 0.02, dtype=np.float64)
+            delta_init = np.full((self.n_scales, self.J), 0.02,
+                                 dtype=np.float64)
         d0 = torch.as_tensor(np.asarray(delta_init, dtype=np.float64),
-                             dtype=torch.float32).clamp(min=1e-6)
-        if d0.numel() != self.J:
-            raise ValueError(f"delta_init has {d0.numel()} entries, "
-                             f"expected n_joints={self.J}.")
+                             dtype=torch.float32).clamp(min=1e-9)
+        if d0.shape != (self.n_scales, self.J):
+            raise ValueError(
+                f"delta_init has shape {tuple(d0.shape)}, expected "
+                f"(n_scales, n_joints) = ({self.n_scales}, {self.J}).")
         self.log_delta = nn.Parameter(torch.log(d0))
 
         # ── standing pose ─────────────────────────────────────────
@@ -624,12 +723,12 @@ class DeltaSNN(nn.Module):
 
     # ---------------------------------------------------------------
     def delta(self):
-        return torch.exp(self.log_delta)                    # (J,)
+        return torch.exp(self.log_delta)                    # (n_scales, J)
 
     def init_state(self, batch, device, dtype=torch.float32):
         mems = [torch.zeros(batch, self.H, device=device, dtype=dtype)
                 for _ in range(self.n_layers)]
-        mem_out = torch.zeros(batch, 2 * self.J, device=device, dtype=dtype)
+        mem_out = torch.zeros(batch, self.n_out, device=device, dtype=dtype)
         acc     = torch.zeros(batch, self.J, device=device, dtype=dtype)
         return tuple(mems) + (mem_out, acc)
 
@@ -682,13 +781,20 @@ class DeltaSNN(nn.Module):
             c = self.out_mem_clip * self.thresh
             mem_out = mem_out.clamp(-c, c)
 
-        up, dn = spk[:, :self.J], spk[:, self.J:]
+        # Split the flat output into (B, n_scales, 2, J) -- the layout is
+        # (scale, direction, joint), coarse scale first.
+        s4 = spk.reshape(-1, self.n_scales, 2, self.J)
+        up, dn = s4[:, :, 0, :], s4[:, :, 1, :]      # (B, n_scales, J)
 
         # ── accumulate ────────────────────────────────────────────
-        # Net increment, so an up and a down in the same timestep cancel to
-        # nothing. That is wasteful rather than wrong; --cofire_lambda can
-        # charge for it and the diagnostic report always measures it.
-        acc = (1.0 - self.leak) * acc + self.delta() * (up - dn)
+        # Every scale contributes its own increment on the same timestep, so
+        # the velocity ceiling is sum(delta) and the resolution is min(delta)
+        # -- the decoupling the ladder is for. Net increment per scale, so an
+        # up and a down in the same timestep cancel to nothing; that is
+        # wasteful rather than wrong (--cofire_lambda can charge for it, and
+        # the diagnostic report always measures it).
+        acc = ((1.0 - self.leak) * acc
+               + (self.delta().unsqueeze(0) * (up - dn)).sum(dim=1))
         y   = self.pose + acc                                # (B, J)
 
         return y, tuple(mems) + (mem_out, acc), (up, dn)
@@ -746,9 +852,11 @@ class SingleStepONNXDelta(nn.Module):
 
     def forward(self, spikes, gait, *states):
         y, new_state, aux = self.model.step(spikes, gait.long(), tuple(states))
-        # up/down are exported too: the robot side may want the raw
-        # increments (e.g. to drive a servo in steps) rather than the
-        # accumulator's opinion of the absolute angle.
+        # up/down are exported too, as (batch, n_scales, n_joints): the
+        # robot side may want the raw increments (e.g. to drive a servo in
+        # steps) rather than the accumulator's opinion of the absolute
+        # angle. Pair them with cfg["delta"]["degrees"], which is the
+        # matching (n_scales, n_joints) table.
         return (y, aux[0], aux[1]) + tuple(new_state)
 
 
@@ -824,7 +932,8 @@ def measure_out(model, spikes, n_gaits, device, period, t0=0, n_cycles=6):
         "y":      y,                                        # (L, G, J)
         "t0":     int(t0),
         "warm":   warm,
-        "rate_up": (up[warm:].sum(0) / ncyc).cpu().numpy(),  # (G, J)
+        # (G, n_scales, J) -- the scale axis came in with the delta ladder
+        "rate_up": (up[warm:].sum(0) / ncyc).cpu().numpy(),
         "rate_dn": (dn[warm:].sum(0) / ncyc).cpu().numpy(),
         "cofire":  (up[warm:] * dn[warm:]).mean(0).cpu().numpy(),
     }
@@ -866,7 +975,12 @@ def calibrate_out_bias(model, spikes, n_gaits, device, period, target,
     def rates_at(b):
         model.b_out.data.copy_(b)
         st = measure_out(model, spikes, n_gaits, device, period, n_cycles=5)
-        r  = np.concatenate([st["rate_up"], st["rate_dn"]], axis=1)  # (G,2J)
+        # Interleave back into the model's flat output order,
+        # (scale*2 + direction)*J + joint, so index k of `r` is the same
+        # neuron as index k of b_out. Stacking on a new axis 2 and
+        # reshaping does exactly that; concatenating would not.
+        r = np.stack([st["rate_up"], st["rate_dn"]], axis=2) \
+              .reshape(st["rate_up"].shape[0], -1)          # (G, n_out)
         return torch.as_tensor(r, dtype=torch.float32,
                                device=device).min(dim=0).values
 
@@ -891,18 +1005,25 @@ def calibrate_out_bias(model, spikes, n_gaits, device, period, target,
         "in_band":   [bool(v) for v in ok.cpu()],
     }
     if verbose:
-        J = model.J
+        J, S = model.J, model.n_scales
         fmt = lambda v: " ".join(f"{x:6.1f}" for x in v)
-        print(f"      target spk/cyc  up [{fmt(rep['target'][:J])}]")
-        print(f"                      dn [{fmt(rep['target'][J:])}]")
-        print(f"      achieved (min over gaits)")
-        print(f"                      up [{fmt(rep['min_rate'][:J])}]")
-        print(f"                      dn [{fmt(rep['min_rate'][J:])}]")
-        print(f"      bias            up [{fmt(rep['bias'][:J])}]")
-        print(f"                      dn [{fmt(rep['bias'][J:])}]")
+        blk = lambda v, k, d: v[(k * 2 + d) * J:(k * 2 + d + 1) * J]
+        for name, key in (("target spk/cyc", "target"),
+                          ("achieved (min)", "min_rate"),
+                          ("bias", "bias")):
+            for k in range(S):
+                tag = "coarse" if k == 0 else ("fine" if k == S - 1
+                                               else f"mid{k}")
+                for d, dn in ((0, "up"), (1, "dn")):
+                    lbl = f"{name:>15}" if (k == 0 and d == 0) else " " * 15
+                    print(f"      {lbl} {tag:>6} {dn} "
+                          f"[{fmt(blk(rep[key], k, d))}]")
         bad = [i for i, v in enumerate(ok.cpu()) if not v]
         if bad:
-            print(f"      WARNING: output neuron(s) {bad} (index < {J} is 'up') "
+            decode = [f"{i}(scale{(i//J)//2},"
+                      f"{'up' if (i//J) % 2 == 0 else 'dn'},j{i % J})"
+                      for i in bad]
+            print(f"      WARNING: output neuron(s) {decode} "
                   f"could not be brought near their budget by bias alone. A "
                   f"neuron pinned at 1 spike/step is saturated -- its delta is "
                   f"too small for the required velocity; check the peak-duty "
@@ -956,33 +1077,55 @@ def delta_report(model, spikes, targets, valid, period, n_gaits, device,
     rmse_g = torch.sqrt((err ** 2).sum(dim=(0, 2)) / denom) * scale
     bias_g = (err.sum(dim=(0, 2)) / denom) * scale   # signed drift, degrees
 
-    d_deg = (model.delta().detach().cpu().numpy() * scale)
+    d_deg = (model.delta().detach().cpu().numpy() * scale)   # (n_scales, J)
+    n_sc  = d_deg.shape[0]
 
     lines = [f"{indent}output layer (free run, {n_cycles} cycles, "
              f"{warm}-step warm-up discarded):"]
-    lines.append(f"{indent}  {'gait':>10}  {'spk/cyc up':>11}  "
+    lines.append(f"{indent}  {'gait':>10} {'scale':>6}  {'spk/cyc up':>11}  "
                  f"{'dn':>7}  {'balance':>8}  {'cofire':>8}  "
                  f"{'RMSE':>8}  {'mean err':>9}")
     stats = []
     for g in range(n_gaits):
-        ru, rd = st["rate_up"][g], st["rate_dn"][g]
-        tot    = ru + rd
-        bal    = float(np.mean((ru - rd) / np.maximum(tot, 1e-9)))
-        cf     = float(np.mean(st["cofire"][g]))
-        lines.append(f"{indent}  {gait_names[g]:>10}  {ru.mean():>11.1f}  "
-                     f"{rd.mean():>7.1f}  {bal:>+8.3f}  {cf:>8.4f}  "
-                     f"{float(rmse_g[g]):>7.2f}°  {float(bias_g[g]):>+8.2f}°")
-        stats.append({
-            "gait":     gait_names[g],
-            "rate_up":  ru.tolist(),
-            "rate_dn":  rd.tolist(),
-            "balance":  bal,
-            "cofire":   cf,
-            "rmse_deg": float(rmse_g[g]),
-            "mean_err_deg": float(bias_g[g]),
-        })
-    lines.append(f"{indent}  delta (deg/spike): " +
-                 " ".join(f"{v:.3f}" for v in d_deg))
+        for k in range(n_sc):
+            ru, rd = st["rate_up"][g][k], st["rate_dn"][g][k]
+            tot    = ru + rd
+            bal    = float(np.mean((ru - rd) / np.maximum(tot, 1e-9)))
+            cf     = float(np.mean(st["cofire"][g][k]))
+            tag    = "coarse" if k == 0 else ("fine" if k == n_sc - 1
+                                              else f"mid{k}")
+            # RMSE and mean error are per-gait, not per-scale (the
+            # accumulator is shared), so only print them on the first row.
+            rc = (f"{float(rmse_g[g]):>7.2f}°  {float(bias_g[g]):>+8.2f}°"
+                  if k == 0 else " " * 19)
+            nm = gait_names[g] if k == 0 else ""
+            lines.append(f"{indent}  {nm:>10} {tag:>6}  {ru.mean():>11.1f}  "
+                         f"{rd.mean():>7.1f}  {bal:>+8.3f}  {cf:>8.4f}  {rc}")
+            stats.append({
+                "gait":     gait_names[g],
+                "scale":    int(k),
+                "rate_up":  ru.tolist(),
+                "rate_dn":  rd.tolist(),
+                "balance":  bal,
+                "cofire":   cf,
+                "rmse_deg": float(rmse_g[g]),
+                "mean_err_deg": float(bias_g[g]),
+            })
+    for k in range(n_sc):
+        lines.append(f"{indent}  delta[{k}] (deg/spike): " +
+                     " ".join(f"{v:.4f}" for v in d_deg[k]))
+    if n_sc > 1:
+        # The scales are independently learnable, so nothing stops them
+        # converging onto each other -- which would silently waste half the
+        # output layer. A learned ratio near 1 means the ladder collapsed.
+        ratio = d_deg[0] / np.maximum(d_deg[-1], 1e-12)
+        lines.append(f"{indent}  learned coarse/fine ratio: " +
+                     " ".join(f"{v:.2f}" for v in ratio) +
+                     f"   (mean {float(np.mean(ratio)):.2f})")
+        if float(np.mean(ratio)) < 1.5:
+            lines.append(f"{indent}  WARNING: the delta ladder has collapsed "
+                         f"(coarse ~= fine). Half the output layer is doing "
+                         f"the other half's job; the resolution gain is gone.")
     return lines, stats
 
 
@@ -1022,8 +1165,14 @@ def grad_blocks_delta(model):
 
 
 def masked_mean(v, mask):
-    """Mean of (L,B,J) over the (L,B) mask."""
-    return ((v.mean(dim=2) * mask).sum() / mask.sum().clamp(min=1.0))
+    """
+    Mean of v over the (L,B) mask, averaging every trailing dim.
+
+    Rank-agnostic because the output aux tensors gained a scale axis: they
+    are (L, B, n_scales, n_joints) now, not (L, B, n_joints).
+    """
+    flat = v.reshape(v.shape[0], v.shape[1], -1).mean(dim=2)
+    return ((flat * mask).sum() / mask.sum().clamp(min=1.0))
 
 
 def windowed_deriv_loss(pred, targ, mask, w):
@@ -1313,15 +1462,17 @@ def plot_delta_detail(model, spikes, targets, valid, device, out_dir,
         gg = torch.full((x.shape[0], 1), g, dtype=torch.long, device=device)
         pred, _, (up, dn) = model(x, gg, return_aux=True)
         pred = pred[warm:, 0].cpu().numpy() * scale + shift
-        up_a = up[warm:, 0].cpu().numpy()
+        up_a = up[warm:, 0].cpu().numpy()      # (steps, n_scales, n_joints)
         dn_a = dn[warm:, 0].cpu().numpy()
         true = targets[g, t0:t0 + n_steps] * scale + shift
 
         n = len(joints)
-        fig, axes = plt.subplots(2 * n, 1, figsize=(13, 2.6 * n),
+        n_sc_g = int(up.shape[2])
+        fig, axes = plt.subplots(2 * n, 1,
+                                 figsize=(13, (2.2 + 0.5 * n_sc_g) * n),
                                  sharex=True, squeeze=False,
                                  gridspec_kw={"height_ratios":
-                                              [3, 1] * n})
+                                              [3, 1 + 0.4 * n_sc_g] * n})
         axes = axes[:, 0]
         for k, j in enumerate(joints):
             a, r = axes[2 * k], axes[2 * k + 1]
@@ -1330,20 +1481,34 @@ def plot_delta_detail(model, spikes, targets, valid, device, out_dir,
                    color="#e63946", lw=1.3, label="pred (staircase)")
             a.set_ylabel(f"col{j} (deg)", fontsize=8)
             a.grid(alpha=0.25); a.legend(fontsize=7, loc="upper right")
-            nu, nd = int(up_a[:, j].sum()), int(dn_a[:, j].sum())
-            a.set_title(f"col{j}   delta="
-                        f"{float(model.delta()[j])*scale:.3f}°/spike   "
-                        f"{nu} up / {nd} dn over {n_steps} steps",
-                        fontsize=8)
-            tu = np.where(up_a[:, j] > 0)[0]
-            td = np.where(dn_a[:, j] > 0)[0]
-            r.scatter(tu, np.full_like(tu, 1.0), marker="|", s=90, lw=1.2,
-                      color="#2a9d8f", label="up")
-            r.scatter(td, np.full_like(td, 0.0), marker="|", s=90, lw=1.2,
-                      color="#f4a261", label="down")
-            r.set_yticks([0, 1]); r.set_yticklabels(["dn", "up"], fontsize=7)
-            r.set_ylim(-0.5, 1.5); r.grid(axis="x", alpha=0.2)
-            r.legend(fontsize=6, loc="upper right", ncol=2)
+            n_sc = up_a.shape[1]
+            dtxt = " / ".join(f"{float(model.delta()[k][j])*scale:.3f}"
+                              for k in range(n_sc))
+            counts = " ".join(
+                f"{'cf'[min(k,1)] if n_sc>1 else ''}"
+                f"{int(up_a[:, k, j].sum())}u/{int(dn_a[:, k, j].sum())}d"
+                for k in range(n_sc))
+            a.set_title(f"col{j}   delta={dtxt}°/spike   "
+                        f"{counts} over {n_steps} steps", fontsize=8)
+            # One raster row per (scale, direction). Coarse and fine get
+            # different colours so a collapsed ladder -- both scales firing
+            # in the same places -- is visible at a glance.
+            ups = ["#2a9d8f", "#1d3557", "#6a4c93"]
+            dns = ["#f4a261", "#e63946", "#b5179e"]
+            ylab = []
+            for k in range(n_sc):
+                tag = "c" if k == 0 else ("f" if k == n_sc - 1 else str(k))
+                for d, (arr, cols) in enumerate(((up_a, ups), (dn_a, dns))):
+                    row = (n_sc - 1 - k) * 2 + (1 - d)
+                    ts_ = np.where(arr[:, k, j] > 0)[0]
+                    r.scatter(ts_, np.full_like(ts_, row, dtype=float),
+                              marker="|", s=70, lw=1.1,
+                              color=cols[k % len(cols)])
+                    ylab.append((row, f"{tag}{'up' if d == 0 else 'dn'}"))
+            ylab.sort()
+            r.set_yticks([v for v, _ in ylab])
+            r.set_yticklabels([t for _, t in ylab], fontsize=6)
+            r.set_ylim(-0.6, 2 * n_sc - 0.4); r.grid(axis="x", alpha=0.2)
         axes[-1].set_xlabel("timestep")
         plt.suptitle(f"{gait_names[g]} — delta output detail "
                      f"({n_cycles:g} cycles, {warm}-step warm-up discarded)",
@@ -1552,6 +1717,30 @@ def main():
                          "this is only a starting point, but a bad one is "
                          "expensive: too small saturates the neuron (gradient "
                          "goes flat) and too large makes every step visible.")
+    ap.add_argument("--delta_scales", type=int, default=2,
+                    help="Number of delta magnitudes per joint (slow-twitch / "
+                         "fast-twitch). Each scale gets its OWN up and down "
+                         "neuron, so the output layer is 2*delta_scales*"
+                         "n_joints wide. 2 (default) gives a coarse pair "
+                         "sized by peak velocity and a fine pair sized by "
+                         "resolution. Why this exists: one delta has to be "
+                         ">= vmax to keep up AND small enough not to ripple, "
+                         "and when those conflict the only single-scale fix "
+                         "is a longer period -- which bptt and tau_max both "
+                         "track, so it gets expensive fast. A ladder buys "
+                         "resolution^(scales-1) without buying period. "
+                         "--delta_scales 1 reproduces the original 2-neuron "
+                         "architecture exactly (and old 1-scale checkpoints "
+                         "only load with it).")
+    ap.add_argument("--delta_ratio", type=float, default=4.0,
+                    help="Each successive scale is 1/ratio of the previous, "
+                         "so at the default the fine delta is a quarter of "
+                         "the coarse one. This sets the INITIALISATION only: "
+                         "the scales are independently learnable, so the "
+                         "ratio can drift (delta_report prints the learned "
+                         "value and warns if the ladder collapses). The "
+                         "required period falls by ratio^(scales-1), so this "
+                         "is the main lever on --floor_target vs period.")
     ap.add_argument("--freeze_delta", action="store_true",
                     help="Hold delta at its initialisation. Useful for "
                          "attributing an RMSE change to the network rather "
@@ -1777,8 +1966,8 @@ def main():
         layout_src = "default"
     print(f"      gait layout: n_legs={n_legs}  n_joints={n_joints}  "
           f"source={layout_src}")
-    print(f"      output neurons: {2 * n_joints} "
-          f"({n_joints} up + {n_joints} down)")
+    print(f"      output neurons: {2 * args.delta_scales * n_joints} "
+          f"({args.delta_scales} scale(s) x 2 directions x {n_joints} joints)")
     if not (0 <= args.pose_gait < len(gait_names)):
         raise ValueError(f"--pose_gait {args.pose_gait} out of range for "
                          f"{len(gait_names)} gait(s).")
@@ -1795,13 +1984,22 @@ def main():
     # ── 2. Size the CPG to the required RMSE floor ────────────────
     print("\n[2/9] Sizing the CPG period to the delta RMSE floor ...")
     req = required_period_for_floor(gait_tables, args.floor_target,
-                                    args.delta_init_scale)
+                                    args.delta_init_scale,
+                                    n_scales=args.delta_scales,
+                                    delta_ratio=args.delta_ratio)
     print(f"      {req['rows']} rows/cycle, worst adjacent-row change "
           f"{req['maxrowdiff_deg']:.3f}°  -> peak velocity "
           f"{req['vmax_per_cycle_deg']:.1f}°/cycle")
-    print(f"      floor = {args.delta_init_scale:g} x vmax / sqrt(12) "
+    print(f"      {args.delta_scales} delta scale(s), ratio "
+          f"{args.delta_ratio:g}  -> finest delta is 1/"
+          f"{req['fine_factor']:g} of the coarse one")
+    print(f"      floor = coarse_delta / ({req['fine_factor']:g} x sqrt(12)) "
           f"<= {args.floor_target:g}°  requires period >= "
           f"{req['period_required']:.0f} steps")
+    if args.delta_scales > 1:
+        solo = req["period_required"] * req["fine_factor"]
+        print(f"      (a single delta scale would need period "
+              f"{solo:.0f} -- hence the ladder)")
 
     if args.vth_fb is not None:
         spb = max(1, int(args.vth_fb // args.to_fb_weight))
@@ -1828,7 +2026,8 @@ def main():
           f"refrac_main={cpgp['refrac_main']}  "
           f"-> period {cpgp['period_measured']:.1f} steps")
     implied = (args.delta_init_scale * req["vmax_per_cycle_deg"]
-               / (cpgp["period_measured"] * math.sqrt(12.0)))
+               / (req["fine_factor"] * cpgp["period_measured"]
+                  * math.sqrt(12.0)))
     print(f"      implied RMSE floor at that period: {implied:.3f}° "
           f"(target {args.floor_target:g}°)")
     if args.tmax < 40 * cpgp["period_measured"]:
@@ -1905,10 +2104,16 @@ def main():
     # ── 6. Delta sizing + feasibility ─────────────────────────────
     print("\n[6/9] Delta sizing & feasibility ...")
     kin = joint_kinematics(gait_tables, period, tgt_range)
-    delta_init = args.delta_init_scale * kin["vmax"]
+    # Coarse delta is sized by the VELOCITY requirement (smallest that can
+    # still reach vmax at the chosen duty); the finer scales are that
+    # divided down by --delta_ratio, and they are what set the RMSE floor.
+    delta_coarse = args.delta_init_scale * kin["vmax"]
+    delta_init   = delta_scale_ladder(delta_coarse, args.delta_scales,
+                                      args.delta_ratio)
     print(f"      target rows {kin['R']}  ->  {kin['steps_per_row']:.2f} "
           f"timesteps per gait-table row")
-    print(f"      delta_init = {args.delta_init_scale:g} x peak velocity")
+    print(f"      delta[0] = {args.delta_init_scale:g} x peak velocity, "
+          f"each further scale / {args.delta_ratio:g}")
     kin_report = report_kinematics(kin, delta_init, period, n_joints)
 
     pose_init = ((gait_tables[args.pose_gait][0] - tgt_range[0])
@@ -1947,6 +2152,7 @@ def main():
         hidden=args.hidden, n_layers=args.n_layers,
         n_gaits=len(gait_tables), max_gaits=args.max_gaits,
         n_neurons=args.n_cpg_neurons, n_joints=n_joints,
+        n_scales=args.delta_scales,
         tau_min=args.tau_min, tau_max=args.tau_max,
         tau_out_min=args.tau_out_min, tau_out_max=args.tau_out_max,
         slope=args.slope, out_slope=args.out_slope,
@@ -2005,9 +2211,14 @@ def main():
     calib = {}
     if not args.no_calibrate:
         print("\n      Calibrating output-neuron biases to the spike budget ...")
+        # budget is travel/(2*sum(delta)) per joint, which is the SAME for
+        # every scale once travel is split in proportion to each scale's
+        # delta -- so every output neuron gets the same per-joint target and
+        # no scale starts starved relative to another. Tiled in the model's
+        # flat order: (scale*2 + direction)*J + joint.
         budget = np.asarray(kin_report["spikes_per_cycle_per_direction"],
                             dtype=np.float64) * args.rate_target_scale
-        target = np.concatenate([budget, budget])          # up then down
+        target = np.tile(budget, 2 * args.delta_scales)
         calib = calibrate_out_bias(model, spikes, len(gait_tables), device,
                                    period, target)
     else:
@@ -2094,7 +2305,8 @@ def main():
         "n_gaits":        len(gait_tables),
         "n_legs":         int(n_legs),
         "n_joints":       int(n_joints),
-        "n_out_neurons":  int(2 * n_joints),
+        "n_out_neurons":  int(2 * args.delta_scales * n_joints),
+        "n_delta_scales": int(args.delta_scales),
         "n_cpg_neurons":  int(args.n_cpg_neurons),
         "gait_names":     gait_names,
         "gait_files":     gait_files,
@@ -2119,6 +2331,11 @@ def main():
             "learnable":    not args.freeze_delta,
             "init_scale":   float(args.delta_init_scale),
             "init_normalised": delta_init.tolist(),
+            "n_scales":     int(args.delta_scales),
+            "ratio_init":   float(args.delta_ratio),
+            "shape":        "(n_scales, n_joints), coarse scale first",
+            "total_normalised":  d_final.sum(axis=0).tolist(),
+            "finest_normalised": d_final[-1].tolist(),
         },
         "pose": {
             "normalised": model.pose.detach().cpu().numpy().tolist(),
@@ -2129,11 +2346,17 @@ def main():
         },
         "accumulator": {
             "leak":     float(args.angle_leak),
-            "formula":  "acc <- (1-leak)*acc + delta*(up-down); "
+            "formula":  "acc <- (1-leak)*acc + sum_over_scales("
+                        "delta[s]*(up[s]-down[s])); "
                         "angle_normalised = pose + acc; "
                         "angle_deg = angle_normalised*(max-min)/2 + (max+min)/2",
-            "up_index":   list(range(n_joints)),
-            "down_index": list(range(n_joints, 2 * n_joints)),
+            # flat output index = (scale*2 + direction)*n_joints + joint
+            "flat_index_formula": "(scale*2 + direction)*n_joints + joint, "
+                                  "direction 0=up 1=down, scale 0=coarsest",
+            "up_index":   [[(k * 2 + 0) * n_joints + j for j in range(n_joints)]
+                           for k in range(args.delta_scales)],
+            "down_index": [[(k * 2 + 1) * n_joints + j for j in range(n_joints)]
+                           for k in range(args.delta_scales)],
             "reset_value": "acc := 0 (i.e. angle := pose)",
         },
         "cpg": {
@@ -2193,8 +2416,9 @@ def main():
             "class":        type(model).__name__,
             "n_params":     int(n_par),
             "param_breakdown": model.param_breakdown(),
-            "output_kind":  "2 spiking LIF neurons per joint (up/down) "
-                            "driving a per-joint accumulator",
+            "output_kind":  f"2 x {args.delta_scales} spiking LIF neurons "
+                            f"per joint (up/down per delta scale) driving a "
+                            f"per-joint accumulator",
             "out_reset":    args.out_reset,
             # Deployment MUST reproduce this: an unclipped membrane on the
             # robot would give a different spike train from the trained one.
