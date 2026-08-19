@@ -375,6 +375,44 @@ def required_period_for_floor(gait_tables, floor_target_deg, delta_scale,
     }
 
 
+def proprio_normalisation(gait_tables, tgt_range):
+    """
+    Per-joint centre and half-range for the proprioceptive input, expressed
+    in the SAME globally-normalised units the accumulator works in.
+
+    The targets use one global min/max across every gait and joint (so the
+    robot needs a single denormalisation), which means a narrow joint only
+    ever occupies a sliver of [-1, 1).  Fed back raw, that joint's channel
+    would carry almost no dynamic range.  Rescaling per joint against its
+    OWN observed span fixes that:
+
+        p_j = (y_j - centre_j) / halfrange_j      ~ [-1, 1] over its range
+
+    Centred rather than mapped to [0, 1] so that "mid-range" is the zero
+    input, matching the target convention and giving layer 0 a zero-mean
+    signal.
+
+    A joint that never moves across any gait has zero span; its half-range
+    is floored (in the model) rather than dividing by zero, which makes its
+    channel a constant the network can ignore.
+    """
+    lo_g, hi_g = tgt_range
+    span = (hi_g - lo_g) + 1e-8
+    tabs = np.stack([np.asarray(t, dtype=np.float64) for t in gait_tables])
+    lo_j = tabs.min(axis=(0, 1))                      # (J,) degrees
+    hi_j = tabs.max(axis=(0, 1))
+    # degrees -> global normalised: n = (deg - lo_g)/span * 2 - 1
+    centre    = ((lo_j + hi_j) / 2.0 - lo_g) / span * 2.0 - 1.0
+    halfrange = (hi_j - lo_j) / span                  # *2/2 cancels
+    return {
+        "centre":         centre,
+        "halfrange":      halfrange,
+        "lo_deg":         lo_j,
+        "hi_deg":         hi_j,
+        "degenerate":     [int(j) for j in np.where(halfrange < 1e-3)[0]],
+    }
+
+
 def delta_scale_ladder(delta_coarse, n_scales, ratio):
     """
     (n_scales, n_joints) delta ladder: coarse, coarse/ratio, coarse/ratio^2...
@@ -593,7 +631,8 @@ class DeltaSNN(nn.Module):
                  slope=25.0, out_slope=5.0, thresh=1.0,
                  delta_init=None, pose_init=None, pose_learnable=True,
                  out_reset="subtract", out_gait_bias=True, angle_leak=0.0,
-                 out_mem_clip=0.0, n_scales=2):
+                 out_mem_clip=0.0, n_scales=2,
+                 proprio=True, prop_center=None, prop_halfrange=None):
         super().__init__()
         if n_gaits > max_gaits:
             raise ValueError(
@@ -638,11 +677,46 @@ class DeltaSNN(nn.Module):
         # neuron fires per timestep, so its current is a single row of w);
         # 0.8 carries over from train.py's StatefulSNN so the two are
         # comparable at init.
-        widths = [self.n_neurons] + [H] * (self.n_layers - 1)
+        # Proprioception widens layer 0's input: the CPG spikes plus one
+        # continuous channel per joint carrying that joint's own commanded
+        # angle. That closes the loop -- without it the network emits
+        # increments with no knowledge of where the joint ended up, so any
+        # up/down imbalance accumulates invisibly and nothing local to a
+        # timestep can correct it.
+        self.proprio = bool(proprio)
+        self.n_in = self.n_neurons + (self.J if self.proprio else 0)
+
+        widths = [self.n_in] + [H] * (self.n_layers - 1)
         self.w_h = nn.ParameterList([
             nn.Parameter(torch.randn(w_in, H) *
                          (0.8 if i == 0 else 1.0 / math.sqrt(w_in)))
             for i, w_in in enumerate(widths)])
+        if self.proprio:
+            # Rescale ONLY the proprioceptive rows of layer 0. The 0.8 above
+            # is tuned for a ONE-HOT input: exactly one CPG neuron fires per
+            # timestep, so a hidden unit receives a single weight, std 0.8.
+            # The proprioceptive block is J continuous channels at once, so
+            # at the same scale it would contribute std 0.8*0.577*sqrt(J) --
+            # about 1.6x the CPG's own drive at J=8, i.e. proprioception
+            # would dominate the rhythm before training starts. Matching the
+            # one-hot contribution gives 0.8/(0.577*sqrt(J)).
+            with torch.no_grad():
+                self.w_h[0][self.n_neurons:].mul_(
+                    1.0 / (0.577 * math.sqrt(self.J)))
+            # Per-joint affine into [-1, 1] over that joint's OWN observed
+            # range, so a 46-degree joint gets the same input dynamic range
+            # as a 92-degree one. Deliberately NOT clamped: when the
+            # accumulator drifts past the observed range the normalised
+            # value exceeds 1, and that excess magnitude is exactly the
+            # signal needed to correct it -- clamping would erase the
+            # difference between slightly out and far out.
+            c0 = (torch.zeros(self.J) if prop_center is None else
+                  torch.as_tensor(np.asarray(prop_center, dtype=np.float32)))
+            h0 = (torch.ones(self.J) if prop_halfrange is None else
+                  torch.as_tensor(np.asarray(prop_halfrange,
+                                             dtype=np.float32)))
+            self.register_buffer("prop_center", c0.clone())
+            self.register_buffer("prop_halfrange", h0.clamp(min=1e-3).clone())
         self.b_h = nn.ParameterList([
             nn.Parameter(torch.zeros(H)) for _ in range(self.n_layers)])
         # affine=False: FiLM supplies the affine, so LN's own would be
@@ -746,7 +820,24 @@ class DeltaSNN(nn.Module):
         mem_out = state[self.n_layers]
         acc     = state[self.n_layers + 1]
 
-        h = x
+        if self.proprio:
+            # The angle the network is looking at is the one produced by the
+            # PREVIOUS step -- `acc` in the incoming state is acc[t-1] -- so
+            # this is causal, the same one-step-stale reading a real encoder
+            # would give.
+            #
+            # DETACHED on purpose. Without it there is a second gradient
+            # path (spike -> acc -> next input -> next spike) stacked on top
+            # of the existing spike -> acc -> every later loss, and that
+            # second-order "if I spike now my future input changes" term is
+            # noise-dominated early while roughly doubling the graph. The
+            # network still learns to USE the signal: d loss/d w_h[0] is
+            # nonzero through the spikes it drives.
+            y_prev = (self.pose + acc).detach()
+            p_in = (y_prev - self.prop_center) / self.prop_halfrange
+            h = torch.cat([x, p_in], dim=1)
+        else:
+            h = x
         for i in range(self.n_layers):
             cur = torch.addmm(self.b_h[i], h, self.w_h[i])
             cur = self.ln[i](cur)
@@ -759,7 +850,7 @@ class DeltaSNN(nn.Module):
             h = s
 
         # ── output neurons ────────────────────────────────────────
-        cur_o = torch.addmm(self.b_out, h, self.w_out)       # (B, 2J)
+        cur_o = torch.addmm(self.b_out, h, self.w_out)       # (B, n_out)
         if self.use_gait_bias:
             cur_o = cur_o + self.gb_out(gait)
         beta_o  = torch.sigmoid(self.beta_out_logit)
@@ -1717,6 +1808,15 @@ def main():
                          "this is only a starting point, but a bad one is "
                          "expensive: too small saturates the neuron (gradient "
                          "goes flat) and too large makes every step visible.")
+    ap.add_argument("--proprio", type=int, default=1, choices=[0, 1],
+                    help="Feed each joint's own commanded angle back as an "
+                         "input channel (closed loop). 1 = on. The value fed "
+                         "back is the network's COMMANDED angle from its own "
+                         "accumulator, not a measured encoder reading, so "
+                         "there is nothing to wire on the robot and no "
+                         "train/deploy mismatch. Detached, so no gradient "
+                         "flows around the loop. --proprio 0 gives the "
+                         "original open-loop integrator for A/B.")
     ap.add_argument("--delta_scales", type=int, default=2,
                     help="Number of delta magnitudes per joint (slow-twitch / "
                          "fast-twitch). Each scale gets its OWN up and down "
@@ -2122,6 +2222,20 @@ def main():
           f"[" + " ".join(f"{v * kin['scale'] + (tgt_range[1]+tgt_range[0])/2:.1f}"
                           for v in pose_init) + "] deg")
 
+    prop = proprio_normalisation(gait_tables, tgt_range)
+    if args.proprio:
+        print(f"      proprioception ON: {n_joints} extra input channel(s), "
+              f"each joint's commanded angle scaled to +/-1 over its own "
+              f"range")
+        print(f"        per-joint span (deg): " +
+              " ".join(f"{v:.1f}" for v in (prop['hi_deg'] - prop['lo_deg'])))
+        if prop["degenerate"]:
+            print(f"        WARNING: joint(s) {prop['degenerate']} never move "
+                  f"across any gait; their channels are constant.")
+    else:
+        print(f"      proprioception OFF (--proprio 0): open-loop integrator, "
+              f"nothing observes the accumulator")
+
     # ── 5. Samplers ───────────────────────────────────────────────
     print("\n[7/9] Stream samplers ...")
     T       = len(spikes)
@@ -2153,6 +2267,8 @@ def main():
         n_gaits=len(gait_tables), max_gaits=args.max_gaits,
         n_neurons=args.n_cpg_neurons, n_joints=n_joints,
         n_scales=args.delta_scales,
+        proprio=bool(args.proprio),
+        prop_center=prop["centre"], prop_halfrange=prop["halfrange"],
         tau_min=args.tau_min, tau_max=args.tau_max,
         tau_out_min=args.tau_out_min, tau_out_max=args.tau_out_max,
         slope=args.slope, out_slope=args.out_slope,
@@ -2308,6 +2424,21 @@ def main():
         "n_out_neurons":  int(2 * args.delta_scales * n_joints),
         "n_delta_scales": int(args.delta_scales),
         "n_cpg_neurons":  int(args.n_cpg_neurons),
+        # Proprioception needs NO new ONNX input: the angle is recomputed
+        # inside step() from the acc state the graph already carries, so the
+        # robot runs the identical single-step graph and feeds nothing extra.
+        "proprioception": {
+            "enabled":   bool(args.proprio),
+            "source":    "commanded angle from the network's own accumulator "
+                         "(pose + acc), one step stale, detached",
+            "n_channels": int(n_joints) if args.proprio else 0,
+            "formula":   "p_j = (pose_j + acc_j - centre_j) / halfrange_j, "
+                         "never clamped",
+            "centre_normalised":    prop["centre"].tolist(),
+            "halfrange_normalised": prop["halfrange"].tolist(),
+            "per_joint_lo_deg":     prop["lo_deg"].tolist(),
+            "per_joint_hi_deg":     prop["hi_deg"].tolist(),
+        },
         "gait_names":     gait_names,
         "gait_files":     gait_files,
         "gaits_dir":      str(gaits_dir.resolve()),
