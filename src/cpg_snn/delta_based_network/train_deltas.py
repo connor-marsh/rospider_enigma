@@ -1529,22 +1529,32 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
 @torch.no_grad()
 def plot_delta_detail(model, spikes, targets, valid, device, out_dir,
                       tgt_range, t0, gait_names, n_joints, period,
-                      joints=None, n_cycles=2.5, warm=600):
+                      leg_cols=None, n_cycles=2.5, warm=600):
     """
-    Zoomed staircase-vs-waveform view with the up/down spike raster beneath.
+    Every joint's staircase-vs-waveform, laid out one LEG PER ROW and one
+    JOINT TYPE PER COLUMN, with the up/down spike raster under each panel.
 
-    This is the plot that actually shows whether the idea works.
-    `recon_*.png` (reused from train.py) is at the wrong zoom to see
-    individual steps -- at 1200 timesteps a 0.3-degree step is a pixel --
-    and the failure modes here are all local: steps too coarse, the neuron
-    saturating at 1 spike/step on the fast part of the swing, or up and
-    down firing together and cancelling.
+    Same grid convention as visualize_timing.py's alignment charts: reading
+    DOWN a column compares the same joint type across legs, which is where
+    the interesting structure lives -- the legs of a gait are meant to be
+    phase-shifted copies, so a column that is not a clean set of shifted
+    copies means the network is treating one leg differently.  The previous
+    version stacked an arbitrary first-four joints vertically, which made
+    that comparison impossible.
+
+    Why this exists at all alongside recon_*.png: at five cycles a
+    sub-degree step is a pixel, and every failure mode of the delta
+    representation is local -- steps too coarse for the flat sections, a
+    neuron pinned at 1 spike/step on the fast part of the swing, up and down
+    cancelling, or one delta scale sitting silent.
     """
     lo, hi = tgt_range
     scale, shift = (hi - lo) / 2.0, (hi + lo) / 2.0
     model.eval()
-    if joints is None:
-        joints = list(range(min(4, n_joints)))
+    if leg_cols is None:                      # fall back to a single column
+        leg_cols = [[j] for j in range(n_joints)]
+    n_legs  = len(leg_cols)
+    C       = max(len(g) for g in leg_cols)
     n_steps = int(n_cycles * period)
 
     x = torch.as_tensor(spikes[t0 - warm:t0 + n_steps], dtype=torch.float32,
@@ -1556,51 +1566,73 @@ def plot_delta_detail(model, spikes, targets, valid, device, out_dir,
         up_a = up[warm:, 0].cpu().numpy()      # (steps, n_scales, n_joints)
         dn_a = dn[warm:, 0].cpu().numpy()
         true = targets[g, t0:t0 + n_steps] * scale + shift
+        n_sc = up_a.shape[1]
 
-        n = len(joints)
-        n_sc_g = int(up.shape[2])
-        fig, axes = plt.subplots(2 * n, 1,
-                                 figsize=(13, (2.2 + 0.5 * n_sc_g) * n),
-                                 sharex=True, squeeze=False,
-                                 gridspec_kw={"height_ratios":
-                                              [3, 1 + 0.4 * n_sc_g] * n})
-        axes = axes[:, 0]
-        for k, j in enumerate(joints):
-            a, r = axes[2 * k], axes[2 * k + 1]
-            a.plot(true[:, j], color="#457b9d", lw=2.0, label="GT")
-            a.step(np.arange(len(pred)), pred[:, j], where="post",
-                   color="#e63946", lw=1.3, label="pred (staircase)")
-            a.set_ylabel(f"col{j} (deg)", fontsize=8)
-            a.grid(alpha=0.25); a.legend(fontsize=7, loc="upper right")
-            n_sc = up_a.shape[1]
-            dtxt = " / ".join(f"{float(model.delta()[k][j])*scale:.3f}"
-                              for k in range(n_sc))
-            counts = " ".join(
-                f"{'cf'[min(k,1)] if n_sc>1 else ''}"
-                f"{int(up_a[:, k, j].sum())}u/{int(dn_a[:, k, j].sum())}d"
-                for k in range(n_sc))
-            a.set_title(f"col{j}   delta={dtxt}°/spike   "
-                        f"{counts} over {n_steps} steps", fontsize=8)
-            # One raster row per (scale, direction). Coarse and fine get
-            # different colours so a collapsed ladder -- both scales firing
-            # in the same places -- is visible at a glance.
-            ups = ["#2a9d8f", "#1d3557", "#6a4c93"]
-            dns = ["#f4a261", "#e63946", "#b5179e"]
-            ylab = []
-            for k in range(n_sc):
-                tag = "c" if k == 0 else ("f" if k == n_sc - 1 else str(k))
-                for d, (arr, cols) in enumerate(((up_a, ups), (dn_a, dns))):
-                    row = (1 - d) * n_sc + (n_sc - 1 - k)
-                    ts_ = np.where(arr[:, k, j] > 0)[0]
-                    r.scatter(ts_, np.full_like(ts_, row, dtype=float),
-                              marker="|", s=70, lw=1.1,
-                              color=cols[k % len(cols)])
-                    ylab.append((row, f"{tag}{'up' if d == 0 else 'dn'}"))
-            ylab.sort()
-            r.set_yticks([v for v, _ in ylab])
-            r.set_yticklabels([t for _, t in ylab], fontsize=6)
-            r.set_ylim(-0.6, 2 * n_sc - 0.4); r.grid(axis="x", alpha=0.2)
-        axes[-1].set_xlabel("timestep")
+        hr = 1.0 + 0.4 * n_sc
+        fig, axes = plt.subplots(
+            2 * n_legs, C, squeeze=False, sharex=True,
+            figsize=(1.0 + 5.0 * C, (1.9 + 0.42 * n_sc) * n_legs),
+            gridspec_kw={"height_ratios": [3.0, hr] * n_legs})
+
+        ups = ["#2a9d8f", "#1d3557", "#6a4c93"]
+        dns = ["#f4a261", "#e63946", "#b5179e"]
+        for L in range(n_legs):
+            for k in range(C):
+                a, r = axes[2 * L][k], axes[2 * L + 1][k]
+                if k >= len(leg_cols[L]):
+                    a.axis("off"); r.axis("off"); continue
+                j = leg_cols[L][k]
+
+                a.plot(true[:, j], color="#457b9d", lw=2.0, label="GT")
+                a.step(np.arange(len(pred)), pred[:, j], where="post",
+                       color="#e63946", lw=1.3, label="pred")
+                a.grid(alpha=0.25); a.tick_params(labelsize=7)
+                dtxt = "/".join(f"{float(model.delta()[m][j]) * scale:.3f}"
+                                for m in range(n_sc))
+                a.set_title(f"col{j}   delta {dtxt}°", fontsize=8)
+                if k == 0:
+                    a.set_ylabel(f"leg {L}\n(°)", fontsize=8)
+                if L == 0 and k == C - 1:
+                    a.legend(fontsize=6, loc="upper right")
+
+                # Rasters grouped by DIRECTION then scale, so all the ups sit
+                # together above all the downs: the eye is comparing up
+                # against down (does the net increment have the right sign
+                # right now?) far more often than coarse against fine.
+                ylab = []
+                for m in range(n_sc):
+                    tag = ("c" if m == 0 else
+                           ("f" if m == n_sc - 1 else str(m)))
+                    for d, (arr, cols) in enumerate(((up_a, ups),
+                                                     (dn_a, dns))):
+                        row = (1 - d) * n_sc + (n_sc - 1 - m)
+                        ts_ = np.where(arr[:, m, j] > 0)[0]
+                        r.scatter(ts_, np.full_like(ts_, row, dtype=float),
+                                  marker="|", s=60, lw=1.0,
+                                  color=cols[m % len(cols)])
+                        ylab.append((row, f"{tag}{'up' if d == 0 else 'dn'}"))
+                ylab.sort()
+                r.set_yticks([v for v, _ in ylab])
+                r.set_yticklabels([t for _, t in ylab], fontsize=6)
+                r.set_ylim(-0.6, 2 * n_sc - 0.4)
+                r.grid(axis="x", alpha=0.2); r.tick_params(labelsize=7)
+
+        # Common y-limits DOWN each column. The point of the grid is
+        # comparing one joint type across legs, and that comparison is
+        # misleading if each panel is autoscaled to its own range.
+        for k in range(C):
+            js = [leg_cols[L][k] for L in range(n_legs)
+                  if k < len(leg_cols[L])]
+            if not js:
+                continue
+            v = np.concatenate([true[:, js].ravel(), pred[:, js].ravel()])
+            pad = 0.06 * (v.max() - v.min() + 1e-6)
+            for L in range(n_legs):
+                if k < len(leg_cols[L]):
+                    axes[2 * L][k].set_ylim(v.min() - pad, v.max() + pad)
+
+        for k in range(C):
+            axes[-1][k].set_xlabel("timestep", fontsize=8)
         plt.suptitle(f"{gait_names[g]} — delta output detail "
                      f"({n_cycles:g} cycles, {warm}-step warm-up discarded)",
                      fontweight="bold")
@@ -2400,7 +2432,8 @@ def main():
                         n_steps=int(round(4 * period)),
                         switch_at=int(round(2 * period)))
         plot_delta_detail(model, spikes, targets, valid, device, out_dir,
-                          tgt_range, t_eval, gait_names, n_joints, period)
+                          tgt_range, t_eval, gait_names, n_joints, period,
+                          leg_cols=leg_cols)
         drift = plot_drift(model, spikes, targets, valid, device, out_dir,
                            tgt_range, t_eval, gait_names, n_joints, period)
 
