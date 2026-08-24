@@ -241,7 +241,7 @@ def replay_cpg(cfg, n_steps):
         du_main        = float(c.get("du_main", 0.1)),
         dv_main        = float(c.get("dv_main", 0.3)),
         refrac_main    = int(c.get("refrac_main", 1)),
-        vth_fb         = 200,#float(c.get("vth_fb", 100.0)),
+        vth_fb         = float(c.get("vth_fb", 100.0)),
         du_fb          = float(c.get("du_fb", 1.0)),
         dv_fb          = float(c.get("dv_fb", 0.0)),
         refrac_fb      = int(c.get("refrac_fb", 1)),
