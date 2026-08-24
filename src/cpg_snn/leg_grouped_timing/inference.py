@@ -1,401 +1,502 @@
 """
-Deployment side for the bursting-LIF CPG + leg-grouped stateful SNN.
+CPG -> SNN inference on the robot  (PyTorch)
+============================================
+Loads best_model.pt + cpg_lif_snn_config.json from a training run, replays the
+CPG, steps the network one timestep at a time, and publishes joint commands to
+the servo controller.
 
-Drop-in replacement for the old CPGChunkStepper / ONNXGaitPredictor /
-run_inference trio.  Three things changed and they all simplify the robot:
+Everything about the model comes from the config, through the same
+`build_model_from_cfg` / `load_run` that visualize.py uses -- so architecture,
+gate mode, taus, group layout and gait set are whatever that checkpoint was
+trained with, including for configs predating any given option.  No ONNX.
 
-1.  No ODE solver.  `LIFCPGStepper.step()` is one integer timestep of pure
-    numpy — a 4x4 matmul and two LIF updates.  There is no chunk-vs-batch
-    integration mismatch left to worry about, so `chunk_size` is gone from
-    the config; chunking here is purely a serial-write batching knob.
+The one thing NOT in the config is the servo wiring: gait-table column ->
+servo id, and the sign/offset conventions of the physical robot.  Training has
+no business knowing those, so they live here (--servo_ids).
 
-2.  No SpikeEventBuffer, no window, no phase computation on the critical
-    path.  The SNN is stateful: it is called once per CPG timestep with the
-    4 spike bits and its own previous state.  `gait_period` is never used
-    by the controller — it appears in the config for diagnostics only.
-
-3.  Inference runs every timestep, not every spike event.  With the
-    supplied CPG that is 254 calls per gait cycle instead of ~40, so the
-    per-call latency budget is tighter; servo writes are decimated
-    separately via --servo_every.
-
-Requires from the training run:
-    cpg_lif_snn_step.onnx
-    cpg_lif_snn_config.json
+Usage
+-----
+    python run_inference.py --model_dir test1
+    python run_inference.py --model_dir test1 --no_robot     # offline check
+    python run_inference.py --model_dir test1 --gait ripple
+    python run_inference.py --model_dir test1 --cycle_time 1.5
+    python run_inference.py --model_dir test1 --gait_schedule 0:0,8:1,16:0
 """
 
 import argparse
-import json
-import os
-import threading as _threading
+import sys
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
-# Reuse the exact CPG classes from the trainer so there is one definition.
 from train import (
-    LIFGeneralArray, BurstingLIF, LIFCPGStepper, CPG_W,
-    GAIT_TABLES_ORIG, GAIT_NAMES, upsample_gait_tables,
-    detect_burst_threshold,
+    LIFCPGStepper, cfg_get, load_run, outputs_path,
 )
 
+# Hexapod servo ids, in gait-table column order (18 columns -> 18 servos).
+# Taken from the previous ONNX inference script.
+HEXAPOD_SERVO_IDS = [5, 3, 1, 11, 9, 7, 17, 15, 13,
+                     18, 16, 14, 12, 10, 8, 6, 4, 2]
+
 
 # ═══════════════════════════════════════════════════════════════════
-# 1.  Stateful ONNX predictor
+# 1.  CPG source (one timestep at a time)
 # ═══════════════════════════════════════════════════════════════════
 
-class StatefulSNNPredictor:
+class CPGSource:
     """
-    Wraps the single-timestep ONNX graph and owns the recurrent state.
+    Yields one (n_cpg,) spike vector per call, matching what training used.
 
-    Call `step(spikes, gait_idx)` once per CPG timestep.  State is kept in
-    numpy between calls, so a dropped or duplicated call desynchronises the
-    controller from the CPG — keep the loop 1:1.
-    """
-
-    def __init__(self, onnx_path, n_legs, hidden_per_leg, intra_threads=2):
-        import onnxruntime as ort
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = intra_threads
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.sess = ort.InferenceSession(str(onnx_path), so,
-                                         providers=["CPUExecutionProvider"])
-        self.state_names_in = ["mem1_in", "spk1_in", "mem2_in",
-                               "spk2_in", "memo_in"]
-        self.n_legs = n_legs
-        self.hg     = hidden_per_leg
-        self.reset()
-
-    def reset(self):
-        z = lambda: np.zeros((1, self.n_legs, self.hg), dtype=np.float32)
-        self.state = [z() for _ in range(5)]
-
-    def step(self, spikes, gait_idx):
-        feed = {"spikes": spikes.reshape(1, -1).astype(np.float32),
-                "gait":   np.array([gait_idx], dtype=np.int64)}
-        for name, val in zip(self.state_names_in, self.state):
-            feed[name] = val
-        out = self.sess.run(None, feed)
-        self.state = list(out[1:])
-        return out[0][0]                      # (8,) normalised angles
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 2.  Online phase tracker  (diagnostics / GT overlay ONLY)
-# ═══════════════════════════════════════════════════════════════════
-
-class OnlinePhase:
-    """
-    Streaming burst-onset detector on CPG neuron 0.
-
-    Used only to index the gait lookup table for the ground-truth overlay
-    in the recorded plots.  The controller does not consume it.
+    Real CPG: stepped live -- it is cheap (numpy, N<=6) and runs indefinitely.
+    Fake CPG: fake_step_chunk is a block generator, not a stepper, so one
+    period is precomputed and cycled.  Exact, since the pattern is periodic by
+    construction.
     """
 
-    def __init__(self, burst_thresh, init_period=254.0):
-        self.thr        = float(burst_thresh)
-        self.period     = float(init_period)
-        self.last_spike = None
-        self.last_onset = None
+    def __init__(self, cfg):
+        c = dict(cfg.get("cpg", {}))
+        self.N = int(c.get("N") or cfg_get(cfg, "n_cpg_neurons", 4))
+        W = np.asarray(c["W"], dtype=np.float64) if "W" in c else None
+        self.cpg = LIFCPGStepper(
+            N=self.N, W=W,
+            i_app          = float(c.get("i_app", 8.0)),
+            vth_main       = float(c.get("vth_main", 100.0)),
+            du_main        = float(c.get("du_main", 0.1)),
+            dv_main        = float(c.get("dv_main", 0.3)),
+            refrac_main    = int(c.get("refrac_main", 1)),
+            vth_fb         = float(c.get("vth_fb", 100.0)),
+            du_fb          = float(c.get("du_fb", 1.0)),
+            dv_fb          = float(c.get("dv_fb", 0.0)),
+            refrac_fb      = int(c.get("refrac_fb", 1)),
+            from_fb_weight = float(c.get("from_fb_weight", -1e6)),
+            to_fb_weight   = float(c.get("to_fb_weight", 10.0)))
 
-    def update(self, t, spiked):
-        if spiked:
-            if self.last_spike is None or (t - self.last_spike) > self.thr:
-                if self.last_onset is not None:
-                    p = t - self.last_onset
-                    if 0.5 * self.period < p < 2.0 * self.period:
-                        self.period = 0.9 * self.period + 0.1 * p
-                self.last_onset = t
-            self.last_spike = t
-        if self.last_onset is None:
-            return 0.0
-        return float(np.clip((t - self.last_onset) / self.period, 0.0, 0.999))
+        self.fake = bool(cfg_get(cfg, "fake_cpg", False))
+        if self.fake:
+            # One period, then cycle. fake_step_chunk's period is
+            # n_spikes * N where n_spikes = (vth_fb//to_fb)*(refrac+1).
+            n_spikes = int((self.cpg.vth_fb // self.cpg.to_fb_weight)
+                           * (self.cpg.refrac_main + 1))
+            self.loop = self.cpg.fake_step_chunk(n_spikes * self.N)
+            self.i = 0
+        else:
+            self.cpg.step_chunk(int(c.get("warmup", 2000)))
+
+    def step(self):
+        if self.fake:
+            row = self.loop[self.i % len(self.loop)]
+            self.i += 1
+            return row
+        return self.cpg.step()
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 3.  Shared state / serial worker  (unchanged in spirit)
+# 2.  Gait selection
+# ═══════════════════════════════════════════════════════════════════
+#
+# The inference loop only ever READS `selector.index`.  Every way of changing
+# the gait is a subclass that writes to it from its own thread, so the loop
+# carries no selection logic and the input methods are independent of each
+# other.  The intended end state is one ROS node per method; each would
+# subclass this the same way and drop in without touching the loop.
+
+# W/A/S/D -> gait-name suffix.  The names come from the gait CSVs themselves
+# (tripod, tripod_left, tripod_backwards, tripod_right, ...), so a base name
+# plus a suffix is all that is needed -- nothing here is hardcoded to tripod.
+WASD_SUFFIX = {"w": "", "a": "_left", "s": "_backwards", "d": "_right"}
+
+
+class GaitSelector:
+    """Thread-safe holder for the current gait index. Base class = fixed."""
+
+    kind = "none"
+
+    def __init__(self, names, initial=0):
+        self.names   = list(names)
+        self._idx    = int(initial)
+        self._lock   = threading.Lock()
+        self._stop   = threading.Event()
+        self._thread = None
+
+    @property
+    def index(self):
+        with self._lock:
+            return self._idx
+
+    def set_index(self, i, why=""):
+        if not 0 <= i < len(self.names):
+            print(f"  ignoring gait index {i} (valid 0..{len(self.names)-1})")
+            return
+        with self._lock:
+            changed = i != self._idx
+            self._idx = i
+        if changed:
+            print(f"  gait -> {self.names[i]} [{i}]{why}")
+
+    def describe(self):
+        return f"{self.kind}, starting on {self.names[self.index]}"
+
+    def start(self):
+        """Called once, after settling. Subclasses spawn their listener here."""
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _spawn(self, target):
+        self._thread = threading.Thread(target=target, daemon=True)
+        self._thread.start()
+
+
+class ScheduledGait(GaitSelector):
+    """Switch on a wall-clock schedule derived from cycle counts."""
+
+    kind = "schedule"
+
+    def __init__(self, names, schedule, cycle_time):
+        super().__init__(names, schedule[0][1])
+        self.schedule, self.cycle_time = schedule, cycle_time
+
+    def describe(self):
+        return f"{self.kind}: " + "  ".join(
+            f"{c:g}cyc->{self.names[i]}" for c, i in self.schedule)
+
+    def start(self):
+        self._spawn(self._loop)
+
+    def _loop(self):
+        # Absolute deadlines from a single t0, so a slow set_index cannot make
+        # later switches drift.
+        t0 = time.perf_counter()
+        for cyc, idx in self.schedule:
+            wait = t0 + cyc * self.cycle_time - time.perf_counter()
+            if wait > 0 and self._stop.wait(wait):
+                return
+            self.set_index(idx, f"  [schedule @ {cyc:g} cyc]")
+
+
+class KeyboardGait(GaitSelector):
+    """WASD on stdin. W=forward, A=left, S=backwards, D=right."""
+
+    kind = "keyboard"
+
+    def __init__(self, names, base, initial=0):
+        super().__init__(names, initial)
+        self.base = base
+        self.targets, missing = {}, []
+        for key, suffix in WASD_SUFFIX.items():
+            name = base + suffix
+            if name in self.names:
+                self.targets[key] = self.names.index(name)
+            else:
+                missing.append((key.upper(), name))
+        if not self.targets:
+            raise SystemExit(
+                f"--base_gait {base!r} yields no usable names. Config has: "
+                f"{self.names}")
+        if missing:
+            print(f"  no gait for: " + ", ".join(f"{k}={n}" for k, n in missing)
+                  + " (those keys will do nothing)")
+
+    def describe(self):
+        return f"{self.kind}: " + "  ".join(
+            f"{k.upper()}={self.names[i]}" for k, i in self.targets.items())
+
+    def start(self):
+        if not sys.stdin.isatty():
+            print("  stdin is not a TTY -- keyboard control disabled, gait "
+                  "stays fixed")
+            return
+        print(f"  keys: " + "  ".join(f"{k.upper()}={self.names[i]}"
+                                     for k, i in self.targets.items()))
+        self._spawn(self._loop)
+
+    def _loop(self):
+        # cbreak rather than raw: it leaves ISIG enabled so Ctrl+C still
+        # reaches the main thread. Settings are restored in the finally.
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while not self._stop.is_set():
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    ch = sys.stdin.read(1).lower()
+                    if ch in self.targets:
+                        self.set_index(self.targets[ch], f"  [key {ch.upper()}]")
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def make_gait_selector(kind, names, args):
+    if kind in ("gesture", "joystick"):
+        raise NotImplementedError(
+            f"--gait_switch {kind} is not implemented. Subclass GaitSelector, "
+            f"override start() to spawn a listener that calls set_index(), and "
+            f"register it in make_gait_selector -- the inference loop needs no "
+            f"changes.")
+    if kind == "schedule":
+        if not args.gait_schedule:
+            raise SystemExit("--gait_switch schedule needs --gait_schedule")
+        return ScheduledGait(names, parse_schedule(args.gait_schedule, names),
+                             args.cycle_time)
+    if kind == "keyboard":
+        return KeyboardGait(names, args.base_gait,
+                            resolve_gait(args.gait, names))
+    return GaitSelector(names, resolve_gait(args.gait, names))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 3.  Servo output
 # ═══════════════════════════════════════════════════════════════════
 
-class SharedState:
-    def __init__(self):
-        self._lock = _threading.Lock()
-        self._gait = 0
-        self._cmd  = None
+class ServoPublisher:
+    """ROS2 ServosPosition publisher, or a no-op when --no_robot."""
 
-    def set_gait(self, g):
-        with self._lock:
-            self._gait = int(g)
+    def __init__(self, servo_ids, enabled=True, duration=0.02, rate_hz=10.0):
+        self.ids, self.enabled, self.duration = servo_ids, enabled, duration
+        if not enabled:
+            print("  --no_robot: commands computed but not published")
+            return
+        import rclpy
+        from rclpy.node import Node
+        from servo_controller_msgs.msg import ServoPosition, ServosPosition
+        self._ServoPosition, self._ServosPosition = ServoPosition, ServosPosition
+        rclpy.init()
+        self.node = Node("run_inference")
+        self.pub = self.node.create_publisher(ServosPosition, "servo_controller", 1)
+        print(f"  ROS2 publisher up on 'servo_controller' ({len(servo_ids)} servos)")
 
-    def get_gait(self):
-        with self._lock:
-            return self._gait
+    def publish(self, values):
+        if not self.enabled:
+            return
+        msg = self._ServosPosition()
+        msg.duration = self.duration
+        msg.position = [self._ServoPosition(id=i, position=float(v))
+                        for i, v in zip(self.ids, values)]
+        msg.position_unit = "pulse"
+        self.pub.publish(msg)
 
-    def set_cmd(self, cmd):
-        with self._lock:
-            self._cmd = cmd
-
-    def pop_cmd(self):
-        with self._lock:
-            c, self._cmd = self._cmd, None
-        return c
-
-
-def serial_worker(shared, n_joints, stop_event, port=None, baud=115200):
-    """Replace the body with your own link; kept minimal on purpose."""
-    ser = None
-    if port is not None:
-        import serial
-        ser = serial.Serial(port, baud, timeout=0.05)
-    while not stop_event.is_set():
-        cmd = shared.pop_cmd()
-        if cmd is None:
-            time.sleep(0.001)
-            continue
-        if ser is not None:
-            tag, angles, delay = cmd
-            ser.write((tag + " " + " ".join(str(a) for a in angles) + "\n").encode())
-    if ser is not None:
-        ser.close()
+    def close(self):
+        if self.enabled:
+            import rclpy
+            self.node.destroy_node()
+            rclpy.shutdown()
 
 
 # ═══════════════════════════════════════════════════════════════════
 # 4.  Inference loop
 # ═══════════════════════════════════════════════════════════════════
 
-def run_inference(cfg, onnx_path, out_dir,
-                  t_max=50_000,
-                  gait_schedule=None,
-                  record=True,
-                  robot=True,
-                  serial_port=None,
-                  servo_every=5,
-                  onnx_threads=2):
-    """
-    Parameters
-    ----------
-    cfg           : dict from cpg_lif_snn_config.json
-    gait_schedule : list of (step, gait_idx)
-    servo_every   : write to the servo bus every k timesteps (the SNN still
-                    runs every timestep; this only throttles serial traffic)
-    """
-    global_min  = float(cfg["global_min"])
-    global_max  = float(cfg["global_max"])
-    n_gaits     = int(cfg["n_gaits"])
-    n_legs      = int(cfg["n_legs"])
-    n_joints    = int(cfg["n_joints"])
-    hg          = int(cfg["hidden_per_leg"])
-    gait_names  = cfg["gait_names"]
-    leg_cols    = [tuple(c) for c in cfg["leg_cols"]]
-    servo_base  = int(cfg["servo_base"])
-    target_rows = int(cfg["target_rows"])
-    phase_zero  = float(cfg.get("phase_zero", 0.0))
-    period_hint = float(cfg.get("cpg_period_steps", 254.0))
-    cpgp        = cfg["cpg"]
+@torch.no_grad()
+def run(model, cfg, pub, sel, args, device):
+    n_joints = int(cfg_get(cfg, "n_joints", 8))
+    lo = float(cfg_get(cfg, "global_min", -124.0))
+    hi = float(cfg_get(cfg, "global_max", 124.0))
+    scale, shift = (hi - lo) / 2.0, (hi + lo) / 2.0
+    period = float(cfg_get(cfg, "cpg_period_steps", 254.0))
+    names = list(cfg_get(cfg, "gait_names", []))
 
-    scale = (global_max - global_min) / 2.0
-    shift = (global_max + global_min) / 2.0
+    # Timesteps have no inherent duration -- training only ever counted them.
+    # cycle_time fixes the mapping: one gait cycle is `period` steps, so a step
+    # is cycle_time/period seconds. This replaces the previous script's magic
+    # sleep(0.07).
+    dt = args.cycle_time / period
+    print(f"\n  period {period:.0f} steps/cycle, cycle_time {args.cycle_time}s"
+          f"  ->  dt {1e3*dt:.2f} ms/step ({1.0/dt:.0f} Hz)")
+    print(f"  publishing every {args.publish_every} step(s) "
+          f"({1.0/(dt*args.publish_every):.1f} Hz)")
 
-    print(f"  legs->servos: " + ", ".join(
-        f"leg{l}=({leg_cols[l][0]+servo_base},{leg_cols[l][1]+servo_base})"
-        for l in range(n_legs)))
-    print(f"  leg->neuron routing per gait: {cfg['route_leg2neuron']}")
+    print(f"  gait switching: {sel.describe()}")
 
-    gait_tables, _ = upsample_gait_tables(GAIT_TABLES_ORIG, gait_names,
-                                          target_rows, verbose=False)
+    cpg = CPGSource(cfg)
+    state = model.init_state(1, device)
+    gait_t = torch.zeros(1, dtype=torch.long, device=device)
 
-    shared     = SharedState()
-    stop_event = _threading.Event()
-    if robot:
-        ser_thread = _threading.Thread(
-            target=serial_worker,
-            args=(shared, n_joints, stop_event),
-            kwargs={"port": serial_port}, daemon=True, name="serial-worker")
-        ser_thread.start()
-        print("  Serial thread started.")
-    else:
-        ser_thread = None
-        print("  --no_robot: serial thread suppressed.")
+    settle = int(args.settle_cycles * period)
+    n_steps = settle + int(args.cycles * period) if args.cycles > 0 else -1
+    print(f"  settling {settle} steps ({args.settle_cycles} cycles) before "
+          f"publishing\n")
 
-    predictor = StatefulSNNPredictor(onnx_path, n_legs, hg,
-                                     intra_threads=onnx_threads)
-    cpg = LIFCPGStepper(
-        N=int(cfg.get("n_cpg_neurons", 4)),
-        W=np.asarray(cpgp["W"]), i_app=cpgp["i_app"],
-        vth_main=cpgp["vth_main"], du_main=cpgp["du_main"],
-        dv_main=cpgp["dv_main"], refrac_main=cpgp["refrac_main"],
-        vth_fb=cpgp["vth_fb"], du_fb=cpgp["du_fb"], dv_fb=cpgp["dv_fb"],
-        refrac_fb=cpgp["refrac_fb"],
-        from_fb_weight=cpgp["from_fb_weight"],
-        to_fb_weight=cpgp["to_fb_weight"])
-
-    # ── Boot: identical to training ──────────────────────────────
-    warmup = int(cpgp.get("warmup", 2000))
-    print(f"  Warming up CPG ({warmup} steps) ...")
-    warm_spk = cpg.step_chunk(warmup)
-    print("  CPG settled.")
-
-    # burst threshold from the warm-up trace (diagnostics only)
-    ts0 = np.where(warm_spk[:, 0] > 0)[0]
-    burst_thr = detect_burst_threshold(ts0) if len(ts0) > 8 else 30.0
-    phaser = OnlinePhase(burst_thr, init_period=period_hint)
-    print(f"  Burst ISI threshold (diagnostics) = {burst_thr:.1f}")
-
-    # The SNN state starts at zero; give it a few cycles of CPG input with
-    # the initial gait before trusting the output.
-    settle = int(3 * period_hint)
-    g0 = gait_schedule[0][1] if gait_schedule else 0
-    for _ in range(settle):
-        predictor.step(cpg.step(), g0)
-    shared.set_gait(g0)
-    print(f"  SNN state settled over {settle} steps.\n")
-
-    schedule = sorted(gait_schedule, key=lambda x: x[0]) if gait_schedule else []
-    sched_ptr = 0
-
-    rec = {k: [] for k in ("t", "spikes", "gait", "pred", "true", "phase")}
-    latencies = []
-
-    print(f"Running inference: {t_max} steps ...")
+    lat, t_start, step, started = [], time.perf_counter(), 0, False
     try:
-        for step in range(t_max):
-            while sched_ptr < len(schedule) and step >= schedule[sched_ptr][0]:
-                shared.set_gait(schedule[sched_ptr][1])
-                print(f"  step {step:>7d}: gait -> "
-                      f"{gait_names[schedule[sched_ptr][1]]}")
-                sched_ptr += 1
+        while n_steps < 0 or step < n_steps:
+            # Selection lives entirely in the selector's own thread; the loop
+            # just reads whatever is current.
+            gait_t.fill_(sel.index)
 
-            active_gait = shared.get_gait()
-
+            x = torch.as_tensor(cpg.step(), dtype=torch.float32,
+                                device=device).unsqueeze(0)
             t0 = time.perf_counter()
-            spk = cpg.step()
-            pred_norm = predictor.step(spk, active_gait)
-            latencies.append((time.perf_counter() - t0) * 1000.0)
+            y, state, _ = model.step(x, gait_t, state)
+            lat.append((time.perf_counter() - t0) * 1e3)
 
-            pred_deg = pred_norm * scale + shift
+            if step >= settle:
+                if not started:
+                    started = True
+                    # Started here, not before settling, so schedule cycle 0
+                    # means "first published cycle" rather than counting the
+                    # settling steps.
+                    sel.start()
+                    print(f"  settled -- publishing\n")
+                if step % args.publish_every == 0:
+                    pub.publish(y[0].cpu().numpy() * scale + shift)
 
-            if robot and (step % servo_every == 0):
-                full_angles = [0] * 16
-                for j in range(n_joints):
-                    full_angles[j + servo_base] = int(np.clip(pred_deg[j], -124, 124))
-                shared.set_cmd(["L", full_angles, 0.0])
-
-            if record:
-                ph = phaser.update(cpg.t, spk[0] > 0)
-                row = int(((ph + phase_zero) % 1.0) * target_rows) % target_rows
-                rec["t"].append(cpg.t)
-                rec["spikes"].append(spk.copy())
-                rec["gait"].append(active_gait)
-                rec["phase"].append(ph)
-                rec["pred"].append(pred_deg.copy())
-                rec["true"].append(gait_tables[active_gait][row].astype(np.float32))
+            step += 1
+            # Sleep the remainder of this step's budget rather than a fixed
+            # amount, so compute time does not accumulate as phase drift.
+            slack = (t_start + step * dt) - time.perf_counter()
+            if slack > 0:
+                time.sleep(slack)
+    except KeyboardInterrupt:
+        print("\n  [INTERRUPT] stopping")
     finally:
-        stop_event.set()
-        if ser_thread is not None:
-            ser_thread.join(timeout=2.0)
-            print("  Serial thread stopped.")
+        sel.stop()
 
-    lat = np.array(latencies)
-    print(f"\nCPG step + SNN step latency ({len(lat)} steps):")
-    for name, v in (("mean", np.mean(lat)), ("median", np.median(lat)),
-                    ("p95", np.percentile(lat, 95)),
-                    ("p99", np.percentile(lat, 99)), ("max", np.max(lat))):
-        print(f"  {name:<7}: {v:.3f} ms")
-    print(f"  sustainable gait rate: "
-          f"{1000.0 / (np.mean(lat) * period_hint):.2f} cycles/s")
-
-    if not record:
-        return None
-    return {k: np.array(v) for k, v in rec.items()} | {
-        "latencies": lat, "gait_names": gait_names,
-        "leg_cols": leg_cols, "n_joints": n_joints}
+    if lat:
+        l = np.array(lat)
+        print(f"\n  model.step latency over {len(l)} calls (ms): "
+              f"mean {l.mean():.3f}  median {np.median(l):.3f}  "
+              f"p95 {np.percentile(l, 95):.3f}  max {l.max():.3f}")
+        print(f"  budget per step {1e3*dt:.2f} ms -> "
+              f"{'OK' if np.percentile(l, 95) < 1e3*dt else 'OVER BUDGET'}")
+        real = time.perf_counter() - t_start
+        print(f"  {step} steps in {real:.1f}s = {step/max(real,1e-9):.0f} Hz "
+              f"(target {1.0/dt:.0f} Hz)")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 5.  Plots
-# ═══════════════════════════════════════════════════════════════════
+def resolve_gait(g, names):
+    """Accept a gait index or a name from the config's gait_names."""
+    if g is None:
+        return 0
+    if g.isdigit():
+        return int(g)
+    if g not in names:
+        raise SystemExit(f"Unknown gait {g!r}; config has {names}")
+    return names.index(g)
 
-def plot_run(res, out_dir, n_show=3000):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
-    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    sl = slice(0, min(n_show, len(res["t"])))
-    t  = res["t"][sl]
-    colors = ["#e63946", "#457b9d", "#2a9d8f", "#f4a261"]
+def parse_schedule(s, names):
+    """
+    "0:tripod,8:ripple,16:1" -> [(0.0, 0), (8.0, 4), (16.0, 1)].
 
-    fig, axes = plt.subplots(6, 1, figsize=(15, 14), sharex=True,
-                             height_ratios=[1.2, 0.6, 1, 1, 1, 1])
-    ax = axes[0]
-    for i in range(res["spikes"].shape[1]):
-        idx = np.where(res["spikes"][sl, i] > 0)[0]
-        ax.scatter(t[idx], np.full_like(idx, i), marker="|", s=90,
-                   color=colors[i % 4])
-    ax.set_yticks(range(4)); ax.set_yticklabels([f"CPG {i}" for i in range(4)])
-    ax.set_title("CPG raster"); ax.grid(axis="x", alpha=0.2)
-
-    axes[1].step(t, res["gait"][sl], where="post", color="#6a0572", lw=1.6)
-    axes[1].set_yticks(range(len(res["gait_names"])))
-    axes[1].set_yticklabels(res["gait_names"])
-    axes[1].set_ylabel("gait"); axes[1].grid(alpha=0.25)
-
-    for l, (a, b) in enumerate(res["leg_cols"]):
-        ax = axes[2 + l]
-        ax.plot(t, res["true"][sl, a], color="#457b9d", lw=1.6, label=f"GT c{a}")
-        ax.plot(t, res["pred"][sl, a], color="#e63946", lw=1.2, ls="--",
-                label=f"pred c{a}")
-        on = np.where(res["spikes"][sl, l] > 0)[0]
-        ax.set_ylabel(f"leg{l} (deg)"); ax.legend(fontsize=7); ax.grid(alpha=0.25)
-    axes[-1].set_xlabel("CPG timestep")
-    plt.suptitle("Deployment trace — stateful SNN driven by bursting-LIF CPG",
-                 fontweight="bold")
-    plt.tight_layout()
-    p = out_dir / "deploy_trace.png"
-    plt.savefig(p, dpi=140); plt.close()
-    print(f"  [saved] {p}")
-
-    v = np.ones(len(res["t"]), dtype=bool)
-    rmse = np.sqrt(np.mean((res["pred"][v] - res["true"][v]) ** 2, axis=0))
-    print("  per-column RMSE (deg): " +
-          "  ".join(f"c{j}={rmse[j]:.2f}" for j in range(len(rmse))))
+    Sorted by cycle, and an entry at cycle 0 is required so the starting gait
+    is explicit rather than inherited from an unrelated flag.
+    """
+    out = []
+    for part in s.split(","):
+        if ":" not in part:
+            raise SystemExit(f"--gait_schedule entry {part!r} is not cycle:gait")
+        cyc, g = part.split(":", 1)
+        out.append((float(cyc), resolve_gait(g.strip(), names)))
+    out.sort()
+    if not out or out[0][0] != 0.0:
+        raise SystemExit("--gait_schedule must include an entry at cycle 0")
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 6.  CLI
+# 5.  Entry point
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model_dir", type=str,
-                    default="outputs")
-    ap.add_argument("--out_dir",   type=str, default="outputs/inference_out")
-    ap.add_argument("--t_max",     type=int, default=20_000)
-    ap.add_argument("--no_robot",  action="store_true")
-    ap.add_argument("--serial_port", type=str, default=None)
-    ap.add_argument("--servo_every", type=int, default=5)
-    ap.add_argument("--onnx_threads", type=int, default=2)
+    ap = argparse.ArgumentParser(
+        description="CPG-SNN inference on the robot (PyTorch)")
+    ap.add_argument("--model_dir", type=str, default="",
+                    help="Resolved as outputs/<model_dir>, same as "
+                         "visualize.py. Default '' = outputs/ itself.")
+    ap.add_argument("--ckpt", type=str, default="best_model.pt")
+    ap.add_argument("--cfg",  type=str, default="cpg_lif_snn_config.json")
+    ap.add_argument("--gait_switch", type=str, default="none",
+                    choices=["none", "schedule", "keyboard", "gesture",
+                             "joystick"],
+                    help="Where gait changes come from. 'none': hold --gait "
+                         "(index 0 by default). 'schedule': follow "
+                         "--gait_schedule. 'keyboard': WASD on stdin, using "
+                         "--base_gait plus a direction suffix. 'gesture' and "
+                         "'joystick' are placeholders and raise "
+                         "NotImplementedError.")
+    ap.add_argument("--gait", type=str, default="0",
+                    help="Starting gait, index or name from the config's "
+                         "gait_names. Used by 'none' and as the initial gait "
+                         "for 'keyboard'.")
+    ap.add_argument("--gait_schedule", type=str, default=None,
+                    help="For --gait_switch schedule: 'cycle:gait' pairs, e.g. "
+                         "'0:tripod,8:ripple,16:0'. Cycles count from the "
+                         "first published cycle, not from start-up.")
+    ap.add_argument("--base_gait", type=str, default="tripod",
+                    help="For --gait_switch keyboard: W uses this name, A/S/D "
+                         "append _left/_backwards/_right. Any missing name is "
+                         "reported at start-up and its key does nothing.")
+    ap.add_argument("--cycle_time", type=float, default=2.0,
+                    help="Wall-clock seconds per gait cycle. Sets the real "
+                         "duration of a CPG timestep (cycle_time/period); "
+                         "training only counted steps, so this is where the "
+                         "physical timescale is chosen. Lower = faster gait.")
+    ap.add_argument("--cycles", type=float, default=0,
+                    help="Gait cycles to run after settling. 0 = forever "
+                         "(Ctrl+C to stop).")
+    ap.add_argument("--settle_cycles", type=float, default=3.0,
+                    help="Cycles to step the model before publishing, so the "
+                         "membranes are not at their zero-state transient "
+                         "when the servos start following.")
+    ap.add_argument("--publish_every", type=int, default=1,
+                    help="Publish every Nth timestep. Raise if the servo "
+                         "controller cannot keep up with 1/dt Hz.")
+    ap.add_argument("--servo_ids", type=str, default=None,
+                    help="Comma-separated servo ids in gait-table COLUMN "
+                         "order. Default is the 18-servo hexapod map. Must be "
+                         "n_joints long.")
+    ap.add_argument("--duration", type=float, default=0.02,
+                    help="ServosPosition.duration field (seconds).")
+    ap.add_argument("--no_robot", action="store_true",
+                    help="Compute commands but publish nothing. No ROS "
+                         "imports, so this runs anywhere.")
+    ap.add_argument("--device", type=str, default=None,
+                    help="cuda / cpu. Default: cuda if available.")
     args = ap.parse_args()
 
-    this_file_dir = os.path.dirname(os.path.abspath(__file__))
-    out_dir = Path(this_file_dir + "/" + args.out_dir)
+    device = torch.device(args.device if args.device else
+                          ("cuda" if torch.cuda.is_available() else "cpu"))
+    this_dir = Path(__file__).resolve().parent
+    model_dir = outputs_path(str(this_dir), args.model_dir)
+    print(f"Device : {device}\nModel  : {model_dir}\n")
 
-    md  = Path(this_file_dir + "/" + args.model_dir)
-    cfg = json.loads((md / "cpg_lif_snn_config.json").read_text())
-    onnx_path = md / "cpg_lif_snn_step.onnx"
+    print("[1/3] Loading checkpoint + config ...")
+    cfg, model, arch = load_run(model_dir, args.ckpt, args.cfg, device)
+    model.eval()
 
-    # one gait per quarter of the run
-    q = args.t_max // 4
-    schedule = [(0, 0), (q, 1), (2 * q, 2), (3 * q, 3)]
+    n_joints = int(cfg_get(cfg, "n_joints", 8))
+    ids = ([int(v) for v in args.servo_ids.split(",")] if args.servo_ids
+           else HEXAPOD_SERVO_IDS[:n_joints] if n_joints <= len(HEXAPOD_SERVO_IDS)
+           else None)
+    if ids is None or len(ids) != n_joints:
+        raise SystemExit(
+            f"Need {n_joints} servo ids for this model's n_joints; got "
+            f"{len(ids) if ids else 0}. Pass --servo_ids explicitly.")
+    print(f"  arch={arch}  n_joints={n_joints}  "
+          f"gate_mode={cfg_get(cfg, 'gate_mode', 'n/a')}  "
+          f"fake_cpg={bool(cfg_get(cfg, 'fake_cpg', False))}")
+    print(f"  column -> servo: {list(zip(range(n_joints), ids))}")
 
-    res = run_inference(cfg, onnx_path, Path(out_dir),
-                        t_max=args.t_max, gait_schedule=schedule,
-                        record=True, robot=not args.no_robot,
-                        serial_port=args.serial_port,
-                        servo_every=args.servo_every,
-                        onnx_threads=args.onnx_threads)
-    if res is not None:
-        plot_run(res, Path(out_dir))
+    print("\n[2/3] Output + gait switching ...")
+    pub = ServoPublisher(ids, enabled=not args.no_robot,
+                         duration=args.duration)
+    sel = make_gait_selector(args.gait_switch,
+                             list(cfg_get(cfg, "gait_names", [])), args)
+
+    print("\n[3/3] Running ...")
+    try:
+        run(model, cfg, pub, sel, args, device)
+    finally:
+        pub.close()
+    print("\nDone.")
 
 
 if __name__ == "__main__":

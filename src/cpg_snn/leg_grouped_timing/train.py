@@ -487,7 +487,7 @@ def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False):
     fake_cpg=True substitutes fake_step_chunk's back-to-back, no-gap bursts
     for the real oscillator's output -- see that method's docstring.
     """
-    cpg = LIFCPGStepper(N=N, i_app=i_app, vth_fb=100)
+    cpg = LIFCPGStepper(N=N, i_app=i_app)
     print(f"  N={N}  i_app={i_app}  from_fb_weight={CPG_FROM_FB_WEIGHT:g}")
     if fake_cpg:
         print(f"  FAKE CPG: back-to-back bursts, no inter-burst gap "
@@ -2790,6 +2790,136 @@ def plot_transition(model, spikes, targets, device, out_dir, tgt_range,
     p = out_dir / "transition.png"
     plt.savefig(p, dpi=140); plt.close()
     print(f"    [saved] {p}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 9b. Config / checkpoint loading  (used by visualize.py, run_inference.py)
+# ═══════════════════════════════════════════════════════════════════
+
+def cfg_get(cfg, key, default=None):
+    """
+    Look a key up at the config top level, then in `model_detail`, then in the
+    verbatim `args` dump.
+
+    Three places because the config records the same fact more than once on
+    purpose: the top level is the deployment contract, `model_detail` is the
+    reproduction record, and `args` is whatever was actually typed.  Older
+    configs (config_version 2, pre-timing-layer) are missing the newer keys
+    entirely, hence the default.
+    """
+    for src in (cfg, cfg.get("model_detail", {}), cfg.get("args", {})):
+        if isinstance(src, dict) and src.get(key) is not None:
+            return src[key]
+    return default
+
+
+def build_model_from_cfg(cfg, device):
+    """Reconstruct the trained architecture.  Shapes must match the
+    checkpoint exactly; init-only values (tau ranges, weight scales) are
+    irrelevant to the loaded weights but are passed through anyway so the
+    printed summary is honest about what the run used."""
+    arch = cfg_get(cfg, "arch", "dense")
+
+    # Only reached for configs missing these keys (they are recorded now).
+    # Derived the same way train.py derives them, so an old config still gets
+    # self-consistent values rather than quadruped-specific constants.
+    _P = float(cfg_get(cfg, "cpg_period_steps", 254.0))
+    _n_cpg = int(cfg_get(cfg, "n_cpg_neurons", 4))
+
+    common = dict(
+        n_gaits   = int(cfg_get(cfg, "n_gaits", 4)),
+        max_gaits = int(cfg_get(cfg, "max_gaits", 16)),
+        n_neurons = int(cfg_get(cfg, "n_cpg_neurons", 4)),
+        n_joints  = int(cfg_get(cfg, "n_joints", N_JOINTS)),
+        tau_min   = float(cfg_get(cfg, "tau_min", 2.0)),
+        tau_max   = float(cfg_get(cfg, "tau_max", 256.0)),
+        slope     = float(cfg_get(cfg, "slope", 25.0)),
+    )
+
+    if arch == "timing_grouped":
+        n_timing = int(cfg_get(cfg, "n_timing", N_LEGS))
+        cfg_leg_cols = cfg_get(cfg, "leg_cols")
+        gc_kwargs = {"n_joints": common["n_joints"]}
+        if cfg_leg_cols is not None:
+            gc_kwargs["leg_cols"] = cfg_leg_cols
+        group_cols = cfg_get(cfg, "group_cols") or build_group_cols(
+            n_timing, **gc_kwargs)
+        # A config from the (reverted) shared-router era has router_hidden
+        # set and a checkpoint containing w_r/w_t, neither of which exists in
+        # this class any more -- load_run's strict=False report will flag it.
+        #
+        # readout_hidden / tau_readout_max fall back to what was ACTUALLY
+        # true before those became separate options, not to their current
+        # smarter defaults: readout_hidden didn't exist yet, and the readout
+        # membrane was simply Hg wide (see the "Ho == Hg (the original)"
+        # comment in TimingGroupedSNN.__init__), so its fallback here is
+        # "hidden", not 32. tau_readout_max was hardcoded 40.0 (see the
+        # module's own note on this in --tau_readout_max's help text), not
+        # period/(2*pi) -- that derivation is newer than the option.
+        # timing_slope similarly falls back to "slope": the constructor's own
+        # timing_slope=None branch does exactly this, so a config predating
+        # the separate --timing_slope arg had the timing layer using --slope.
+        _hidden = int(cfg_get(cfg, "hidden", 256))
+        model = TimingGroupedSNN(
+            hidden_per_group = _hidden,
+            n_timing         = n_timing,
+            group_cols       = group_cols,
+            tau_timing_min   = float(cfg_get(cfg, "tau_timing_min", 2.0)),
+            tau_timing_max   = float(cfg_get(cfg, "tau_timing_max",
+                                               _P / _n_cpg)),
+            readout_hidden   = int(cfg_get(cfg, "readout_hidden", _hidden)),
+            tau_readout_max  = float(cfg_get(cfg, "tau_readout_max", 40.0)),
+            timing_slope     = float(cfg_get(cfg, "timing_slope",
+                                               cfg_get(cfg, "slope", 25.0))),
+            timing_reset     = str(cfg_get(cfg, "timing_reset", "subtract")),
+            sub_film         = str(cfg_get(cfg, "sub_film", "both")),
+            # gate_mode replaced the old boolean event_gated. Map the old
+            # key when only it is present: True was the "decay" behaviour
+            # (membranes leak every step), and absent entirely means ungated.
+            gate_mode        = str(cfg_get(
+                cfg, "gate_mode",
+                "decay" if cfg_get(cfg, "event_gated", False) else "none")),
+            # sub_ln changes FORWARD BEHAVIOUR, not shapes, so a wrong value
+            # loads cleanly and then quietly computes something else.
+            sub_ln           = str(cfg_get(cfg, "sub_ln", "l2")),
+            **common)
+    else:
+        model = StatefulSNN(hidden=int(cfg_get(cfg, "hidden", 256)), **common)
+
+    return model.to(device), arch
+
+
+def load_run(model_dir, ckpt_name, cfg_name, device):
+    model_dir = Path(model_dir)
+    cfg_path  = model_dir / cfg_name
+    ckpt_path = model_dir / ckpt_name
+    for p in (cfg_path, ckpt_path):
+        if not p.exists():
+            raise FileNotFoundError(f"Not found: {p}")
+
+    cfg = json.loads(cfg_path.read_text())
+    model, arch = build_model_from_cfg(cfg, device)
+
+    sd = torch.load(ckpt_path, map_location=device)
+    # torch.compile in train.py is an instance-attribute swap on `step`, not a
+    # module wrapper, so keys should be unprefixed -- but strip the wrapper
+    # prefix anyway in case a future run compiles the module itself.
+    if any(k.startswith("_orig_mod.") for k in sd):
+        sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing or unexpected:
+        print(f"  NOTE  missing keys: {list(missing)}")
+        print(f"        unexpected  : {list(unexpected)}")
+        print( "        A non-empty list here means the config and the "
+               "checkpoint disagree — treat every figure as suspect.")
+    model.eval()
+
+    n_par = sum(p.numel() for p in model.parameters())
+    print(f"  Loaded {ckpt_path.name}  ({type(model).__name__}, "
+          f"arch={arch}, {n_par:,} params)")
+    print(f"  Config {cfg_path.name}  (version "
+          f"{cfg.get('config_version', '?')})")
+    return cfg, model, arch
 
 
 # ═══════════════════════════════════════════════════════════════════
