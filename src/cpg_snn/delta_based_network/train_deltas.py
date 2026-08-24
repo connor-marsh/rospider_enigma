@@ -377,38 +377,60 @@ def required_period_for_floor(gait_tables, floor_target_deg, delta_scale,
 
 def proprio_normalisation(gait_tables, tgt_range):
     """
-    Per-joint centre and half-range for the proprioceptive input, expressed
-    in the SAME globally-normalised units the accumulator works in.
+    Centre and half-range for the proprioceptive input, in the same
+    globally-normalised units the accumulator works in.
 
-    The targets use one global min/max across every gait and joint (so the
-    robot needs a single denormalisation), which means a narrow joint only
-    ever occupies a sliver of [-1, 1).  Fed back raw, that joint's channel
-    would carry almost no dynamic range.  Rescaling per joint against its
-    OWN observed span fixes that:
+        p[g,j] = (y_j - centre[g,j]) / halfrange_j
 
-        p_j = (y_j - centre_j) / halfrange_j      ~ [-1, 1] over its range
+    The centre is PER GAIT, the half-range is per joint.  Both parts matter:
 
-    Centred rather than mapped to [0, 1] so that "mid-range" is the zero
-    input, matching the target convention and giving layer 0 a zero-mean
-    signal.
+    Per-gait centre.  Pooling min/max across the whole gait set was a bug.
+    Different gaits park the same joint at different postures -- on hexapod
+    pulsewidth tables the pooled span runs 3-5x the span the joint actually
+    covers inside any ONE gait (e.g. 217 pooled vs 50 within-gait).
+    Normalising against the pooled span therefore left the channel swinging
+    about +/-0.23 instead of +/-1 while a gait was running, throwing away
+    most of the resolution on the signal that closes the loop -- the exact
+    opposite of why per-joint scaling was added.  Subtracting the gait's own
+    centre removes the posture offset, and the network already has the gait
+    index so the lookup costs nothing.
 
-    A joint that never moves across any gait has zero span; its half-range
-    is floored (in the model) rather than dividing by zero, which makes its
-    channel a constant the network can ignore.
+    Per-joint (not per-gait) half-range.  Dividing by each gait's own span
+    would make every channel swing exactly +/-1 everywhere, but a joint that
+    is nearly static in one gait would then get an enormous gain on that
+    gait, amplifying accumulator drift and quantisation into the input.
+    Using the widest within-gait span per joint keeps the gain bounded and
+    honest: a gait that moves the joint less produces a smaller swing,
+    because it genuinely is moving less.
+
+    A joint that never moves in any gait has zero span; its half-range is
+    floored in the model rather than dividing by zero, leaving its channel
+    a constant the network can ignore.
+
+    Units: whatever the gait tables are in.  Degrees for the quadruped,
+    servo pulsewidth for the hexapod -- the maths is identical, only the
+    printed labels differ.
     """
     lo_g, hi_g = tgt_range
     span = (hi_g - lo_g) + 1e-8
     tabs = np.stack([np.asarray(t, dtype=np.float64) for t in gait_tables])
-    lo_j = tabs.min(axis=(0, 1))                      # (J,) degrees
-    hi_j = tabs.max(axis=(0, 1))
-    # degrees -> global normalised: n = (deg - lo_g)/span * 2 - 1
-    centre    = ((lo_j + hi_j) / 2.0 - lo_g) / span * 2.0 - 1.0
-    halfrange = (hi_j - lo_j) / span                  # *2/2 cancels
+
+    lo_gj = tabs.min(axis=1)                          # (G, J) within-gait
+    hi_gj = tabs.max(axis=1)
+    lo_j  = tabs.min(axis=(0, 1))                     # (J,)  pooled
+    hi_j  = tabs.max(axis=(0, 1))
+
+    # raw -> global normalised: n = (raw - lo_g)/span * 2 - 1
+    centre    = ((lo_gj + hi_gj) / 2.0 - lo_g) / span * 2.0 - 1.0   # (G, J)
+    within    = (hi_gj - lo_gj) / span                              # (G, J)
+    halfrange = within.max(axis=0)                                  # (J,)
     return {
-        "centre":         centre,
-        "halfrange":      halfrange,
-        "lo_deg":         lo_j,
-        "hi_deg":         hi_j,
+        "centre":         centre,                     # (G, J) normalised
+        "halfrange":      halfrange,                  # (J,)   normalised
+        "within_span_raw": (hi_gj - lo_gj),           # (G, J) raw units
+        "pooled_span_raw": (hi_j - lo_j),             # (J,)   raw units
+        "lo_raw":         lo_j,
+        "hi_raw":         hi_j,
         "degenerate":     [int(j) for j in np.where(halfrange < 1e-3)[0]],
     }
 
@@ -710,8 +732,27 @@ class DeltaSNN(nn.Module):
             # value exceeds 1, and that excess magnitude is exactly the
             # signal needed to correct it -- clamping would erase the
             # difference between slightly out and far out.
-            c0 = (torch.zeros(self.J) if prop_center is None else
-                  torch.as_tensor(np.asarray(prop_center, dtype=np.float32)))
+            # Centre is per gait: (max_gaits, J), looked up by gait index.
+            # Over-allocated to max_gaits for the same reason FiLM is -- the
+            # tensor shape must not depend on how many gaits this run loaded,
+            # or a checkpoint stops loading when the gait set changes. Unused
+            # rows hold the mean centre so an out-of-range gait index
+            # degrades to "average posture" instead of zero.
+            if prop_center is None:
+                c0 = torch.zeros(max_gaits, self.J)
+            else:
+                c = torch.as_tensor(np.asarray(prop_center,
+                                               dtype=np.float32))
+                if c.ndim != 2 or c.shape[1] != self.J:
+                    raise ValueError(
+                        f"prop_center has shape {tuple(c.shape)}, expected "
+                        f"(n_gaits, n_joints=({self.J})).")
+                if c.shape[0] > max_gaits:
+                    raise ValueError(
+                        f"prop_center has {c.shape[0]} gaits > max_gaits="
+                        f"{max_gaits}.")
+                c0 = c.mean(dim=0, keepdim=True).repeat(max_gaits, 1)
+                c0[:c.shape[0]] = c
             h0 = (torch.ones(self.J) if prop_halfrange is None else
                   torch.as_tensor(np.asarray(prop_halfrange,
                                              dtype=np.float32)))
@@ -834,7 +875,11 @@ class DeltaSNN(nn.Module):
             # network still learns to USE the signal: d loss/d w_h[0] is
             # nonzero through the spikes it drives.
             y_prev = (self.pose + acc).detach()
-            p_in = (y_prev - self.prop_center) / self.prop_halfrange
+            # prop_center is (max_gaits, J); indexing by the gait vector
+            # gives (B, J), so each stream is centred on ITS OWN gait's
+            # posture rather than on the pooled-across-gaits midpoint.
+            p_in = ((y_prev - self.prop_center[gait])
+                    / self.prop_halfrange)
             h = torch.cat([x, p_in], dim=1)
         else:
             h = x
@@ -2256,14 +2301,26 @@ def main():
 
     prop = proprio_normalisation(gait_tables, tgt_range)
     if args.proprio:
+        wmax = prop["within_span_raw"].max(axis=0)     # (J,) widest per joint
+        pooled = prop["pooled_span_raw"]
         print(f"      proprioception ON: {n_joints} extra input channel(s), "
-              f"each joint's commanded angle scaled to +/-1 over its own "
-              f"range")
-        print(f"        per-joint span (deg): " +
-              " ".join(f"{v:.1f}" for v in (prop['hi_deg'] - prop['lo_deg'])))
+              f"centred PER GAIT and scaled to +/-1 over each joint's widest "
+              f"within-gait span")
+        print(f"        within-gait span (raw table units, widest gait): " +
+              " ".join(f"{v:.1f}" for v in wmax))
+        # Printed alongside on purpose: these two were previously conflated,
+        # and pooled/within is the ratio by which the old pooled scaling was
+        # shrinking the input swing.
+        print(f"        pooled-across-gaits span:                       " +
+              " ".join(f"{v:.1f}" for v in pooled))
+        ratio = pooled / np.maximum(wmax, 1e-9)
+        print(f"        pooled/within ratio: mean {ratio.mean():.2f}x  "
+              f"max {ratio.max():.2f}x"
+              + ("   (per-gait centring recovers that much input swing)"
+                 if ratio.max() > 1.2 else "   (postures agree across gaits)"))
         if prop["degenerate"]:
             print(f"        WARNING: joint(s) {prop['degenerate']} never move "
-                  f"across any gait; their channels are constant.")
+                  f"in any gait; their channels are constant.")
     else:
         print(f"      proprioception OFF (--proprio 0): open-loop integrator, "
               f"nothing observes the accumulator")
@@ -2473,12 +2530,15 @@ def main():
             "source":    "commanded angle from the network's own accumulator "
                          "(pose + acc), one step stale, detached",
             "n_channels": int(n_joints) if args.proprio else 0,
-            "formula":   "p_j = (pose_j + acc_j - centre_j) / halfrange_j, "
-                         "never clamped",
-            "centre_normalised":    prop["centre"].tolist(),
+            "formula":   "p[j] = (pose_j + acc_j - centre[gait][j]) / "
+                         "halfrange[j], never clamped",
+            "centre_normalised":    prop["centre"].tolist(),   # (n_gaits, J)
+            "centre_is_per_gait":   True,
             "halfrange_normalised": prop["halfrange"].tolist(),
-            "per_joint_lo_deg":     prop["lo_deg"].tolist(),
-            "per_joint_hi_deg":     prop["hi_deg"].tolist(),
+            "within_gait_span_raw": prop["within_span_raw"].tolist(),
+            "pooled_span_raw":      prop["pooled_span_raw"].tolist(),
+            "per_joint_lo_raw":     prop["lo_raw"].tolist(),
+            "per_joint_hi_raw":     prop["hi_raw"].tolist(),
         },
         "gait_names":     gait_names,
         "gait_files":     gait_files,
