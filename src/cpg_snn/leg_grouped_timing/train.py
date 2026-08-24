@@ -487,7 +487,7 @@ def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False):
     fake_cpg=True substitutes fake_step_chunk's back-to-back, no-gap bursts
     for the real oscillator's output -- see that method's docstring.
     """
-    cpg = LIFCPGStepper(N=N, i_app=i_app, vth_fb=200)
+    cpg = LIFCPGStepper(N=N, i_app=i_app, vth_fb=100)
     print(f"  N={N}  i_app={i_app}  from_fb_weight={CPG_FROM_FB_WEIGHT:g}")
     if fake_cpg:
         print(f"  FAKE CPG: back-to-back bursts, no inter-burst gap "
