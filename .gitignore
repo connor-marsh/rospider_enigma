@@ -58,6 +58,10 @@ qtcreator-*
 # Catkin custom files
 CATKIN_IGNORE
 
+# extra hiwonder ros stuff
+src/xf_mic_asr_offline
+src/xf_mic_asr_offline_msgs
+
 # Model files
 src/large_models
 src/large_models_examples
