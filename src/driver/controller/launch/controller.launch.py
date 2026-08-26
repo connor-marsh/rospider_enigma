@@ -99,12 +99,6 @@ def launch_setup(context):
         }.items()
     )
 
-    oled_show_node = Node(
-        package='controller',
-        executable='oled_show',
-        output='screen',
-    )
-
 
     return [
         namespace_arg,
@@ -119,7 +113,6 @@ def launch_setup(context):
         imu_filter_launch,
         odom_publisher_launch,
         ekf_filter_node,
-        oled_show_node,
         servo_controller_launch,
         arm_kinematics_launch,
         move_controller_launch,

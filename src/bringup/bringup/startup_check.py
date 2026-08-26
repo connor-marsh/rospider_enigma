@@ -32,7 +32,7 @@ class StartupCheckNode(Node):
         self.play_buzzer()
         
         # Start a timer to check the IP and update the OLED every 5 seconds
-        self.timer = self.create_timer(5.0, self.update_oled)
+        self.timer = self.create_timer(10.0, self.update_oled)
 
     def play_buzzer(self):
         msg = BuzzerState()

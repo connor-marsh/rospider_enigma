@@ -39,7 +39,7 @@ class ControllerManager(Node):
         self.arm_wake_pose = [0.0, 0.92, -1.549, -1.466, 0.0, 0.0]
         self.arm_sleep_pose = [0.0,1.365,-1.9,-1.7,0.0,0.0]
         self.servo_ids = self.leg_ids + self.arm_ids
-        self.pose_duration = 1.0
+        self.pose_duration = 2.0
 
         # 读取配置参数
         self.base_frame = self.get_parameter('base_frame').value
