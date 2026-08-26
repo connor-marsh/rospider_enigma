@@ -120,6 +120,10 @@ class GaitSelector:
         self._lock   = threading.Lock()
         self._stop   = threading.Event()
         self._thread = None
+        # Set by the caller; receives (old_index, new_index, kind) so a
+        # listener (e.g. the live visualiser) can report both the transition
+        # and what triggered it, without the selector knowing about it.
+        self.on_change = None
 
     @property
     def index(self):
@@ -131,10 +135,12 @@ class GaitSelector:
             print(f"  ignoring gait index {i} (valid 0..{len(self.names)-1})")
             return
         with self._lock:
-            changed = i != self._idx
+            old, changed = self._idx, i != self._idx
             self._idx = i
         if changed:
             print(f"  gait -> {self.names[i]} [{i}]{why}")
+            if self.on_change is not None:
+                self.on_change(old, i, self.kind)
 
     def describe(self):
         return f"{self.kind}, starting on {self.names[self.index]}"
@@ -266,7 +272,7 @@ class ServoPublisher:
             return
         import rclpy
         from rclpy.node import Node
-        from servo_controller_msgs.msg import ServoPosition, ServosPosition
+        from servo_controller_msgs.msg import ServoPosition, ServosPosition  # type: ignore
         self._ServoPosition, self._ServosPosition = ServoPosition, ServosPosition
         rclpy.init()
         self.node = Node("run_inference")
@@ -295,7 +301,7 @@ class ServoPublisher:
 # ═══════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def run(model, cfg, pub, sel, args, device):
+def run(model, cfg, pub, sel, viz, args, device):
     n_joints = int(cfg_get(cfg, "n_joints", 8))
     lo = float(cfg_get(cfg, "global_min", -124.0))
     hi = float(cfg_get(cfg, "global_max", 124.0))
@@ -334,8 +340,9 @@ def run(model, cfg, pub, sel, args, device):
             x = torch.as_tensor(cpg.step(), dtype=torch.float32,
                                 device=device).unsqueeze(0)
             t0 = time.perf_counter()
-            y, state, _ = model.step(x, gait_t, state)
+            y, state, aux = model.step(x, gait_t, state)
             lat.append((time.perf_counter() - t0) * 1e3)
+            joints = y[0].cpu().numpy() * scale + shift
 
             if step >= settle:
                 if not started:
@@ -346,7 +353,13 @@ def run(model, cfg, pub, sel, args, device):
                     sel.start()
                     print(f"  settled -- publishing\n")
                 if step % args.publish_every == 0:
-                    pub.publish(y[0].cpu().numpy() * scale + shift)
+                    pub.publish(joints)
+                if viz is not None:
+                    # aux is (timing spikes,) for timing_grouped, None for
+                    # dense. Buffering is cheap; viz decides when to redraw.
+                    spk_t = (aux[0][0].cpu().numpy() if aux
+                             else np.zeros(0, np.float32))
+                    viz.update(x[0].cpu().numpy(), spk_t, joints, sel.index)
 
             step += 1
             # Sleep the remainder of this step's budget rather than a fixed
@@ -455,6 +468,25 @@ def main():
                          "n_joints long.")
     ap.add_argument("--duration", type=float, default=0.02,
                     help="ServosPosition.duration field (seconds).")
+    ap.add_argument("--viz", action="store_true",
+                    help="Open the live visualisation window (see "
+                         "live_visualization.py). Needs a display -- over SSH "
+                         "that means 'ssh -X'. NOTE the redraw happens inside "
+                         "the control loop and costs ~16 ms for an 18-joint "
+                         "hexapod, which overruns a 16 ms control step; the "
+                         "loop uses absolute deadlines so phase does not drift "
+                         "permanently, but prefer --no_robot or a low "
+                         "--viz_fps for anything but debugging.")
+    ap.add_argument("--viz_fps", type=float, default=12.0,
+                    help="Redraw rate for --viz. Buffering still happens every "
+                         "timestep; only drawing is throttled.")
+    ap.add_argument("--viz_window", type=int, default=600,
+                    help="Timesteps of history shown in the trace plot.")
+    ap.add_argument("--gaits_dir", type=str, default="../gaits",
+                    help="Folder of {name}.csv gait tables, resolved as "
+                         "this_file_dir/<gaits_dir>. Only needed for --viz, "
+                         "which reads per-gait per-joint min/max from them to "
+                         "scale the trace plot.")
     ap.add_argument("--no_robot", action="store_true",
                     help="Compute commands but publish nothing. No ROS "
                          "imports, so this runs anywhere.")
@@ -491,11 +523,23 @@ def main():
     sel = make_gait_selector(args.gait_switch,
                              list(cfg_get(cfg, "gait_names", [])), args)
 
+    viz = None
+    if args.viz:
+        # Imported lazily so matplotlib is not pulled in on the robot unless
+        # the visualisation is actually asked for.
+        from live_visualization import LiveVisualizer
+        viz = LiveVisualizer(cfg, this_dir / args.gaits_dir,
+                             window=args.viz_window, fps=args.viz_fps)
+        sel.on_change = viz.notify_gait_switch
+        print("  live visualisation open")
+
     print("\n[3/3] Running ...")
     try:
-        run(model, cfg, pub, sel, args, device)
+        run(model, cfg, pub, sel, viz, args, device)
     finally:
         pub.close()
+        if viz is not None:
+            viz.close()
     print("\nDone.")
 
 
