@@ -480,8 +480,17 @@ def main():
     ap.add_argument("--viz_fps", type=float, default=12.0,
                     help="Redraw rate for --viz. Buffering still happens every "
                          "timestep; only drawing is throttled.")
-    ap.add_argument("--viz_window", type=int, default=600,
-                    help="Timesteps of history shown in the trace plot.")
+    ap.add_argument("--viz_trace_cycles", type=float, default=5.0,
+                    help="History shown in the joint-angle plots, in CPG "
+                         "cycles. Expressed in cycles rather than timesteps so "
+                         "it stays meaningful whether the period is 352 (real "
+                         "oscillator) or 120 (--fake_cpg).")
+    ap.add_argument("--viz_cpg_cycles", type=float, default=2.0,
+                    help="History shown in the CPG spike plot, in CPG cycles. "
+                         "Much shorter than --viz_trace_cycles on purpose: at "
+                         "5 cycles the individual spikes in a burst merge into "
+                         "a solid block, and seeing them is the point of that "
+                         "plot.")
     ap.add_argument("--gaits_dir", type=str, default="../gaits",
                     help="Folder of {name}.csv gait tables, resolved as "
                          "this_file_dir/<gaits_dir>. Only needed for --viz, "
@@ -529,7 +538,9 @@ def main():
         # the visualisation is actually asked for.
         from live_visualization import LiveVisualizer
         viz = LiveVisualizer(cfg, this_dir / args.gaits_dir,
-                             window=args.viz_window, fps=args.viz_fps)
+                             trace_cycles=args.viz_trace_cycles,
+                             cpg_cycles=args.viz_cpg_cycles,
+                             fps=args.viz_fps)
         sel.on_change = viz.notify_gait_switch
         print("  live visualisation open")
 

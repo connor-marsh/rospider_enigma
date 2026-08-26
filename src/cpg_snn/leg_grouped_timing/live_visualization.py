@@ -12,7 +12,12 @@ A single matplotlib window, updated from inside the inference loop:
             shoulder/knee for a quadruped), each in [-1, 1]. Normalisation is
             PER GAIT, PER JOINT against that joint's own min and max in the
             active gait table, so a 5-degree joint and a 60-degree joint are
-            equally readable.
+            equally readable. Joint dots in the schematic use the same
+            normalisation on a coolwarm map (blue = joint minimum, red = joint
+            maximum), so a dot and its trace line always agree.
+
+Both x-axes are sized in CPG CYCLES, not fixed timesteps, so they stay
+meaningful whether the period is 352 (real oscillator) or 120 (fake_cpg).
 
 Why matplotlib rather than PyGame/PyQtGraph: it is already a dependency of
 visualize.py, so this adds nothing to install, and it draws both the schematic
@@ -54,7 +59,8 @@ class LiveVisualizer:
     a change; everything else is internal.
     """
 
-    def __init__(self, cfg, gaits_dir, window=600, fps=12.0, backend=None):
+    def __init__(self, cfg, gaits_dir, trace_cycles=5.0, cpg_cycles=2.0,
+                 fps=12.0, backend=None):
         import matplotlib
         # train.py sets Agg at import time (it only ever saves figures), and
         # importing it above means we inherit that -- plt.show() would then
@@ -79,8 +85,8 @@ class LiveVisualizer:
                     "python3-tk system package), pass an explicit backend, or "
                     "drop --viz.")
         import matplotlib.pyplot as plt
-        from matplotlib.collections import LineCollection
-        self.plt, self._LC = plt, LineCollection
+        from matplotlib.collections import LineCollection, PatchCollection
+        self.plt, self._LC, self._PC = plt, LineCollection, PatchCollection
 
         self.n_cpg    = int(cfg_get(cfg, "n_cpg_neurons", 4))
         self.n_joints = int(cfg_get(cfg, "n_joints", 8))
@@ -102,10 +108,22 @@ class LiveVisualizer:
 
         self.ranges = self._joint_ranges(cfg, gaits_dir)
 
+        # Both x-axes are expressed in CPG CYCLES rather than raw timesteps, so
+        # they stay meaningful when the period changes (352 for the real
+        # oscillator, 120 for fake_cpg). The CPG plot gets a much shorter span
+        # than the joint traces -- at 5 cycles the individual spikes in a burst
+        # merge into a solid block, and the point of that plot is to see them.
+        self.period = max(float(cfg_get(cfg, "cpg_period_steps", 254.0)), 10.0)
+        self.trace_cycles, self.cpg_cycles = float(trace_cycles), float(cpg_cycles)
+
         # ── ring buffers (raw values + the gait they were produced under, so
         # history keeps the normalisation that was true when it was recorded)
-        self.W = int(window)
+        self.W     = int(round(self.trace_cycles * self.period))
+        # One ring buffer, sized for the longer window; the CPG plot just reads
+        # the most recent W_cpg of it.
+        self.W_cpg = min(int(round(self.cpg_cycles * self.period)), self.W)
         self.buf     = np.full((self.W, self.n_joints), np.nan, np.float32)
+        self.bcpg    = np.zeros((self.W, self.n_cpg), np.float32)
         self.bgait   = np.zeros(self.W, np.int32)
         self.bswitch = np.zeros(self.W, bool)
         self.n_seen  = 0
@@ -119,6 +137,13 @@ class LiveVisualizer:
         # as solid rather than flickering.
         self._acc_cpg = np.zeros(self.n_cpg, bool)
         self._acc_tim = np.zeros(max(self.n_timing, 1), bool)
+
+        # One colour per CPG neuron, shared between its node's outline and its
+        # row in the spike plot -- that pairing is what ties the two views
+        # together, along with matching N0..Nk labels on both.
+        cm = self.plt.get_cmap("turbo")
+        self.cpg_colors = [cm(0.12 + 0.76 * i / max(self.n_cpg - 1, 1))
+                           for i in range(self.n_cpg)]
 
         self.fps, self._last_draw = float(fps), 0.0
         self._banner_until, self._banner_text = 0.0, ""
@@ -161,20 +186,25 @@ class LiveVisualizer:
         plt = self.plt
         K = len(self.types)
         try:
-            self.fig = plt.figure(figsize=(14.0, 3.6 + 1.9 * K))
+            self.fig = plt.figure(figsize=(18.0, 4.2 + 2.0 * K))
         except Exception as e:
             raise SystemExit(
                 f"Could not open a plot window ({e}). A display is required; "
                 f"over SSH use 'ssh -X', or drop --viz.")
+        # Two columns on the schematic row only: CPG spike history on the left,
+        # the network diagram on the right. The banner and the joint traces
+        # span both.
         gs = self.fig.add_gridspec(
-            2 + K, 1, height_ratios=[0.62, 2.5] + [1.0] * K,
-            hspace=0.30, top=0.97, bottom=0.07, left=0.07, right=0.98)
+            2 + K, 2, width_ratios=[1.0, 2.15],
+            height_ratios=[0.62, 2.6] + [1.0] * K,
+            hspace=0.30, wspace=0.13, top=0.97, bottom=0.06,
+            left=0.055, right=0.985)
 
         # ── banner on its OWN axes ───────────────────────────────────
         # Previously a Text inside ax_net: it extended past ax_net.bbox, and
         # since only that bbox is restored when blitting, the overflow left
         # stale pixels that piled up until the text was illegible.
-        self.ax_ban = self.fig.add_subplot(gs[0])
+        self.ax_ban = self.fig.add_subplot(gs[0, :])
         self.ax_ban.axis("off")
         self.ax_ban.set_xlim(0, 1)
         self.ax_ban.set_ylim(0, 1)
@@ -183,66 +213,127 @@ class LiveVisualizer:
         # a badge overflowing vertically leaves un-restored strips spanning its
         # full width -- which showed as a sliver of red left over from a longer
         # gait name after switching to a shorter one. Hence the taller banner
-        # row above and the smaller pad here; _assert_banner_fits checks it.
+        # row above and the small pad here.
         self.banner = self.ax_ban.text(
             0.5, 0.5, "", ha="center", va="center", fontsize=15,
             fontweight="bold", color="white", zorder=5,
             bbox=dict(boxstyle="round,pad=0.3", fc=ON_C, ec="none"))
         self.banner.set_visible(False)
 
+        # ── CPG spike history ────────────────────────────────────────
+        # One axes, one x-axis, but the y-axis is split into a lane per neuron
+        # (row i occupies [i, i+0.78]). Because the CPG bursts in sequence, the
+        # active lane steps down the plot over time, so a cycle reads as a
+        # diagonal.
+        ax = self.ax_cpg = self.fig.add_subplot(gs[1, 0])
+        ax.set_xlim(0, self.W_cpg)
+        ax.set_ylim(-0.35, self.n_cpg - 0.15)
+        ax.set_yticks(np.arange(self.n_cpg))
+        ax.set_yticklabels([f"N{i}" for i in range(self.n_cpg)], fontsize=9,
+                           fontweight="bold")
+        for t, c in zip(ax.get_yticklabels(), self.cpg_colors):
+            t.set_color(c)
+        ax.set_xlabel("timesteps", fontsize=9)
+        ax.set_title(f"CPG spikes  ({self.cpg_cycles:g} cycles)", fontsize=10,
+                     fontweight="bold")
+        ax.tick_params(axis="x", labelsize=8)
+        for i in range(self.n_cpg):
+            ax.axhline(i, color="k", lw=0.5, alpha=0.18)
+        self.cpg_lines = [
+            ax.plot(np.arange(self.W_cpg), np.full(self.W_cpg, np.nan), lw=1.2,
+                    color=self.cpg_colors[i], drawstyle="steps-post")[0]
+            for i in range(self.n_cpg)]
+
         # ── schematic ────────────────────────────────────────────────
-        ax = self.ax_net = self.fig.add_subplot(gs[1])
-        ax.set_xlim(-0.12, 2.12)
-        ax.set_ylim(-0.02, 1.10)
+        ax = self.ax_net = self.fig.add_subplot(gs[1, 1])
+        # Columns pulled in from 0/1/2 to make room for the decoder stage and
+        # the spike plot without stretching the figure further.
+        X_CPG, X_TIM, X_DEC, X_JNT = 0.0, 0.58, 1.12, 1.70
+        DEC_W = 0.24
+        ax.set_xlim(-0.13, 1.86)
+        ax.set_ylim(-0.02, 1.12)
         ax.axis("off")
         col = lambda n, x: np.stack(
             [np.full(n, x), (np.linspace(0.04, 0.92, n) if n > 1
                              else np.array([0.48]))], axis=1)
-        self.p_cpg = col(self.n_cpg, 0.0)
-        self.p_tim = col(self.n_timing, 1.0) if self.n_timing else None
-        self.p_jnt = col(self.n_joints, 2.0)
+        self.p_cpg = col(self.n_cpg, X_CPG)
+        self.p_tim = col(self.n_timing, X_TIM) if self.n_timing else None
+        self.p_jnt = col(self.n_joints, X_JNT)
+
+        # ── "Angle Decoder" boxes, one per timing neuron ─────────────
+        # Stands in for that sub-network's hidden layers + readout, which is
+        # the honest structure without drawing individual hidden units.
+        self.dec_boxes, self.p_dec = [], None
+        if self.n_timing:
+            span = (self.p_tim[1, 1] - self.p_tim[0, 1]) if self.n_timing > 1 else 0.7
+            h = max(min(0.78 * abs(span), 0.14), 0.012)
+            self.p_dec = col(self.n_timing, X_DEC)
+            for y in self.p_dec[:, 1]:
+                self.dec_boxes.append(plt.Rectangle(
+                    (X_DEC - DEC_W / 2, y - h / 2), DEC_W, h))
+            self.pc_dec = self._PC(self.dec_boxes, edgecolors="k",
+                                   linewidths=0.8, zorder=3)
+            self.pc_dec.set_facecolor([JOINT_C] * self.n_timing)
+            ax.add_collection(self.pc_dec)
+            ax.text(X_DEC, 1.05, "Angle Decoder", ha="center", va="bottom",
+                    fontsize=9, fontweight="bold")
+            if self.n_timing <= 8:      # only legible at low counts
+                for i, y in enumerate(self.p_dec[:, 1]):
+                    ax.text(X_DEC, y, "dec", ha="center", va="center",
+                            fontsize=6.5, color="white", zorder=4)
+        else:
+            self.pc_dec = None
 
         # Edges as LineCollections: one artist each instead of hundreds of
         # Line2Ds, which matters when blitting every frame.
         if self.n_timing:
             self.e_ct = [(a, b) for a in self.p_cpg for b in self.p_tim]
-            self.e_tj = [(self.p_tim[gi], self.p_jnt[c])
+            # timing -> its decoder, then decoder -> the joints it drives
+            self.e_td = [(self.p_tim[i], (X_DEC - DEC_W / 2, self.p_dec[i, 1]))
+                         for i in range(self.n_timing)]
+            self.e_dj = [((X_DEC + DEC_W / 2, self.p_dec[gi, 1]), self.p_jnt[c])
                          for gi, cols in enumerate(self.groups) for c in cols]
         else:
             self.e_ct = [(a, b) for a in self.p_cpg for b in self.p_jnt]
-            self.e_tj = []
-        self.lc_ct = self._LC(self.e_ct, linewidths=0.6, zorder=1,
-                              colors=[(*self._rgb(DIM), OFF_A)] * len(self.e_ct))
-        ax.add_collection(self.lc_ct)
-        if self.e_tj:
-            self.lc_tj = self._LC(
-                self.e_tj, linewidths=0.8, zorder=1,
-                colors=[(*self._rgb(DIM), OFF_A)] * len(self.e_tj))
-            ax.add_collection(self.lc_tj)
-        else:
-            self.lc_tj = None
+            self.e_td = self.e_dj = []
+        mk = lambda segs, lw: self._LC(
+            segs, linewidths=lw, zorder=1,
+            colors=[(*self._rgb(DIM), OFF_A)] * len(segs))
+        self.lc_ct = mk(self.e_ct, 0.6); ax.add_collection(self.lc_ct)
+        self.lc_td = mk(self.e_td, 1.0) if self.e_td else None
+        self.lc_dj = mk(self.e_dj, 0.9) if self.e_dj else None
+        for lc in (self.lc_td, self.lc_dj):
+            if lc is not None:
+                ax.add_collection(lc)
 
         self.s_cpg = ax.scatter(*self.p_cpg.T, s=330, c=[CPG_C] * self.n_cpg,
-                                edgecolors="k", linewidths=0.8, zorder=3)
-        self.s_jnt = ax.scatter(*self.p_jnt.T, s=150, c=[JOINT_C] * self.n_joints,
+                                edgecolors=self.cpg_colors, linewidths=2.4,
+                                zorder=3)
+        self.s_jnt = ax.scatter(*self.p_jnt.T, s=140, c=[JOINT_C] * self.n_joints,
                                 edgecolors="k", linewidths=0.6, zorder=3)
-        self.s_tim = (ax.scatter(*self.p_tim.T, s=250,
+        self.s_tim = (ax.scatter(*self.p_tim.T, s=230,
                                  c=[TIMING_C] * self.n_timing, edgecolors="k",
                                  linewidths=0.8, zorder=3)
                       if self.n_timing else None)
-        labels = [(0.0, f"CPG ({self.n_cpg})"), (2.0, f"joints ({self.n_joints})")]
+        labels = [(X_CPG, f"CPG ({self.n_cpg})"),
+                  (X_JNT, f"joints ({self.n_joints})")]
         if self.n_timing:
-            labels.append((1.0, f"timing ({self.n_timing})"))
+            labels.append((X_TIM, f"timing ({self.n_timing})"))
         for x, lab in labels:
             ax.text(x, 1.05, lab, ha="center", va="bottom", fontsize=9,
                     fontweight="bold")
+        # N0..Nk beside each CPG node, in that neuron's colour: the other half
+        # of the pairing with the spike plot's lanes.
+        for i, (x, y) in enumerate(self.p_cpg):
+            ax.text(x - 0.07, y, f"N{i}", ha="right", va="center", fontsize=8,
+                    fontweight="bold", color=self.cpg_colors[i])
 
         # ── traces: one axes per joint type ──────────────────────────
         cmap = plt.get_cmap("turbo")
         self.tr_axes, self.tr_lines, self.tr_sw = [], [], []
         for ti, cols in enumerate(self.types):
-            a = self.fig.add_subplot(gs[2 + ti],
-                                     sharex=self.tr_axes[0] if self.tr_axes else None)
+            a = self.fig.add_subplot(
+                gs[2 + ti, :], sharex=self.tr_axes[0] if self.tr_axes else None)
             a.set_xlim(0, self.W)
             a.set_ylim(-1.15, 1.15)
             a.set_yticks([-1, 0, 1])
@@ -252,7 +343,9 @@ class LiveVisualizer:
             if ti < K - 1:
                 a.tick_params(labelbottom=False)
             else:
-                a.set_xlabel("timesteps (newest at right)", fontsize=9)
+                a.set_xlabel(f"timesteps, newest at right "
+                             f"({self.trace_cycles:g} CPG cycles "
+                             f"= {self.W} steps)", fontsize=9)
             lines = []
             for li, c in enumerate(cols):
                 ln, = a.plot(np.arange(self.W), np.full(self.W, np.nan), lw=1.3,
@@ -278,7 +371,10 @@ class LiveVisualizer:
 
         self._animated = ([self.lc_ct, self.s_cpg, self.s_jnt, self.banner]
                           + ([self.s_tim] if self.s_tim else [])
-                          + ([self.lc_tj] if self.lc_tj else [])
+                          + ([self.pc_dec] if self.pc_dec is not None else [])
+                          + [lc for lc in (self.lc_td, self.lc_dj)
+                             if lc is not None]
+                          + self.cpg_lines
                           + [ln for grp in self.tr_lines for _, ln in grp]
                           + list(self.tr_sw))
         for a in self._animated:
@@ -299,6 +395,7 @@ class LiveVisualizer:
         c.draw()
         self.bg_ban = c.copy_from_bbox(self.ax_ban.bbox)
         self.bg_net = c.copy_from_bbox(self.ax_net.bbox)
+        self.bg_cpg = c.copy_from_bbox(self.ax_cpg.bbox)
         self.bg_tr  = [c.copy_from_bbox(a.bbox) for a in self.tr_axes]
         self._need_bg = False
 
@@ -314,6 +411,10 @@ class LiveVisualizer:
         """Cheap on every call; redraws only at the target fps."""
         i = self.n_seen % self.W
         self.buf[i]     = joints
+        # Recorded EVERY timestep, unlike the node lighting below which ORs
+        # between frames: the plot is the true spike train, the nodes answer
+        # "did this neuron fire since the last redraw".
+        self.bcpg[i]    = np.asarray(cpg_spk).reshape(-1)[:self.n_cpg]
         self.bgait[i]   = gait_idx
         self.bswitch[i] = False if self.n_seen >= self.W else self.bswitch[i]
         self.n_seen += 1
@@ -363,12 +464,21 @@ class LiveVisualizer:
         self.lc_ct.set_color([(*self._rgb(ON_C), 0.95) if s
                               else (*self._rgb(DIM), OFF_A) for s in live])
         self.lc_ct.set_linewidth([1.8 if s else 0.6 for s in live])
-        if self.lc_tj is not None:
+        if self.lc_td is not None:
+            self.lc_td.set_color([(*self._rgb(ON_C), 0.95) if s
+                                  else (*self._rgb(DIM), OFF_A)
+                                  for s in on_t[:self.n_timing]])
+            self.lc_td.set_linewidth([2.2 if s else 1.0
+                                      for s in on_t[:self.n_timing]])
+            # A decoder lights up with the timing neuron feeding it, and so do
+            # all the joint edges leaving it.
+            self.pc_dec.set_facecolor([ON_C if s else JOINT_C
+                                       for s in on_t[:self.n_timing]])
             lt = np.array([on_t[gi] for gi, cols in enumerate(self.groups)
                            for _ in cols])
-            self.lc_tj.set_color([(*self._rgb(ON_C), 0.95) if s
+            self.lc_dj.set_color([(*self._rgb(ON_C), 0.95) if s
                                   else (*self._rgb(DIM), OFF_A) for s in lt])
-            self.lc_tj.set_linewidth([2.0 if s else 0.8 for s in lt])
+            self.lc_dj.set_linewidth([2.0 if s else 0.9 for s in lt])
 
         cur = self._norm(self.buf[(self.n_seen - 1) % self.W])
         cw = self.plt.get_cmap("coolwarm")
@@ -376,20 +486,33 @@ class LiveVisualizer:
 
         for art in ([self.lc_ct, self.s_cpg, self.s_jnt]
                     + ([self.s_tim] if self.s_tim else [])
-                    + ([self.lc_tj] if self.lc_tj else [])):
+                    + ([self.pc_dec] if self.pc_dec is not None else [])
+                    + [lc for lc in (self.lc_td, self.lc_dj) if lc is not None]):
             self.ax_net.draw_artist(art)
         c.blit(self.ax_net.bbox)
 
-        # ── traces: roll so newest is at the right edge; x stays fixed ──
+        # ── CPG spike history: a lane per neuron, newest at the right ──
+        c.restore_region(self.bg_cpg)
+        nc = min(self.n_seen, self.W_cpg)
+        idx_c = np.arange(self.n_seen - nc, self.n_seen) % self.W
+        xs_c = np.arange(self.W_cpg - nc, self.W_cpg)
+        for i, ln in enumerate(self.cpg_lines):
+            ln.set_data(xs_c, i + 0.78 * self.bcpg[idx_c, i])
+            self.ax_cpg.draw_artist(ln)
+        c.blit(self.ax_cpg.bbox)
+
+        # Trace window is longer than the CPG window, so it needs its own slice.
         n = min(self.n_seen, self.W)
         idx = np.arange(self.n_seen - n, self.n_seen) % self.W
+        xs = np.arange(self.W - n, self.W)
+
+        # ── traces: roll so newest is at the right edge; x stays fixed ──
         vals = self._norm(self.buf[idx])
-        x = np.arange(self.W - n, self.W)
-        segs = [[(v, -1.15), (v, 1.15)] for v in x[self.bswitch[idx]]]
+        segs = [[(v, -1.15), (v, 1.15)] for v in xs[self.bswitch[idx]]]
         for ti, a in enumerate(self.tr_axes):
             c.restore_region(self.bg_tr[ti])
             for col, ln in self.tr_lines[ti]:
-                ln.set_data(x, vals[:, col])
+                ln.set_data(xs, vals[:, col])
                 a.draw_artist(ln)
             self.tr_sw[ti].set_segments(segs)
             a.draw_artist(self.tr_sw[ti])
