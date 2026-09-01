@@ -44,8 +44,9 @@ from train import (
 CPG_C    = "#457b9d"
 TIMING_C = "#2a9d8f"
 JOINT_C  = "#6a0572"
+SNN_C    = "#3d405b"     # decoder blocks: fixed colour, never highlighted
 ON_C     = "#e63946"
-OFF_A    = 0.12          # edge alpha when idle
+OFF_A    = 0.60          # edge alpha when idle
 DIM      = "#c8cdd4"
 
 # Anatomical names for the k-th joint within a leg, keyed by joints-per-leg.
@@ -59,7 +60,7 @@ class LiveVisualizer:
     a change; everything else is internal.
     """
 
-    def __init__(self, cfg, gaits_dir, trace_cycles=5.0, cpg_cycles=2.0,
+    def __init__(self, cfg, gaits_dir, trace_cycles=5.0, cpg_cycles=1.5,
                  fps=12.0, backend=None):
         import matplotlib
         # train.py sets Agg at import time (it only ever saves figures), and
@@ -182,6 +183,27 @@ class LiveVisualizer:
         return np.clip(2.0 * (vals - lo) / (hi - lo) - 1.0, -1.05, 1.05)
 
     # ------------------------------------------------------------------
+    def _grouped_col(self, x, gap=1.5):
+        """(n_joints, 2) node positions, clustered per leg with a gap between."""
+        legs = [[c for c in leg] for leg in
+                ([list(t) for t in zip(*self.types)] if self.types else [])]
+        if not legs or sum(len(l) for l in legs) != self.n_joints:
+            n = self.n_joints
+            return np.stack([np.full(n, x),
+                             np.linspace(0.04, 0.92, n) if n > 1
+                             else np.array([0.48])], axis=1)
+        slot = np.zeros(self.n_joints)
+        y = 0.0
+        for leg in legs:
+            for c in leg:
+                slot[c] = y
+                y += 1.0
+            y += gap
+        span = slot.max() - slot.min()
+        ys = (0.04 + 0.88 * (slot - slot.min()) / span if span > 0
+              else np.full(self.n_joints, 0.48))
+        return np.stack([np.full(self.n_joints, x), ys], axis=1)
+
     def _build(self):
         plt = self.plt
         K = len(self.types)
@@ -195,7 +217,7 @@ class LiveVisualizer:
         # the network diagram on the right. The banner and the joint traces
         # span both.
         gs = self.fig.add_gridspec(
-            2 + K, 2, width_ratios=[1.0, 2.15],
+            2 + K, 2, width_ratios=[1.0, 1.0],
             height_ratios=[0.62, 2.6] + [1.0] * K,
             hspace=0.30, wspace=0.13, top=0.97, bottom=0.06,
             left=0.055, right=0.985)
@@ -229,14 +251,14 @@ class LiveVisualizer:
         ax.set_xlim(0, self.W_cpg)
         ax.set_ylim(-0.35, self.n_cpg - 0.15)
         ax.set_yticks(np.arange(self.n_cpg))
-        ax.set_yticklabels([f"N{i}" for i in range(self.n_cpg)], fontsize=9,
+        ax.set_yticklabels([f"N{i}" for i in range(self.n_cpg)], fontsize=14,
                            fontweight="bold")
         for t, c in zip(ax.get_yticklabels(), self.cpg_colors):
             t.set_color(c)
-        ax.set_xlabel("timesteps", fontsize=9)
-        ax.set_title(f"CPG spikes  ({self.cpg_cycles:g} cycles)", fontsize=10,
+        ax.set_xlabel("timesteps", fontsize=11)
+        ax.set_title(f"CPG spikes  ({self.cpg_cycles:g} cycles)", fontsize=15,
                      fontweight="bold")
-        ax.tick_params(axis="x", labelsize=8)
+        ax.tick_params(axis="x", labelsize=10)
         for i in range(self.n_cpg):
             ax.axhline(i, color="k", lw=0.5, alpha=0.18)
         self.cpg_lines = [
@@ -250,15 +272,19 @@ class LiveVisualizer:
         # the spike plot without stretching the figure further.
         X_CPG, X_TIM, X_DEC, X_JNT = 0.0, 0.58, 1.12, 1.70
         DEC_W = 0.24
-        ax.set_xlim(-0.13, 1.86)
-        ax.set_ylim(-0.02, 1.12)
+        ax.set_xlim(-0.26, 1.86)
+        ax.set_ylim(-0.02, 1.22)
         ax.axis("off")
         col = lambda n, x: np.stack(
             [np.full(n, x), (np.linspace(0.04, 0.92, n) if n > 1
                              else np.array([0.48]))], axis=1)
         self.p_cpg = col(self.n_cpg, X_CPG)
         self.p_tim = col(self.n_timing, X_TIM) if self.n_timing else None
-        self.p_jnt = col(self.n_joints, X_JNT)
+        # Joints clustered by LEG rather than evenly spaced, so the 3 (or 2)
+        # joints of one leg read as belonging together. Grouped by leg_cols,
+        # not group_cols: with --n_timing 18 every network group is a single
+        # column and would give no visual grouping at all.
+        self.p_jnt = self._grouped_col(X_JNT)
 
         # ── "Angle Decoder" boxes, one per timing neuron ─────────────
         # Stands in for that sub-network's hidden layers + readout, which is
@@ -271,16 +297,20 @@ class LiveVisualizer:
             for y in self.p_dec[:, 1]:
                 self.dec_boxes.append(plt.Rectangle(
                     (X_DEC - DEC_W / 2, y - h / 2), DEC_W, h))
+            # Fixed colour, no spike highlight: the block stands for a whole
+            # sub-network, so flashing it on its timing spike said less than
+            # the edges leaving it already do.
             self.pc_dec = self._PC(self.dec_boxes, edgecolors="k",
                                    linewidths=0.8, zorder=3)
-            self.pc_dec.set_facecolor([JOINT_C] * self.n_timing)
+            self.pc_dec.set_facecolor([SNN_C] * self.n_timing)
             ax.add_collection(self.pc_dec)
-            ax.text(X_DEC, 1.05, "Angle Decoder", ha="center", va="bottom",
-                    fontsize=9, fontweight="bold")
-            if self.n_timing <= 8:      # only legible at low counts
-                for i, y in enumerate(self.p_dec[:, 1]):
-                    ax.text(X_DEC, y, "dec", ha="center", va="center",
-                            fontsize=6.5, color="white", zorder=4)
+            ax.text(X_DEC, 1.09, "Angle Decoder", ha="center", va="bottom",
+                    fontsize=15, fontweight="bold")
+            if self.n_timing <= 8:      # "SNN" is illegible in thinner boxes
+                for y in self.p_dec[:, 1]:
+                    ax.text(X_DEC, y, "SNN", ha="center", va="center",
+                            fontsize=13, fontweight="bold", color="white",
+                            zorder=4)
         else:
             self.pc_dec = None
 
@@ -320,12 +350,12 @@ class LiveVisualizer:
         if self.n_timing:
             labels.append((X_TIM, f"timing ({self.n_timing})"))
         for x, lab in labels:
-            ax.text(x, 1.05, lab, ha="center", va="bottom", fontsize=9,
+            ax.text(x, 1.09, lab, ha="center", va="bottom", fontsize=15,
                     fontweight="bold")
         # N0..Nk beside each CPG node, in that neuron's colour: the other half
         # of the pairing with the spike plot's lanes.
         for i, (x, y) in enumerate(self.p_cpg):
-            ax.text(x - 0.07, y, f"N{i}", ha="right", va="center", fontsize=8,
+            ax.text(x - 0.08, y, f"N{i}", ha="right", va="center", fontsize=13,
                     fontweight="bold", color=self.cpg_colors[i])
 
         # ── traces: one axes per joint type ──────────────────────────
@@ -337,15 +367,16 @@ class LiveVisualizer:
             a.set_xlim(0, self.W)
             a.set_ylim(-1.15, 1.15)
             a.set_yticks([-1, 0, 1])
+            a.tick_params(labelsize=11)
             a.grid(alpha=0.25)
             a.axhline(0, color="k", lw=0.6, alpha=0.35)
-            a.set_ylabel(self.type_names[ti], fontsize=10, fontweight="bold")
+            a.set_ylabel(self.type_names[ti], fontsize=15, fontweight="bold")
             if ti < K - 1:
                 a.tick_params(labelbottom=False)
             else:
                 a.set_xlabel(f"timesteps, newest at right "
                              f"({self.trace_cycles:g} CPG cycles "
-                             f"= {self.W} steps)", fontsize=9)
+                             f"= {self.W} steps)", fontsize=11)
             lines = []
             for li, c in enumerate(cols):
                 ln, = a.plot(np.arange(self.W), np.full(self.W, np.nan), lw=1.3,
@@ -353,8 +384,8 @@ class LiveVisualizer:
                              label=f"leg {li}")
                 lines.append((c, ln))
             if ti == 0 and len(cols) > 1:
-                a.legend(fontsize=7, ncol=min(len(cols), 6), loc="upper right",
-                         framealpha=0.85)
+                a.legend(fontsize=10, ncol=min(len(cols), 6),
+                         loc="upper right", framealpha=0.85)
             sw = self._LC([], colors="k", linewidths=1.2, alpha=0.5,
                           linestyles="dashed", zorder=4)
             a.add_collection(sw)
@@ -371,7 +402,6 @@ class LiveVisualizer:
 
         self._animated = ([self.lc_ct, self.s_cpg, self.s_jnt, self.banner]
                           + ([self.s_tim] if self.s_tim else [])
-                          + ([self.pc_dec] if self.pc_dec is not None else [])
                           + [lc for lc in (self.lc_td, self.lc_dj)
                              if lc is not None]
                           + self.cpg_lines
@@ -464,29 +494,29 @@ class LiveVisualizer:
         self.lc_ct.set_color([(*self._rgb(ON_C), 0.95) if s
                               else (*self._rgb(DIM), OFF_A) for s in live])
         self.lc_ct.set_linewidth([1.8 if s else 0.6 for s in live])
+        cur = np.nan_to_num(self._norm(self.buf[(self.n_seen - 1) % self.W]))
+        cw = self.plt.get_cmap("coolwarm")
+        jnt_c = [cw(0.5 * (v + 1)) for v in cur]
+        self.s_jnt.set_facecolor(jnt_c)
+
         if self.lc_td is not None:
+            # timing -> decoder still shows the SPIKE, since that is the event.
             self.lc_td.set_color([(*self._rgb(ON_C), 0.95) if s
                                   else (*self._rgb(DIM), OFF_A)
                                   for s in on_t[:self.n_timing]])
             self.lc_td.set_linewidth([2.2 if s else 1.0
                                       for s in on_t[:self.n_timing]])
-            # A decoder lights up with the timing neuron feeding it, and so do
-            # all the joint edges leaving it.
-            self.pc_dec.set_facecolor([ON_C if s else JOINT_C
-                                       for s in on_t[:self.n_timing]])
+            # decoder -> joint lights up with the timing neuron driving that
+            # decoder, same as every other edge, so a spike reads as one
+            # continuous path CPG -> timing -> decoder -> joints.
             lt = np.array([on_t[gi] for gi, cols in enumerate(self.groups)
                            for _ in cols])
             self.lc_dj.set_color([(*self._rgb(ON_C), 0.95) if s
                                   else (*self._rgb(DIM), OFF_A) for s in lt])
             self.lc_dj.set_linewidth([2.0 if s else 0.9 for s in lt])
 
-        cur = self._norm(self.buf[(self.n_seen - 1) % self.W])
-        cw = self.plt.get_cmap("coolwarm")
-        self.s_jnt.set_facecolor([cw(0.5 * (v + 1)) for v in np.nan_to_num(cur)])
-
         for art in ([self.lc_ct, self.s_cpg, self.s_jnt]
                     + ([self.s_tim] if self.s_tim else [])
-                    + ([self.pc_dec] if self.pc_dec is not None else [])
                     + [lc for lc in (self.lc_td, self.lc_dj) if lc is not None]):
             self.ax_net.draw_artist(art)
         c.blit(self.ax_net.bbox)
