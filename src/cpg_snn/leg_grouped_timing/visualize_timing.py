@@ -314,13 +314,22 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     sl    = slice(t_lo, t_hi)
     t     = np.arange(t_lo, t_hi)
 
-    fig = plt.figure(figsize=(max(14.0, 5.8 * C), 3.2 + 1.75 * G))
+    # The timing raster has G lanes against the CPG raster's n_cpg, so a fixed
+    # height ratio for both crams them together once G is large -- at
+    # --n_timing 18 with a 6-neuron CPG it was 18 lanes in the space meant for
+    # 6. Give the timing raster the same height PER LANE as the CPG one, and
+    # grow the figure to match so the extra space is added rather than taken
+    # from the trace rows.
+    CPG_H, LEG_H = 1.1, 1.5
+    tim_h = max(CPG_H, CPG_H * G / max(n_cpg, 1))
+    units = CPG_H + tim_h + LEG_H * G
+    fig = plt.figure(figsize=(max(14.0, 5.8 * C), 1.05 * units + 1.0))
     # top/bottom pinned so the suptitle sits close to the first raster instead
     # of leaving a band of dead space (bbox_inches="tight" crops the OUTER
     # margin, not internal gaps).
     gs  = gridspec.GridSpec(2 + G, C, hspace=0.62, wspace=0.20,
                             top=0.935, bottom=0.045, left=0.055, right=0.99,
-                            height_ratios=[1.1, 1.1] + [1.5] * G)
+                            height_ratios=[CPG_H, tim_h] + [LEG_H] * G)
 
     # The two rasters span every column; the leg rows do not.
     ax_cpg = fig.add_subplot(gs[0, :])
@@ -361,7 +370,8 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
         ax_tim.scatter(idx, np.full(len(idx), j), marker="|", s=110, lw=1.5,
                        color=TIMING_PALETTE[j % len(TIMING_PALETTE)])
     ax_tim.set_yticks(range(G))
-    ax_tim.set_yticklabels([f"T{j}" for j in range(G)], fontsize=8)
+    ax_tim.set_yticklabels([f"T{j}" for j in range(G)],
+                           fontsize=8 if G <= 12 else 7)
     ax_tim.set_ylim(-0.6, G - 0.4)
     cycle_lines(ax_tim)
     ax_tim.set_title("Timing layer raster  (exact — same spikes the "
