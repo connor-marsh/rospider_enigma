@@ -1261,6 +1261,42 @@ class TimingGroupedSNN(nn.Module):
     have been the wrong choice -- it cannot collapse three legs onto one
     phase.
 
+    BIAS MODES
+    ----------
+    `bias_mode` decides how a neuron's excitability is parameterised.
+
+      "current"  the classic form: an additive term in the input current.
+      "voltage"  (default) a per-unit offset to the SPIKING THRESHOLD instead.
+                 No bias current anywhere in the spiking path.
+      "none"     no bias at all.
+
+    Why voltage is the default. For an UNGATED layer with subtractive reset the
+    two are EXACTLY equivalent -- substituting m' = mem - b/(1-beta) turns
+    mem[t] = beta*mem[t-1] + w*s[t] + b into the unbiased recurrence with the
+    spike test shifted to m' > thresh - b/(1-beta) (verified numerically:
+    identical spike trains). So nothing is given up.
+
+    Where they differ, voltage is preferable:
+      - Under gating the bias is already gated, so it is not tonic drive -- but
+        it IS part of the per-spike injection, and w1/b1 become redundant
+        because only their sum enters. Injection magnitude is what produces the
+        jerk on each spike, so moving the bias out of the injection and into a
+        persistent threshold attacks that directly.
+      - A threshold never touches the membrane, so a frozen sub-network
+        provably cannot have spiked. With bias_mode="current" and
+        gate_mode="none" that guarantee does not hold.
+
+    The RESET still subtracts the fixed `thresh`, not the offset threshold.
+    Resetting by the offset would let a unit that learns a low threshold fire
+    easily AND reset by almost nothing, which runs away; and it is not the
+    variant that is equivalent to a bias current (measured 60 vs 75 spikes on
+    the same input).
+
+    b_read has no voltage equivalent and is dropped outside "current" mode:
+    memo is analog and never spikes, so there is no threshold to offset. b_out
+    still carries the output offset, and being added to y rather than to a
+    membrane it is not a bias current in the sense that matters.
+
     No LayerNorm on the timing layer
     --------------------------------
     LN subtracts the mean across the normalised dimension.  Over 6-16 units
@@ -1304,6 +1340,7 @@ class TimingGroupedSNN(nn.Module):
                  tau_readout_max=40.0,
                  sub_ln="l2", sub_film="both",
                  timing_reset="zero", gate_mode="freeze",
+                 bias_mode="voltage",
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
         if n_gaits > max_gaits:
@@ -1358,6 +1395,10 @@ class TimingGroupedSNN(nn.Module):
             raise ValueError(f"gate_mode must be none|decay|freeze, got "
                              f"{gate_mode!r}")
         self.gate_mode = gate_mode
+        if bias_mode not in ("current", "voltage", "none"):
+            raise ValueError(f"bias_mode must be current|voltage|none, got "
+                             f"{bias_mode!r}")
+        self.bias_mode = bias_mode
         self.group_cols = group_cols
         self.H          = Hg          # alias for generic callers
 
@@ -1396,15 +1437,20 @@ class TimingGroupedSNN(nn.Module):
         self.w_in_gait = nn.Embedding(max_gaits, self.n_neurons * G)
         nn.init.normal_(self.w_in_gait.weight, mean=_W_IN_INIT, std=_W_IN_INIT)
 
-        # Per-gait bias.  Note this is tonic drive -- present on silent steps
-        # too -- which is exactly why it is wanted here: with
-        # timing_reset="zero" a timing unit can only fire when input arrives,
-        # so bias is the ONLY mechanism by which it can spike BETWEEN CPG
-        # bursts.  Under event gating that maintenance firing is what the
-        # sub-networks need, so tonic drive is load-bearing rather than the
-        # liability it would be for a CPG-locked burster.
-        self.b_t = nn.Embedding(max_gaits, G)
-        nn.init.zeros_(self.b_t.weight)
+        # Per-gait excitability.  See BIAS MODES in the class docstring.
+        #   "current": an additive current, i.e. tonic drive on every step it
+        #              is applied.  With timing_reset="zero" that is the only
+        #              way a unit fires BETWEEN CPG bursts, so it is
+        #              load-bearing rather than a liability here.
+        #   "voltage": a per-gait threshold offset instead. Never touches the
+        #              membrane, so it cannot manufacture a spike on a step
+        #              where no input arrived.
+        if bias_mode == "current":
+            self.b_t = nn.Embedding(max_gaits, G)
+            nn.init.zeros_(self.b_t.weight)
+        elif bias_mode == "voltage":
+            self.v_t = nn.Embedding(max_gaits, G)
+            nn.init.zeros_(self.v_t.weight)
         self.beta_t_logit = nn.Parameter(
             init_beta_logit((G,), tau_timing_min, tau_timing_max))
 
@@ -1415,11 +1461,9 @@ class TimingGroupedSNN(nn.Module):
         # film1's gamma are both learnable so the init only sets the
         # optimisation path, not what is reachable.
         self.w1 = nn.Parameter(torch.randn(G, Hg) * _W1_INIT)
-        self.b1 = nn.Parameter(torch.zeros(G, Hg))
 
         # ── sub-network layer 2: block diagonal (G, Hg, Hg) ───────
         self.w2 = nn.Parameter(torch.randn(G, Hg, Hg) / math.sqrt(Hg))
-        self.b2 = nn.Parameter(torch.zeros(G, Hg))
 
         # ── block-diagonal analog readout ─────────────────────────
         # Ho, not Hg: memo is a BANK OF LOW-PASS FILTERS (one tau per unit,
@@ -1432,9 +1476,21 @@ class TimingGroupedSNN(nn.Module):
         # distinct (projection, tau) pairs for the whole group.  Ho == Hg (the
         # original) is the other extreme and was ~40% of the model's params.
         self.w_read = nn.Parameter(torch.randn(G, Hg, Ho) / math.sqrt(Hg))
-        self.b_read = nn.Parameter(torch.zeros(G, Ho))
         self.w_out  = nn.Parameter(torch.randn(G, Ho, C) / math.sqrt(Ho))
         self.b_out  = nn.Parameter(torch.zeros(G, C))
+
+        # Bias parameters, whichever form is in use.  b_read has no voltage
+        # equivalent -- memo is ANALOG and never spikes, so there is no
+        # threshold to offset -- so in voltage/none mode it is simply dropped
+        # and b_out carries the output offset.  b_out is added to y, not to a
+        # membrane, so it is not a "bias current" in the sense that matters.
+        if bias_mode == "current":
+            self.b1     = nn.Parameter(torch.zeros(G, Hg))
+            self.b2     = nn.Parameter(torch.zeros(G, Hg))
+            self.b_read = nn.Parameter(torch.zeros(G, Ho))
+        elif bias_mode == "voltage":
+            self.v1 = nn.Parameter(torch.zeros(G, Hg))
+            self.v2 = nn.Parameter(torch.zeros(G, Hg))
 
         self.ln1 = nn.LayerNorm(Hg, elementwise_affine=False)
         self.ln2 = nn.LayerNorm(Hg, elementwise_affine=False)
@@ -1483,9 +1539,17 @@ class TimingGroupedSNN(nn.Module):
         `LIFGeneralArray` (the CPG) does exactly this: `v[spike] = 0`.
         """
         W   = self.w_in_gait(gait).view(-1, self.n_neurons, self.G)
-        cur = torch.bmm(x.unsqueeze(1), W).squeeze(1) + self.b_t(gait)
+        cur = torch.bmm(x.unsqueeze(1), W).squeeze(1)
+        if self.bias_mode == "current":
+            cur = cur + self.b_t(gait)
+        # Comparison threshold only; the RESET below still subtracts the fixed
+        # self.thresh. Resetting by the offset threshold instead would let a
+        # unit that learns a low threshold fire easily AND reset by almost
+        # nothing, which runs away.
+        th = (self.thresh - self.v_t(gait) if self.bias_mode == "voltage"
+              else self.thresh)
         mem_t = torch.sigmoid(self.beta_t_logit) * mem_t + cur
-        spk_t = spike_fn(mem_t - self.thresh, self.timing_slope)
+        spk_t = spike_fn(mem_t - th, self.timing_slope)
         if self.timing_reset == "zero":
             mem_t = mem_t * (1.0 - spk_t)
         else:
@@ -1562,10 +1626,15 @@ class TimingGroupedSNN(nn.Module):
         # w1 and b1 are redundant when gated (only their sum enters) because
         # the gate replaced the spk_t multiplication that used to separate
         # them. Both kept so checkpoint shapes are unchanged.
+        # In "current" mode and gated, w1 and b1 are redundant (only their sum
+        # enters). In "voltage" mode the bias has moved out of the injection
+        # entirely, which is the point: injection magnitude is what drives the
+        # jerk, and a threshold offset does not inflate it.
+        b1 = self.b1 if self.bias_mode == "current" else 0.0
         if gated:
-            cur1 = self.w1 + self.b1                          # (G, Hg)
+            cur1 = self.w1 + b1                               # (G, Hg)
         else:
-            cur1 = spk_t.unsqueeze(-1) * self.w1 + self.b1    # (B, G, Hg)
+            cur1 = spk_t.unsqueeze(-1) * self.w1 + b1         # (B, G, Hg)
         if self.sub_ln in ("l1", "both"):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
@@ -1575,13 +1644,17 @@ class TimingGroupedSNN(nn.Module):
             cur1 = gate * cur1
         new1 = dec1 * mem1 + cur1
         mem1 = torch.lerp(mem1, new1, g_hard) if freeze else new1
-        spk1 = spike_fn(mem1 - self.thresh, self.slope)
+        th1 = (self.thresh - self.v1 if self.bias_mode == "voltage"
+               else self.thresh)
+        spk1 = spike_fn(mem1 - th1, self.slope)
         if gated:
             spk1 = gate * spk1
         mem1 = mem1 - self.thresh * spk1
 
         # ---- sub-net layer 2: block diagonal ------------------------
-        cur2 = torch.einsum("bgh,ghk->bgk", spk1, self.w2) + self.b2
+        cur2 = torch.einsum("bgh,ghk->bgk", spk1, self.w2)
+        if self.bias_mode == "current":
+            cur2 = cur2 + self.b2
         if self.sub_ln in ("l2", "both"):
             cur2 = self.ln2(cur2)
         if self.sub_film in ("l2", "both"):
@@ -1591,13 +1664,17 @@ class TimingGroupedSNN(nn.Module):
             cur2 = gate * cur2
         new2 = dec2 * mem2 + cur2
         mem2 = torch.lerp(mem2, new2, g_hard) if freeze else new2
-        spk2 = spike_fn(mem2 - self.thresh, self.slope)
+        th2 = (self.thresh - self.v2 if self.bias_mode == "voltage"
+               else self.thresh)
+        spk2 = spike_fn(mem2 - th2, self.slope)
         if gated:
             spk2 = gate * spk2
         mem2 = mem2 - self.thresh * spk2
 
         # ---- block-diagonal analog readout -------------------------
-        curo = torch.einsum("bgh,ghk->bgk", spk2, self.w_read) + self.b_read
+        curo = torch.einsum("bgh,ghk->bgk", spk2, self.w_read)
+        if self.bias_mode == "current":
+            curo = curo + self.b_read
         if gated:
             curo = gate * curo
         newo = deco * memo + curo
@@ -1658,14 +1735,17 @@ class TimingGroupedSNN(nn.Module):
     # ---------------------------------------------------------------
     def param_breakdown(self):
         """Grouped parameter counts, for the startup print."""
-        n = lambda *ps: int(sum(p.numel() for p in ps))
+        n = lambda *ps: int(sum(p.numel() for p in ps
+                                 if p is not None))
+        g = lambda name: getattr(self, name, None)
         return {
-            "timing":  n(self.w_in_gait.weight, self.b_t.weight,
-                         self.beta_t_logit),
-            "sub_l1":  n(self.w1, self.b1, self.beta1_logit),
-            "sub_l2":  n(self.w2, self.b2, self.beta2_logit),
-            "readout": n(self.w_read, self.b_read, self.w_out, self.b_out,
-                         self.betao_logit),
+            "timing":  n(self.w_in_gait.weight, self.beta_t_logit,
+                         *(w.weight for w in (g("b_t"), g("v_t"))
+                           if w is not None)),
+            "sub_l1":  n(self.w1, self.beta1_logit, g("b1"), g("v1")),
+            "sub_l2":  n(self.w2, self.beta2_logit, g("b2"), g("v2")),
+            "readout": n(self.w_read, self.w_out, self.b_out,
+                         self.betao_logit, g("b_read")),
             "sub_film": n(self.film1.weight, self.film2.weight),
         }
 
@@ -2876,6 +2956,8 @@ def build_model_from_cfg(cfg, device):
             # gate_mode replaced the old boolean event_gated. Map the old
             # key when only it is present: True was the "decay" behaviour
             # (membranes leak every step), and absent entirely means ungated.
+            # "current" was the only behaviour before bias_mode existed.
+            bias_mode        = str(cfg_get(cfg, "bias_mode", "current")),
             gate_mode        = str(cfg_get(
                 cfg, "gate_mode",
                 "decay" if cfg_get(cfg, "event_gated", False) else "none")),
@@ -3200,6 +3282,21 @@ def main():
                          "since w1's gradient is proportional to the timing "
                          "spike and so was exactly zero the whole time it was "
                          "dead. 0 disables.")
+    ap.add_argument("--bias_mode", type=str, default="voltage",
+                    choices=["current", "voltage", "none"],
+                    help="[timing_grouped] How neuron excitability is "
+                         "parameterised. 'current': an additive term in the "
+                         "input current. 'voltage' (default): a per-unit "
+                         "offset to the spiking THRESHOLD instead, with no "
+                         "bias current in the spiking path. 'none': no bias. "
+                         "For an ungated layer with subtractive reset the "
+                         "first two are exactly equivalent, so voltage gives "
+                         "up nothing; where they differ voltage is preferable, "
+                         "because a threshold never touches the membrane (so a "
+                         "frozen sub-network provably cannot have spiked) and "
+                         "because it keeps the bias out of the per-spike "
+                         "injection, whose magnitude is what causes the jerk. "
+                         "See BIAS MODES in TimingGroupedSNN's docstring.")
     ap.add_argument("--gate_mode", type=str, default="freeze",
                     choices=["none", "decay", "freeze"],
                     help="[timing_grouped] How much a sub-network may do "
@@ -3510,7 +3607,7 @@ def main():
             tau_readout_max=args.tau_readout_max,
             sub_ln=args.sub_ln, sub_film=args.sub_film,
             timing_reset=args.timing_reset,
-            gate_mode=args.gate_mode,
+            gate_mode=args.gate_mode, bias_mode=args.bias_mode,
             slope=args.slope, timing_slope=args.timing_slope).to(device)
     else:
         model = StatefulSNN(hidden=args.hidden, n_gaits=len(gait_tables),
@@ -3571,7 +3668,7 @@ def main():
               f"readout({args.readout_hidden})], no cross talk (todo 3a)")
         print(f"      timing reset={args.timing_reset}  "
               f"sub_film={args.sub_film}  sub_ln={args.sub_ln}  "
-              f"gate_mode={args.gate_mode}")
+              f"gate_mode={args.gate_mode}  bias_mode={args.bias_mode}")
         if args.gate_mode == "freeze":
             print(f"      gate_mode=freeze: sub-networks are BIT-FOR-BIT "
                   f"unchanged on silent steps and the output is HELD; the "
@@ -3661,7 +3758,7 @@ def main():
         # task gradient is weak, exactly when L1 pressure is arriving.  So
         # start high and let the L1 term prune downward.
         if args.gate_mode != "none" and args.spike_objective == "min_count":
-            band_lo, band_hi = 2.0 * cpg_rate, 8.0 * cpg_rate
+            band_lo, band_hi = 1.0 * cpg_rate, 4.0 * cpg_rate
             print(f"      (event-gated + min_count: calibrating to "
                   f"{band_lo:.0f}-{band_hi:.0f} spk/cyc, well above the CPG's "
                   f"{cpg_rate:.1f}, so the network starts able to render the "
@@ -3862,6 +3959,8 @@ def main():
             "timing_reset":     (args.timing_reset
                                  if args.arch == "timing_grouped" else None),
             "freeze_blocks":    (args.freeze_blocks or None),
+            "bias_mode":        (args.bias_mode
+                                 if args.arch == "timing_grouped" else None),
             "gate_mode":        (args.gate_mode
                                  if args.arch == "timing_grouped" else None),
             "spike_objective":  (spike_obj.describe()
