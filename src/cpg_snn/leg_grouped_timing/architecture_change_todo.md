@@ -6,9 +6,17 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
 
 ---
 
+> **STATUS: this file is closed out.** The architecture change it tracked (leg
+> grouping via a timing layer) is built and running. Statuses below are final;
+> anything still live has moved to **`leg_grouped_timing_todo.md`**, which also
+> carries the context, measured constants and negative results needed to pick
+> the work up. Items marked [→] are continued there.
+
 ## Pertaining too architecture change
 
-**1.** [ ] **`max_gaits=16` fixes the FiLM table shape** — *Medium*
+**1.** [→] **`max_gaits=16` fixes the FiLM table shape** — *Medium*
+   > **[→] Now measured, not estimated: at max_gaits=16 with 2 gaits in use, the sub-network FiLM tables were 27.7% of the model and 14 of 16 rows received no gradient. Left at 16 because changing it invalidates checkpoints and 16 is the hexapod gait count. Continued in the new file.**
+   >
    > 18.7% of params at h=128, so a checkpoint trained on `n_gaits=4` loads
    into a run using up to 16. Changing `max_gaits` itself, unlike `n_gaits`,
    invalidates old checkpoints — that's the tradeoff being made, just
@@ -23,7 +31,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    means "checkpoint transfers across `n_gaits`" is weaker than it was: FiLM
    transfers as identity, routing transfers as noise.
 
-**2.** [ ] **Hybrid gait conditioning (discrete pattern + continuous parameters)** — *Medium*
+**2.** [→] **Hybrid gait conditioning (discrete pattern + continuous parameters)** — *Medium*
+   > **[→] Unchanged and still the likely end state for gait conditioning. Continued in the new file alongside item 11.**
+   >
    > Gait is currently one integer index into an over-allocated FiLM embedding,
    which handles *growing the gait count* but not *structure*: some
    variation is genuinely categorical (tripod vs ripple vs wave are
@@ -47,7 +57,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    FiLM. A hybrid scheme could express that; two independent
    `Embedding(max_gaits, ·)` tables cannot.
 
-**3.** [~] **Reintroduce leg grouping, properly this time** — *High*
+**3.** [x] **Reintroduce leg grouping, properly this time** — *High*
+   > **[x] DONE. TimingGroupedSNN in train.py, --arch timing_grouped (now the default). Per-gait CPG->timing weight matrix; the shared-router alternative was tried and reverted, see item 11.**
+   >
    > Removed along with input routing because the old block-diagonal layers 2+
    made the network four independent sub-networks with no principled way to
    align each group to a CPG neuron (the routing permutation's phase
@@ -80,6 +92,8 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    reference, rather than four copies each re-deriving phase from raw spikes.
 
 **3a.** [x] **Do it with no cross talk** — *High*
+   > **[x] DONE and running. No cross talk: one sub-network per timing neuron, block-diagonal layers 2+ and readout.**
+   >
    > Implemented as `--arch timing_grouped`. Sub-network *g*'s only spike
    input is timing neuron *g*; layers 2+ and the analog readout are block
    diagonal `(G, Hg, Hg)`; group *g* writes only its own gait-table columns
@@ -91,7 +105,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    `init_state`, `timing_only`, both plot paths and ONNX export without
    spending an epoch.
 
-**3b.** [ ] **Do it with cross talk** — *Medium*
+**3b.** [→] **Do it with cross talk** — *Medium*
+   > **[→] Still untested. Continued in the new file.**
+   >
    > Compare results. One-line change to sub-net layer 1: replace the outer
    product `spk_t.unsqueeze(-1) * w1 + b1` with
    `einsum("bt,tgh->bgh", spk_t, w1_cross)` and `w1` becomes
@@ -100,7 +116,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    branch. Judge on free-run RMSE and `Val(post-sw)` at matched gradient
    steps, not train loss.
 
-**3c.** [ ] **Sweep the timing layer's shape and firing regime** — *High*
+**3c.** [x] **Sweep the timing layer's shape and firing regime** — *High*
+   > **[x] Largely DONE. n_timing (n_legs or n_joints), sub_ln (now l2), tau ranges (now period-derived), and the firing regime (now set by calibration rather than --timing_w_scale, which is gone). Remaining sweeps moved to the new file.**
+   >
    > The knobs that actually decide whether 3a works, in rough order of
    expected impact:
    > - `--n_timing`: `n_legs` (4, default) vs `n_joints` (8). Columns *j* and
@@ -126,7 +144,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    >   ~4x. Run both before concluding anything about the architecture rather
    >   than about capacity.
 
-**3d.** [ ] **Reconsider having entirely separate CPG→timing weights per gait** — *Medium*
+**3d.** [x] **Reconsider having entirely separate CPG→timing weights per gait** — *Medium*
+   > **[x] DONE and superseded. FiLM was removed from the timing layer (its gamma was provably absorbable into a free per-gait matrix); the per-gait bias survives as b_t/v_t. The broader question of avoiding a per-gait weight table is item 11.**
+   >
    > Requested explicitly. `w_in_gait` currently gives each gait its own
    `(n_cpg_neurons, n_timing)` matrix with nothing shared, which is the
    maximally expressive option and also the one with the least inductive
@@ -154,7 +174,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    moment `w_in_gait` is made gait-shared by any of the options above. If
    per-gait routing is kept permanently, consider dropping timing gamma.
 
-**3e.** [ ] **Graph diagnostics for the timing layer** — *Medium*
+**3e.** [x] **Graph diagnostics for the timing layer** — *Medium*
+   > **[x] DONE. timing_report prints rate/phase/R plus a phase-separation number; visualize_timing.py produces the timing_alignment, phase_fold, alignment_summary and routing_matrices figures, and live_visualization.py does it in real time during inference.**
+   >
    > Print-based diagnostics exist: `timing_report` prints, per gait and per
    timing neuron, **spk/cyc** (0.00 = DEAD, with an explicit warning), the
    **circular mean phase** of firing, and **R**, the circular concentration.
@@ -177,7 +199,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    > - **Learned tau distribution**, timing layer vs sub-networks, to check
    >   whether `--tau_timing_max` is binding.
 
-**3f.** [ ] **Dead-timing-neuron protection** — *Medium*
+**3f.** [x] **Dead-timing-neuron protection** — *Medium*
+   > **[x] DONE. calibrate_gains (pre-training, bisects into a CPG-derived band), the spike-statistics objective, and reinit_dead_units (which also re-rolls the sub-network's w1, the parameter that receives exactly zero gradient while its timing neuron is silent). Dead timing neurons are no longer observed in practice.**
+   >
    > Sharper failure mode than anything in the dense arch: each sub-network's
    entire input is one binary channel, so a silent timing neuron freezes its
    leg at whatever the decaying membranes settle to, and the surrogate
@@ -188,7 +212,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    `--timing_w_scale`, or re-init of dead units mid-run. Don't add any of
    these pre-emptively — wait and see whether the report ever fires.
 
-**4.** [ ] **`inference.py` is broken** — *High*
+**4.** [x] **`inference.py` is broken** — *High*
+   > **[x] DONE. Rewritten as run_inference.py: PyTorch not ONNX, config-driven with backward compatibility, plus gait switching (none/schedule/keyboard, gesture/joystick stubbed) and optional live visualisation.**
+   >
    > `StatefulSNNPredictor` still hardcodes 5 state tensors (`state_names_in`,
    `[z() for _ in range(5)]`, `out[1:]`) from before the recurrence removal,
    and the state shape is now `(B, H)` rather than `(B, 4, H/4)` after the
@@ -211,7 +237,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
 
 ## Miscellaneous items
 
-**1.** [ ] **Find the largest usable LR** — *Low*
+**1.** [x] **Find the largest usable LR** — *Low*
+   > **[x] DONE, and the answer is that it does not matter. 2e-3 vs 8e-3 (4x) gave near-identical loss curves. Under Adam the update is scale-invariant in the gradient, so |grad| was never an LR diagnostic; |upd| is now logged instead. Do not re-sweep.**
+   >
    > Still at 2e-3. `|grad|` and loss both trend smoothly down with no
    oscillation, which rules out the LR being *too high* but says nothing
    about *too low* — smooth slow descent looks the same as smooth fast
@@ -228,7 +256,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    (embedding lookups + block-diagonal einsums, ~4x the params at equal
    `--hidden`), so the dense LR bracket does not transfer.
 
-**2.** [ ] **Batch size may still want an LR rescale** — *Low*
+**2.** [x] **Batch size may still want an LR rescale** — *Low*
+   > **[x] DONE by the above: LR-insensitive over 4x, so the batch change did not need a rescale.**
+   >
    > Batch went 32→128 (4×) but `lr` stayed at 2e-3, deferred deliberately so
    the first benchmark was a clean comparison. Adam sqrt-rule suggests
    ~4e-3. Fold this into item 1's LR range test rather than treating it as a
@@ -308,7 +338,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    the version worth measuring first. `_timing` is already factored out as
    its own method, so the extraction is mechanical when the time comes.
 
-**9.** [ ] **Named legs for quadruped and hexapod, for use in visualizations** — *Low*
+**9.** [→] **Named legs for quadruped and hexapod, for use in visualizations** — *Low*
+   > **[→] Still open. Continued in the new file.**
+   >
    > Requested directly. Every leg-indexed label right now is a bare index —
    `leg{l}` / `T{l}` in visualize.py's plots — not an anatomical name. `HEXAPOD_LEG_NAMES =
    ["LF","LM","LR","RF","RM","RR"]` already exists next to `HEXAPOD_LEG_COLS`
@@ -329,7 +361,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    >   `plot_alignment`, `plot_phase_fold`, `plot_alignment_summary`, and
    >   `plot_routing`, and in train.py's leg->servo startup print.
 
-**10.** [ ] **The spike-concentration penalty forbids two bursts per cycle** — *Medium*
+**10.** [→] **The spike-concentration penalty forbids two bursts per cycle** — *Medium*
+   > **[→] Still open. Continued in the new file.**
+   >
    > `spike_stats_penalty` scores burst tightness with the circular
    concentration R of a unit's spike phases:
    >
@@ -362,7 +396,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    3.2e-5 vs 9.7e-3, a ~300x separation. That separation is entirely the R
    term, which is what makes it worth keeping despite this limitation.
 
-**11.** [ ] **Find a gait-conditioning scheme that isn't a per-gait weight table** — *High*
+**11.** [→] **Find a gait-conditioning scheme that isn't a per-gait weight table** — *High*
+   > **[→] Still THE open question, and now better evidenced: the per-gait embedding does separate gaits, so the collapse was the shared router's, not the table's. Continued in the new file.**
+   >
    > `w_in_gait` is back: an `Embedding(max_gaits, n_cpg_neurons * n_timing)`
    giving each gait its own free CPG→timing routing matrix, nothing shared.
    It is the version that demonstrably separates gaits, and it is not the
@@ -452,7 +488,9 @@ into one flat, numbered list rather than separate bites/follow-ups/ideas section
    difference of 1.55e-05, contributing ~1.6e-07 to the loss at λ=0.01.
    Structural fix, not a loss fix.
 
-**13.** [ ] **Derive footfall phases by inverse kinematics, and consider using them to train the timing layer** — *High*
+**13.** [→] **Derive footfall phases by inverse kinematics, and consider using them to train the timing layer** — *High*
+   > **[→] Still open. Continued in the new file.**
+   >
    > The gait CSVs are joint angles, not foot positions, so the **fundamental
    phase of a joint column is not the footfall phase**. Trying to read
    footfall timing off the tables directly does not work: some columns rise
