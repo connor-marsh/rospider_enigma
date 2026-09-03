@@ -3376,7 +3376,7 @@ def main():
                          "because it keeps the bias out of the per-spike "
                          "injection, whose magnitude is what causes the jerk. "
                          "See BIAS MODES in TimingGroupedSNN's docstring.")
-    ap.add_argument("--gate_mode", type=str, default="freeze",
+    ap.add_argument("--gate_mode", type=str, default="decay",
                     choices=["none", "decay", "freeze"],
                     help="[timing_grouped] How much a sub-network may do "
                          "without a spike from its own timing neuron. "
