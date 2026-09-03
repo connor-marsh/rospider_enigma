@@ -6,7 +6,7 @@ CPG, steps the network one timestep at a time, and publishes joint commands to
 the servo controller.
 
 Everything about the model comes from the config, through the same
-`build_model_from_cfg` / `load_run` that visualize.py uses -- so architecture,
+`build_model_from_cfg` / `load_run` that visualize_timing.py uses -- so architecture,
 gate mode, taus, group layout and gait set are whatever that checkpoint was
 trained with, including for configs predating any given option.  No ONNX.
 
@@ -423,7 +423,7 @@ def main():
         description="CPG-SNN inference on the robot (PyTorch)")
     ap.add_argument("--model_dir", type=str, default="",
                     help="Resolved as outputs/<model_dir>, same as "
-                         "visualize.py. Default '' = outputs/ itself.")
+                         "visualize_timing.py. Default '' = outputs/ itself.")
     ap.add_argument("--ckpt", type=str, default="best_model.pt")
     ap.add_argument("--cfg",  type=str, default="cpg_lif_snn_config.json")
     ap.add_argument("--gait_switch", type=str, default="none",
@@ -485,7 +485,7 @@ def main():
                          "cycles. Expressed in cycles rather than timesteps so "
                          "it stays meaningful whether the period is 352 (real "
                          "oscillator) or 120 (--fake_cpg).")
-    ap.add_argument("--viz_cpg_cycles", type=float, default=2.0,
+    ap.add_argument("--viz_cpg_cycles", type=float, default=1.5,
                     help="History shown in the CPG spike plot, in CPG cycles. "
                          "Much shorter than --viz_trace_cycles on purpose: at "
                          "5 cycles the individual spikes in a burst merge into "

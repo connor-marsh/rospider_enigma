@@ -637,37 +637,75 @@ GAIT_FILES_BY_N = {4: QUADRUPED_GAIT_FILES, 6: HEXAPOD_GAIT_FILES}
 
 
 # Output files are grouped into per-category subfolders of the run dir.
-# Routing is by FILENAME PREFIX so every call site can keep passing a bare
-# name and the layout lives in one place -- train.py writes recon_*, and
-# visualize.py writes the rest, without either needing to know the folders.
-OUT_SUBDIRS = (
-    ("recon_",            "recons"),
-    ("timing_alignment_", "timing_alignments"),
-    ("membranes_",        "membrane_waveforms"),
-    ("phase_fold_",       "phase_folds"),
+# Routing is by FILENAME so every call site can keep passing a bare name and
+# the layout lives in exactly one place: train.py, visualize_timing.py and
+# reorganize_outputs.py all consult this table and so cannot disagree.
+#
+# Left LOOSE in the run directory (deliberately -- these are the ones looked at
+# first): metrics.csv, training_curves.png, transition.png, rmse_heatmap.png.
+#
+# The model/ entries are EXACT filenames rather than ".pt"/".onnx" suffixes, so
+# nothing unexpected gets swept in -- including .onnx.data, which
+# torch.onnx.export writes alongside the graph when weights are stored
+# externally and which is useless separated from it.
+OUT_ROUTES = (
+    # (kind, pattern, subfolder);  kind is "prefix" | "exact"
+    ("prefix", "recon_",                      "recons"),
+    ("prefix", "timing_alignment_",           "timing_alignments"),
+    ("prefix", "membranes_",                  "membrane_waveforms"),
+    ("prefix", "phase_fold_",                 "phase_folds"),
+    ("exact",  "best_model.pt",               "model"),
+    ("exact",  "cpg_lif_snn_config.json",     "model"),
+    ("exact",  "cpg_lif_snn_step.onnx",       "model"),
+    ("exact",  "cpg_lif_snn_step.onnx.data",  "model"),
+    ("exact",  "alignment_summary.png",       "misc_info"),
+    ("exact",  "burst_threshold.png",         "misc_info"),
+    ("exact",  "cpg_raster.png",              "misc_info"),
+    ("exact",  "routing_matrices.png",        "misc_info"),
+    ("exact",  "tau_distributions.png",       "misc_info"),
+    ("exact",  "timing_summary.json",         "misc_info"),
 )
+OUT_CATEGORY_DIRS = tuple(dict.fromkeys(d for _, _, d in OUT_ROUTES))
+
+
+def route_subdir(name):
+    """Category subfolder for a filename, or "" to leave it loose."""
+    for kind, pat, sub in OUT_ROUTES:
+        if ((kind == "prefix" and name.startswith(pat))
+                or (kind == "exact" and name == pat)):
+            return sub
+    return ""
 
 
 def out_path(out_dir, name):
-    """
-    Route `name` into its category subfolder of `out_dir`, creating it.
-
-    Anything without a known prefix stays loose in the run directory --
-    rmse_heatmap.png, cpg_raster.png, alignment_summary.png, the config, the
-    checkpoint, metrics.csv and so on all sit at the top level together.
-    """
-    sub = next((d for pre, d in OUT_SUBDIRS if name.startswith(pre)), "")
-    p = Path(out_dir, sub, name) if sub else Path(out_dir, name)
+    """Routed path for WRITING `name`, with its parent directory created."""
+    p = Path(out_dir, route_subdir(name), name)
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def in_path(in_dir, name):
+    """
+    Routed path for READING `name`, falling back to the loose location.
+
+    The fallback is what keeps runs made before this layout loadable: their
+    best_model.pt sits at the top level, not in model/. If neither exists the
+    routed path is returned so the caller's error message points at where the
+    file is now supposed to live.
+    """
+    routed = Path(in_dir, route_subdir(name), name)
+    if routed.exists():
+        return routed
+    loose = Path(in_dir, name)
+    return loose if loose.exists() else routed
 
 
 def outputs_path(this_file_dir, rel=""):
     """
     this_file_dir/outputs[/rel].
 
-    Used for --out_dir (train.py, visualize.py) and --model_dir
-    (visualize.py) so a bare name like "test1" always lands at
+    Used for --out_dir (train.py, visualize_timing.py) and --model_dir
+    (visualize_timing.py) so a bare name like "test1" always lands at
     outputs/test1 instead of needing the "outputs/" prefix typed out every
     time.  rel="" (the default for all three args) resolves to
     this_file_dir/outputs itself, unchanged from the old default.
@@ -2458,7 +2496,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                     objective needs no change here.
     """
     best = float("inf")
-    best_path = out_dir / "best_model.pt"
+    best_path = out_path(out_dir, "best_model.pt")
     hist = {"train": [], "val": [], "val_sw": [], "gnorm": [], "sec": [],
             "floor": [], "upd": []}
     last_timing_stats = []
@@ -2476,7 +2514,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
         hist[f"u_{b}"] = []
     n_par = sum(p.numel() for p in model.parameters())
     exp_upd = args.lr * math.sqrt(n_par) * math.sqrt(args.chunks_per_epoch)
-    metrics = MetricsWriter(out_dir / "metrics.csv")
+    metrics = MetricsWriter(out_path(out_dir, "metrics.csv"))
     print(f"\n  Per-epoch metrics -> {out_dir / 'metrics.csv'}")
     print(f"  Gradient blocks: {', '.join(sorted(blocks))}")
     print(f"  |upd| = per-epoch ||delta theta||. Order-of-magnitude "
@@ -2899,7 +2937,7 @@ def plot_transition(model, spikes, targets, device, out_dir, tgt_range,
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 9b. Config / checkpoint loading  (used by visualize.py, run_inference.py)
+# 9b. Config / checkpoint loading  (used by visualize_timing.py, run_inference.py)
 # ═══════════════════════════════════════════════════════════════════
 
 def cfg_get(cfg, key, default=None):
@@ -2999,8 +3037,8 @@ def build_model_from_cfg(cfg, device):
 
 def load_run(model_dir, ckpt_name, cfg_name, device):
     model_dir = Path(model_dir)
-    cfg_path  = model_dir / cfg_name
-    ckpt_path = model_dir / ckpt_name
+    cfg_path  = in_path(model_dir, cfg_name)
+    ckpt_path = in_path(model_dir, ckpt_name)
     for p in (cfg_path, ckpt_path):
         if not p.exists():
             raise FileNotFoundError(f"Not found: {p}")
@@ -3062,7 +3100,7 @@ def export_onnx(model, out_dir, device, cfg):
         in_names  = ["spikes", "gait"] + list(model.state_names_in)
         out_names = ["angles"]         + list(model.state_names_out)
 
-        path = out_dir / "cpg_lif_snn_step.onnx"
+        path = out_path(out_dir, "cpg_lif_snn_step.onnx")
         torch.onnx.export(
             wrapper, dummy, str(path),
             export_params=True, opset_version=14, do_constant_folding=True,
@@ -3087,7 +3125,7 @@ def export_onnx(model, out_dir, device, cfg):
         if compiled_step is not None:
             model.step = compiled_step
 
-    cfg_path = out_dir / "cpg_lif_snn_config.json"
+    cfg_path = out_path(out_dir, "cpg_lif_snn_config.json")
     with open(cfg_path, "w") as f:
         json.dump(json_safe(cfg), f, indent=2, default=str)
     print(f"    [saved] config -> {cfg_path}")
@@ -3137,7 +3175,7 @@ def main():
                          "overriding the --n_cpg_neurons default. Use this "
                          "to run a subset, a different naming, or a species "
                          "GAIT_FILES_BY_N has no entry for. Named to match "
-                         "visualize.py's --gaits, though that one filters "
+                         "visualize_timing.py's --gaits, though that one filters "
                          "which loaded gaits to plot rather than which "
                          "files to load — same name, different job.")
     ap.add_argument("--leg_cols", type=str, default=None,
@@ -3464,9 +3502,9 @@ def main():
                          "prints one line per gait; the compute is "
                          "negligible (timing units only, batch 1).")
     ap.add_argument("--visualize", type=int, default=1,
-                    help="1 = run visualize.py's timing-layer analysis at the "
+                    help="1 = run visualize_timing.py's timing-layer analysis at the "
                          "end of training, writing into this run's own output "
-                         "folders. 0 = skip (run visualize.py by hand later).")
+                         "folders. 0 = skip (run visualize_timing.py by hand later).")
     ap.add_argument("--dry_run",   action="store_true",
                     help="Build data + diagnostics, skip training.")
     ap.add_argument("--out_dir",   type=str, default="",
@@ -3832,7 +3870,7 @@ def main():
             n_gaits=len(gait_tables), period=period,
             spike_obj=spike_obj)
         final_lr = float(opt.param_groups[0]["lr"])
-        model.load_state_dict(torch.load(out_dir / "best_model.pt",
+        model.load_state_dict(torch.load(in_path(out_dir, "best_model.pt"),
                                          map_location=device))
         print(f"\n  best val MSE : {best:.6f}")
         plot_training_curves(hist, out_dir)
@@ -3900,7 +3938,7 @@ def main():
         # Same list as gait_names for CSV-loaded gaits (file stem == display
         # name, matching train_snn.py's convention) — kept as a separate key
         # anyway, so a future remap of display names doesn't have to also
-        # change what visualize.py loads from disk.
+        # change what visualize_timing.py loads from disk.
         "gait_files":       gait_files,
         "gaits_dir":        str(gaits_dir.resolve()),
         "leg_cols":         [list(c) for c in leg_cols],
@@ -4015,7 +4053,8 @@ def main():
                                  for s in model.init_state(1, "cpu")],
             "onnx_inputs":      ["spikes", "gait"] + list(model.state_names_in),
             "onnx_outputs":     ["angles"] + list(model.state_names_out),
-            "weights_file":     "best_model.pt",
+            "weights_file":     "model/best_model.pt",
+            "config_file":      "model/cpg_lif_snn_config.json",
         },
 
         # ── CPG analysis ──────────────────────────────────────────
@@ -4067,7 +4106,7 @@ def main():
     export_onnx(model, out_dir, device, cfg)
 
     # ── 7. Timing-layer visualisation ───────────────────────────
-    # Imported HERE, not at module scope: visualize.py imports from this file,
+    # Imported HERE, not at module scope: visualize_timing.py imports from this file,
     # so a top-level import would be circular.
     #
     # out_dir is passed as both the model dir and the output dir, so the
@@ -4078,7 +4117,7 @@ def main():
     if args.visualize and not args.dry_run:
         print("\n[7/7] Timing-layer visualisation ...")
         try:
-            from visualize import default_args, run_visualization
+            from visualize_timing import default_args, run_visualization
             run_visualization(out_dir, out_dir,
                               default_args(gaits_dir=args.gaits_dir))
         except Exception as e:
@@ -4086,7 +4125,7 @@ def main():
             # and metrics are already on disk by this point.
             print(f"  visualisation FAILED ({type(e).__name__}: {e})")
             print(f"  training output is intact; rerun with "
-                  f"'python visualize.py --model_dir {args.out_dir or ''}'")
+                  f"'python visualize_timing.py --model_dir {args.out_dir or ''}'")
 
     print(f"\nDone — {out_dir.resolve()}")
 

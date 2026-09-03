@@ -20,7 +20,7 @@ Both x-axes are sized in CPG CYCLES, not fixed timesteps, so they stay
 meaningful whether the period is 352 (real oscillator) or 120 (fake_cpg).
 
 Why matplotlib rather than PyGame/PyQtGraph: it is already a dependency of
-visualize.py, so this adds nothing to install, and it draws both the schematic
+visualize_timing.py, so this adds nothing to install, and it draws both the schematic
 and the scrolling plots in one figure. Blitting keeps it fast enough.
 
 TIMING CAVEAT: `update` buffers cheaply on every call but only REDRAWS at
