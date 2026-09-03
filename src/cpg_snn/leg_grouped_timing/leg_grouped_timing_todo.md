@@ -1,5 +1,21 @@
 # Leg-grouped timing architecture — open work and context
 
+## Connor's personal notes and add-ons
+#### Everything else is written by claude and proof-read by Connor
+Hello, for organizations sake, I'm moving from an old chat to a new one, the old chat was about creating this architecture change from one single large SNN taking CPG input and outputting joint angles, to a CPG going to a small LIF timing layer, which then has N distinct smaller SNN's, one for each timing neuron, and then the distinct SNN's will output angles for whichever joints they are assigned (typically either 1 timing neuron per joint, or 1 timing neuron per leg, and then the SNN outputs angles for the number of joints in that leg)
+
+Now I want to refine and finalize this code. You created (and I edited) the file leg_grouped_timing_todo.md to contain the majority of the important context about what we left off on. Also feel free to reference the architecture change todo or the training optimizatoin todo, although those arent as relevant right now.
+
+There are lots of potential things to test and change, but the state of the project right now is that without gating (meaning signals are free to flow through the SNN on every timestep, regardless if the timing layer spiked) we are able to get great performance in terms of RMSE, and matching the output waveforms, but we don't get the desired timing layer "alignment", which is more of an explainability/aesthetic issue. The goal is for the timing layer neuron for a specific joint/leg to spike/burst when that leg is moving the most. But the ungated network hasnt achieved this. With gating (meaning SNN LIF neurons dont output anything if their respecting timing layer didnt spike that timestep) there is promise for better alignment, but the RMSE has been very poor, due to either entirely failing to actually learn the waveform, or mostly learning it, but having these jittery spiky reactions whenever there actually is a timing layer spike. We have two gated options: decay and freeze. Decay lets the output layer decay when there are no spikes, freeze freezes it. I think lets mostly ignore freeze and work on decay, as I beleive the smooth decaying exponential outputs have good promise to match the waveform with a minimal number of spikes.
+
+Here are my primary concerns/ideas right now:
+
+On my most recent attempt (using a timing layer neuron per joint, 18 for the hexapod), I noticed that certain joint waveforms have near perfect RMSE and alignment, like super ideal results overall, but other joint waveforms are a mess. With the architecture there is full separation between the different joints/timing neurons, so there is no reason that one should be able to work and another shouldnt. I believe that the other neurons subnetworks are getting stuck in local minimums, and the one that was near perfect just got "lucky". So I think a potential fix is doing some kind of more complex training curriculum designed to get out of local minimums. This could take advantage of the fact that each subnetwork is separate, and could train several copies of the same subnetwork with different initialized weights, and then just choose the one that performs the best, and even do some sort of genetic algorithm type deal where it will re-roll the bad ones and stuff like that.
+
+I'm still partially confused/unsure about why there is this jittery/spiky result in response to timing layer spikes with the gated network. After switching from current based biases to voltage based biases, i thought that the gated network would be nearly equivalent to the ungated network, but that hasnt been the case. I think potentially the issue could be subtractve reset in the SNN's, because for example a hidden layer 1 could have a large input like 5 (where the threshold and reset value are both 1) so ungated this neuron would spike on the 5 next timesteps. But gated, this neuron might only be able to spike once (or at least to output its spike to the next layer once) if the timing neuron stops spiking immediately
+
+
+## Back to Claude
 Successor to `architecture_change_todo.md`, which is closed out. That file
 tracked *building* the leg-grouped timing architecture; this one tracks making
 it **work better than the ungated baseline**, which it currently does not.
