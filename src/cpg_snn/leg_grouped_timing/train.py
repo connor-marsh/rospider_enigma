@@ -1403,7 +1403,7 @@ class TimingGroupedSNN(nn.Module):
                  tau_timing_min=2.0, tau_timing_max=64.0,
                  tau_readout_max=40.0,
                  sub_ln="l2", sub_film="both",
-                 timing_reset="zero", gate_mode="freeze",
+                 timing_reset="zero", hidden_reset="subtract", gate_mode="freeze",
                  bias_mode="voltage",
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
@@ -1455,6 +1455,7 @@ class TimingGroupedSNN(nn.Module):
         self.sub_ln     = sub_ln
         self.sub_film   = sub_film
         self.timing_reset = timing_reset
+        self.hidden_reset = hidden_reset
         if gate_mode not in ("none", "decay", "freeze"):
             raise ValueError(f"gate_mode must be none|decay|freeze, got "
                              f"{gate_mode!r}")
@@ -1713,7 +1714,10 @@ class TimingGroupedSNN(nn.Module):
         spk1 = spike_fn(mem1 - th1, self.slope)
         if gated:
             spk1 = gate * spk1
-        mem1 = mem1 - self.thresh * spk1
+        if self.hidden_reset == "zero":
+            mem1 = mem1 * (1.0 - spk1)
+        else:
+            mem1 = mem1 - self.thresh * spk1
 
         # ---- sub-net layer 2: block diagonal ------------------------
         cur2 = torch.einsum("bgh,ghk->bgk", spk1, self.w2)
@@ -1733,7 +1737,10 @@ class TimingGroupedSNN(nn.Module):
         spk2 = spike_fn(mem2 - th2, self.slope)
         if gated:
             spk2 = gate * spk2
-        mem2 = mem2 - self.thresh * spk2
+        if self.hidden_reset == "zero":
+            mem2 = mem2 * (1.0 - spk2)
+        else:
+            mem2 = mem2 - self.thresh * spk2
 
         # ---- block-diagonal analog readout -------------------------
         curo = torch.einsum("bgh,ghk->bgk", spk2, self.w_read)
@@ -3254,6 +3261,14 @@ def main():
                          "spikes per burst than the CPG has. That was the "
                          "cause of the observed over-firing AND the "
                          "too-tight-burst R values. Kept only for A/B.")
+    ap.add_argument("--hidden_reset", type=str, default="subtract",
+                        choices=["zero", "subtract"],
+                        help="[timing_grouped] Membrane reset for the hidden "
+                             "layer. 'zero' matches the CPG (LIFGeneralArray does "
+                             "v[spike]=0). With 'subtract' the residual "
+                             "mem-thresh can still exceed threshold, so the unit "
+                             "re-fires on the SILENT steps between CPG spikes: "
+                             )
     ap.add_argument("--timing_slope", type=float, default=5.0,
                     help="[timing_grouped] Surrogate-gradient slope for the "
                          "TIMING layer only; --slope still applies to the "
@@ -3674,7 +3689,7 @@ def main():
             tau_timing_max=args.tau_timing_max,
             tau_readout_max=args.tau_readout_max,
             sub_ln=args.sub_ln, sub_film=args.sub_film,
-            timing_reset=args.timing_reset,
+            timing_reset=args.timing_reset, hidden_reset=args.hidden_reset,
             gate_mode=args.gate_mode, bias_mode=args.bias_mode,
             slope=args.slope, timing_slope=args.timing_slope).to(device)
     else:
