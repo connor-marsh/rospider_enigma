@@ -595,7 +595,7 @@ def analyse_cpg(spikes, out_dir):
     ax[1].set_yscale("log"); ax[1].set_xlabel("ISI (steps)")
     ax[1].set_title("Neuron 0 — raw ISI"); ax[1].grid(alpha=0.3)
     plt.tight_layout()
-    p = out_dir / "burst_threshold.png"
+    p = out_path(out_dir, "burst_threshold.png")
     plt.savefig(p, dpi=140); plt.close()
     print(f"    [saved] {p}")
 
@@ -634,6 +634,32 @@ HEXAPOD_GAIT_FILES = [
     "ripple_backwards", "ripple_tiny_backwards", "ripple_left", "ripple_tiny_left",
 ]
 GAIT_FILES_BY_N = {4: QUADRUPED_GAIT_FILES, 6: HEXAPOD_GAIT_FILES}
+
+
+# Output files are grouped into per-category subfolders of the run dir.
+# Routing is by FILENAME PREFIX so every call site can keep passing a bare
+# name and the layout lives in one place -- train.py writes recon_*, and
+# visualize.py writes the rest, without either needing to know the folders.
+OUT_SUBDIRS = (
+    ("recon_",            "recons"),
+    ("timing_alignment_", "timing_alignments"),
+    ("membranes_",        "membrane_waveforms"),
+    ("phase_fold_",       "phase_folds"),
+)
+
+
+def out_path(out_dir, name):
+    """
+    Route `name` into its category subfolder of `out_dir`, creating it.
+
+    Anything without a known prefix stays loose in the run directory --
+    rmse_heatmap.png, cpg_raster.png, alignment_summary.png, the config, the
+    checkpoint, metrics.csv and so on all sit at the top level together.
+    """
+    sub = next((d for pre, d in OUT_SUBDIRS if name.startswith(pre)), "")
+    p = Path(out_dir, sub, name) if sub else Path(out_dir, name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def outputs_path(this_file_dir, rel=""):
@@ -2730,7 +2756,7 @@ def plot_cpg_raster(spikes, onsets, out_dir, n_show=1200):
     ax.set_title("Bursting-LIF CPG raster (dashed = neuron-0 burst onset)")
     ax.grid(axis="x", alpha=0.2)
     plt.tight_layout()
-    p = out_dir / "cpg_raster.png"
+    p = out_path(out_dir, "cpg_raster.png")
     plt.savefig(p, dpi=140); plt.close()
     print(f"    [saved] {p}")
 
@@ -2747,7 +2773,7 @@ def plot_training_curves(hist, out_dir):
     ax.legend(); ax.grid(alpha=0.3)
     ax.set_title("Stateful TBPTT training")
     plt.tight_layout()
-    p = out_dir / "training_curves.png"
+    p = out_path(out_dir, "training_curves.png")
     plt.savefig(p, dpi=140); plt.close()
     print(f"    [saved] {p}")
 
@@ -2806,7 +2832,7 @@ def plot_reconstruction(model, spikes, targets, valid, device,
         plt.suptitle(f"{gait_names[g]} — free-run reconstruction "
                      f"({warm}-step warm-up discarded)", fontweight="bold")
         plt.tight_layout()
-        p = out_dir / f"recon_{gait_names[g]}.png"
+        p = out_path(out_dir, f"recon_{gait_names[g]}.png")
         plt.savefig(p, dpi=140); plt.close()
         print(f"    [saved] {p}  mean RMSE = {rmse[g].mean():.2f}°")
 
@@ -2825,7 +2851,7 @@ def plot_reconstruction(model, spikes, targets, valid, device,
                     color="white" if rmse[g, j] > rmse.max() * 0.6 else "black")
     ax.set_title("Per-joint RMSE (degrees)", fontweight="bold")
     plt.tight_layout()
-    p = out_dir / "rmse_heatmap.png"
+    p = out_path(out_dir, "rmse_heatmap.png")
     plt.savefig(p, dpi=140); plt.close()
     print(f"    [saved] {p}")
     return rmse
@@ -2867,7 +2893,7 @@ def plot_transition(model, spikes, targets, device, out_dir, tgt_range,
     plt.suptitle(f"Gait switch {gait_names[g_from]} -> {gait_names[g_to]} "
                  f"at t={switch_at}", fontweight="bold")
     plt.tight_layout()
-    p = out_dir / "transition.png"
+    p = out_path(out_dir, "transition.png")
     plt.savefig(p, dpi=140); plt.close()
     print(f"    [saved] {p}")
 
@@ -3437,6 +3463,10 @@ def main():
                          "firing report. Slower than --log_every because it "
                          "prints one line per gait; the compute is "
                          "negligible (timing units only, batch 1).")
+    ap.add_argument("--visualize", type=int, default=1,
+                    help="1 = run visualize.py's timing-layer analysis at the "
+                         "end of training, writing into this run's own output "
+                         "folders. 0 = skip (run visualize.py by hand later).")
     ap.add_argument("--dry_run",   action="store_true",
                     help="Build data + diagnostics, skip training.")
     ap.add_argument("--out_dir",   type=str, default="",
@@ -3758,7 +3788,7 @@ def main():
         # task gradient is weak, exactly when L1 pressure is arriving.  So
         # start high and let the L1 term prune downward.
         if args.gate_mode != "none" and args.spike_objective == "min_count":
-            band_lo, band_hi = 1.0 * cpg_rate, 4.0 * cpg_rate
+            band_lo, band_hi = 2.0 * cpg_rate, 8.0 * cpg_rate
             print(f"      (event-gated + min_count: calibrating to "
                   f"{band_lo:.0f}-{band_hi:.0f} spk/cyc, well above the CPG's "
                   f"{cpg_rate:.1f}, so the network starts able to render the "
@@ -4035,6 +4065,28 @@ def main():
         },
     }
     export_onnx(model, out_dir, device, cfg)
+
+    # ── 7. Timing-layer visualisation ───────────────────────────
+    # Imported HERE, not at module scope: visualize.py imports from this file,
+    # so a top-level import would be circular.
+    #
+    # out_dir is passed as both the model dir and the output dir, so the
+    # figures land in this run's own category folders rather than a nested
+    # outputs/<run>/visualize/. It re-reads best_model.pt and the config from
+    # disk, which doubles as an end-of-run check that those artifacts load and
+    # run.
+    if args.visualize and not args.dry_run:
+        print("\n[7/7] Timing-layer visualisation ...")
+        try:
+            from visualize import default_args, run_visualization
+            run_visualization(out_dir, out_dir,
+                              default_args(gaits_dir=args.gaits_dir))
+        except Exception as e:
+            # Never let plotting lose a finished run: the checkpoint, config
+            # and metrics are already on disk by this point.
+            print(f"  visualisation FAILED ({type(e).__name__}: {e})")
+            print(f"  training output is intact; rerun with "
+                  f"'python visualize.py --model_dir {args.out_dir or ''}'")
 
     print(f"\nDone — {out_dir.resolve()}")
 

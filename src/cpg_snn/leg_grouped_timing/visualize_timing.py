@@ -73,7 +73,7 @@ from train import (
     LIFCPGStepper, cpg_weight_matrix,
     detect_burst_threshold, burst_onsets,
     upsample_gait_tables, build_group_cols,
-    load_gait_tables, GAIT_FILES_BY_N, outputs_path,
+    load_gait_tables, GAIT_FILES_BY_N, outputs_path, out_path,
     cfg_get, build_model_from_cfg, load_run,
     N_LEGS, N_JOINTS, CPG_PALETTE, CPG_FROM_FB_WEIGHT,
 )
@@ -284,8 +284,10 @@ def circ_diff(a, b):
 # ═══════════════════════════════════════════════════════════════════
 
 def _savefig(fig, out_dir, name, dpi):
-    p = Path(out_dir) / name
-    p.parent.mkdir(parents=True, exist_ok=True)
+    # out_path routes by filename prefix into recons/ timing_alignments/
+    # membrane_waveforms/ phase_folds/, leaving anything else loose in the run
+    # directory. See OUT_SUBDIRS in train.py.
+    p = out_path(out_dir, name)
     fig.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     print(f"    [saved] {p}")
@@ -739,7 +741,7 @@ def plot_membranes(mems, state_names, gait_name, out_dir, dpi,
 # 6.  Main
 # ═══════════════════════════════════════════════════════════════════
 
-def main():
+def _build_parser():
     ap = argparse.ArgumentParser(
         description="Visualise the timing layer of a trained CPG-SNN run.")
     ap.add_argument("--model_dir", type=str, default="",
@@ -776,16 +778,50 @@ def main():
     ap.add_argument("--no_membranes", action="store_true")
     ap.add_argument("--dpi",  type=int, default=140)
     ap.add_argument("--seed", type=int, default=0)
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = _build_parser().parse_args()
+    this_file_dir = os.path.dirname(os.path.abspath(__file__))
+    model_dir = outputs_path(this_file_dir, args.model_dir)
+    out_dir = (None if args.out_dir is None
+               else outputs_path(this_file_dir, args.out_dir))
+    run_visualization(model_dir, out_dir, args)
+
+
+def default_args(**overrides):
+    """
+    The CLI defaults as a plain namespace, so train.py can call
+    run_visualization without going through argparse.
+    """
+    a = _build_parser().parse_args([])
+    for k, v in overrides.items():
+        setattr(a, k, v)
+    return a
+
+
+def run_visualization(model_dir, out_dir=None, args=None):
+    """
+    Everything the CLI does, callable directly.
+
+    `out_dir=None` keeps the historical default of <model_dir>/visualize --
+    but train.py passes model_dir itself, so the figures land in the run's own
+    category folders alongside its other output rather than in a nested
+    directory.
+
+    The checkpoint and config are re-read from disk rather than taking a live
+    model, which also serves as an end-of-run check that the saved artifacts
+    actually load and run.
+    """
+    args = args if args is not None else default_args()
+    model_dir = Path(model_dir)
+    out_dir = Path(out_dir) if out_dir is not None else model_dir / "visualize"
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    this_file_dir = os.path.dirname(os.path.abspath(__file__))
-    model_dir = outputs_path(this_file_dir, args.model_dir)
-    out_dir   = (model_dir / "visualize" if args.out_dir is None
-                else outputs_path(this_file_dir, args.out_dir))
-    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device : {device}\nModel  : {model_dir}\nOutput : "
           f"{out_dir.resolve()}\n")
 
@@ -806,7 +842,10 @@ def main():
                 f"no standard gait set (know {sorted(GAIT_FILES_BY_N)}).")
         print(f"  NOTE: config has no 'gait_files' key — assuming the "
               f"standard n_cpg_neurons={n_cpg} set: {gait_files}")
-    gaits_dir = Path(this_file_dir + "/" + args.gaits_dir)
+    # Relative to THIS file, not to model_dir, so it resolves the same
+    # whether called from the CLI or from train.py.
+    gaits_dir = Path(os.path.dirname(os.path.abspath(__file__)),
+                     args.gaits_dir)
     gait_tables_orig, all_names = load_gait_tables(gait_files, gaits_dir)
     print(f"  Loaded {len(all_names)} gait CSV(s) from {gaits_dir.resolve()}: "
           f"{all_names}")
@@ -950,7 +989,7 @@ def main():
                           "leg's first gait-table column; a consistent "
                           "reference, not a biomechanical footfall event"),
     }
-    p = out_dir / "timing_summary.json"
+    p = out_path(out_dir, "timing_summary.json")
     p.write_text(json.dumps(blob, indent=2))
     print(f"    [saved] {p}")
     print(f"\nDone — {out_dir.resolve()}")
