@@ -3071,6 +3071,7 @@ def build_model_from_cfg(cfg, device):
             timing_slope     = float(cfg_get(cfg, "timing_slope",
                                                cfg_get(cfg, "slope", 25.0))),
             timing_reset     = str(cfg_get(cfg, "timing_reset", "subtract")),
+            hidden_reset     = str(cfg_get(cfg, "hidden_reset", "subtract")),
             sub_film         = str(cfg_get(cfg, "sub_film", "both")),
             # gate_mode replaced the old boolean event_gated. Map the old
             # key when only it is present: True was the "decay" behaviour
