@@ -1042,7 +1042,10 @@ def spike_fn(x, slope=25.0):
 # default changed to "l2".
 _W_IN_INIT = 0.5
 _W1_INIT   = 0.5
-
+# Smallest gap kept between a voltage-mode bias and `thresh`, so the
+# effective threshold `thresh - v` stays strictly positive.  See
+# TimingGroupedSNN.clamp_bias_voltage.
+_V_EPS = 1e-6
 
 def init_beta_logit(shape, tau_min, tau_max, generator=None):
     """
@@ -1571,6 +1574,43 @@ class TimingGroupedSNN(nn.Module):
             nn.init.zeros_(e.weight)
             e.weight.data[:, :G * Hg] = 1.0
 
+        # ---------------------------------------------------------------
+    @torch.no_grad()
+    def clamp_bias_voltage(self):
+        """
+        Project v_t / v1 / v2 into [-thresh, thresh - _V_EPS].
+
+        The UPPER bound is the load-bearing one.  A voltage-mode unit
+        compares against `thresh - v`, so v >= thresh makes the effective
+        threshold non-positive, and such a unit fires on EVERY timestep
+        with no way back: reset-to-zero lands at 0, which is still above a
+        non-positive threshold, and subtractive reset is the same failure
+        one step slower.  It stops carrying information, and in an ungated
+        run it spikes on timesteps where its timing neuron did not, which
+        is the opposite of what the layer is for.
+
+        The LOWER bound is mild by comparison: it caps the effective
+        threshold at 2*thresh so a unit cannot be driven permanently silent
+        by the bias alone.
+
+        Clamped on `.data` after the optimiser step, NOT at the use site in
+        `step()`: `(thresh - v.clamp(...))` gives a parameter sitting
+        outside the range exactly zero gradient, so it could never come
+        back.  Clamping the data leaves the true gradient of the unclamped
+        expression, which points inward.  This is projected gradient
+        descent, and it is a no-op on any run that never left the range.
+
+        Deliberately NOT called from build_model_from_cfg / load_run: a
+        trained checkpoint must reconstruct as whatever it actually was,
+        out-of-range biases included.  Use check_bias_voltage.py to find
+        those.
+        """
+        if self.bias_mode != "voltage":
+            return
+        lo, hi = -self.thresh, self.thresh - _V_EPS
+        for p in (self.v_t.weight, self.v1, self.v2):
+            p.data.clamp_(lo, hi)
+
     # ---------------------------------------------------------------
     def init_state(self, batch, device, dtype=torch.float32):
         z = lambda w: torch.zeros(batch, self.G, w, device=device, dtype=dtype)
@@ -1704,7 +1744,7 @@ class TimingGroupedSNN(nn.Module):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
             v1 = self.film1(gait).view(-1, 2, G, Hg)
-            cur1 = cur1 * v1[:, 0] + v1[:, 1]
+            cur1 = cur1 * v1[:, 0]# + v1[:, 1]
         if gated:
             cur1 = gate * cur1
         new1 = dec1 * mem1 + cur1
@@ -1727,7 +1767,7 @@ class TimingGroupedSNN(nn.Module):
             cur2 = self.ln2(cur2)
         if self.sub_film in ("l2", "both"):
             v2 = self.film2(gait).view(-1, 2, G, Hg)
-            cur2 = cur2 * v2[:, 0] + v2[:, 1]
+            cur2 = cur2 * v2[:, 0]# + v2[:, 1]
         if gated:
             cur2 = gate * cur2
         new2 = dec2 * mem2 + cur2
@@ -2631,6 +2671,14 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                                              for g in gs]))
                 gnorm = nn.utils.clip_grad_norm_(model.parameters(), args.clip)
                 opt.step()
+                # Keep the voltage-mode thresholds strictly positive.  See
+                # TimingGroupedSNN.clamp_bias_voltage.  getattr because
+                # --arch dense has no such parameters; `model` is the raw
+                # module (compile swaps `step`, not the module), so this
+                # reaches the real method.
+                clamp = getattr(model, "clamp_bias_voltage", None)
+                if clamp is not None:
+                    clamp()
                 # Stepped per GRADIENT STEP, not per epoch: the LR schedule
                 # must not depend on chunks_per_epoch, which is only a
                 # logging/validation boundary. T_max is set to
