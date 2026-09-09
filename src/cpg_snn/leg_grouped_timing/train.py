@@ -3896,7 +3896,8 @@ def main():
                   f"{cpg_rate:.1f}, so the network starts able to render the "
                   f"waveform and prunes from there)")
         else:
-            band_lo, band_hi = 0.5 * cpg_rate, 2.0 * cpg_rate
+            # band_lo, band_hi = 0.5 * cpg_rate, 2.0 * cpg_rate
+            band_lo, band_hi = 2.0 * cpg_rate, 4.0 * cpg_rate # TODO remove, this is the effective of the above case, but with natural gating
         calib = calibrate_gains(
             model, spikes, len(gait_tables), device, period,
             lo=band_lo, hi=band_hi)
