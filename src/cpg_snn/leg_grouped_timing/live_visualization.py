@@ -33,9 +33,15 @@ Needs a display. Over SSH that means X forwarding (ssh -X); headless fails
 with a clear message.
 """
 
+import json
 import multiprocessing as mp
+import os
 import queue
+import socket
+import struct
+import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -711,3 +717,254 @@ class VisualizerProxy:
                   f"dropped ({pct:.1f}%) — drops mean the plot fell behind, "
                   f"not that the control loop stalled")
         self.proc = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 7.  Remote driver (robot -> laptop over a socket)
+# ═══════════════════════════════════════════════════════════════════
+#
+# Stream the DATA, not the pixels. A frame is ~124 bytes, so at 60 Hz this is
+# ~7 kB/s. Shipping the rendered figure instead -- X11 forwarding, VNC, a
+# remote desktop -- means pushing a 1.8-megapixel framebuffer, which is about
+# 35 Mbit/s even at 20:1 compression and roughly 12,000x more traffic. That is
+# why those feel laggy over WiFi and this does not: all the drawing happens on
+# the laptop, and the robot only says what the numbers were.
+#
+# The laptop LISTENS and the robot CONNECTS OUT, so the viewer can be up first
+# and reconnect independently of run order. Over SSH that is a reverse tunnel:
+#
+#     laptop$  python live_visualization.py --listen 5555
+#     laptop$  ssh -R 5555:localhost:5555 user@robot
+#     robot$   python run_inference.py --viz --viz_mode remote
+#
+# Wire format is 1 byte kind + 4 byte big-endian length + payload. Explicitly
+# NOT pickle: a socket should not be handing arbitrary objects to eval-like
+# machinery, even down a local tunnel.
+
+_MSG_HELLO = 2          # payload: JSON of the run config
+_HDR = struct.Struct(">BI")
+
+
+def _send_msg(sock, kind, payload):
+    sock.sendall(_HDR.pack(kind, len(payload)) + payload)
+
+
+def _recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+def _recv_msg(sock):
+    hdr = _recv_exact(sock, _HDR.size)
+    if hdr is None:
+        return None
+    kind, n = _HDR.unpack(hdr)
+    payload = _recv_exact(sock, n) if n else b""
+    return None if payload is None else (kind, payload)
+
+
+class VisualizerClient:
+    """
+    Same surface as VisualizerProxy, but the figure lives on another machine.
+
+    The control loop still only touches a bounded queue. A daemon thread does
+    the blocking socket writes, because a network hiccup on the loop's own
+    thread would be exactly the stall this is meant to avoid. A thread is fine
+    here where it was not for matplotlib: sockets are thread-safe and no GUI
+    is involved.
+    """
+
+    def __init__(self, cfg, host="localhost", port=5555, maxsize=256,
+                 timeout=5.0):
+        self.n_cpg = int(cfg_get(cfg, "n_cpg_neurons", 4))
+        nt = cfg_get(cfg, "n_timing")
+        self.n_timing = int(nt) if nt else 0
+        self.sent = self.dropped = 0
+        self.q = queue.Queue(maxsize=maxsize)
+        self._stop = threading.Event()
+
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(None)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _send_msg(self.sock, _MSG_HELLO,
+                  json.dumps(_json_safe(cfg)).encode("utf-8"))
+        self.thread = threading.Thread(target=self._sender, daemon=True)
+        self.thread.start()
+
+    def _sender(self):
+        while not self._stop.is_set():
+            try:
+                kind, payload = self.q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                _send_msg(self.sock, kind, payload)
+            except OSError:
+                self._stop.set()
+                return
+
+    def _put(self, kind, payload):
+        if self._stop.is_set():
+            return
+        try:
+            self.q.put_nowait((kind, payload))
+            self.sent += 1
+        except queue.Full:
+            self.dropped += 1
+
+    def update(self, cpg_spk, timing_spk, joints, gait_idx):
+        self._put(_KIND_FRAME, np.concatenate((
+            np.float32([gait_idx]),
+            np.asarray(cpg_spk, np.float32).reshape(-1),
+            np.asarray(timing_spk, np.float32).reshape(-1),
+            np.asarray(joints, np.float32).reshape(-1))).tobytes())
+
+    def notify_gait_switch(self, old, new, mode):
+        m = str(mode).encode("utf-8")
+        self._put(_KIND_GAIT, struct.pack(">ii", int(old), int(new)) + m)
+
+    def alive(self):
+        return not self._stop.is_set()
+
+    def close(self):
+        self._stop.set()
+        try:
+            self.thread.join(timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        if self.sent or self.dropped:
+            pct = 100.0 * self.dropped / max(self.sent + self.dropped, 1)
+            print(f"  visualiser: {self.sent} frames sent, {self.dropped} "
+                  f"dropped ({pct:.1f}%)")
+
+
+def _json_safe(o):
+    """cfg comes from JSON but may have picked up numpy scalars since."""
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return o
+
+
+def serve_visualizer(port, gaits_dir, host="", **kwargs):
+    """
+    Laptop side: wait for the robot to connect, then render locally.
+
+    Loops on accept, so the robot can be restarted without restarting this.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((host, port))
+    srv.listen(1)
+    print(f"Visualiser listening on {host or '0.0.0.0'}:{port}")
+    print(f"Gait tables: {gaits_dir}")
+    print("Waiting for the robot to connect "
+          "(Ctrl+C to quit) ...")
+    try:
+        while True:
+            conn, addr = srv.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            print(f"\nConnected: {addr[0]}:{addr[1]}")
+            try:
+                _serve_one(conn, gaits_dir, kwargs)
+            except Exception as e:
+                print(f"  session ended: {type(e).__name__}: {e}")
+            finally:
+                conn.close()
+            print("Waiting for the next connection ...")
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        srv.close()
+
+
+def _serve_one(conn, gaits_dir, kwargs):
+    msg = _recv_msg(conn)
+    if msg is None or msg[0] != _MSG_HELLO:
+        print("  expected a config handshake first; dropping")
+        return
+    cfg = json.loads(msg[1].decode("utf-8"))
+    print(f"  config received: n_cpg={cfg_get(cfg, 'n_cpg_neurons')} "
+          f"n_timing={cfg_get(cfg, 'n_timing')} "
+          f"n_joints={cfg_get(cfg, 'n_joints')}")
+    viz = LiveVisualizer(cfg, gaits_dir, **kwargs)
+    n_cpg, n_tim = viz.n_cpg, viz.n_timing
+    # Non-blocking reads so the GUI still gets pumped while idle.
+    conn.settimeout(0.0)
+    n = 0
+    try:
+        while True:
+            got = False
+            while True:
+                try:
+                    m = _recv_msg(conn)
+                except (BlockingIOError, socket.timeout):
+                    break
+                if m is None:
+                    print(f"  robot disconnected after {n} frames")
+                    return
+                kind, payload = m
+                got = True
+                if kind == _KIND_GAIT:
+                    old, new = struct.unpack(">ii", payload[:8])
+                    viz.notify_gait_switch(old, new,
+                                           payload[8:].decode("utf-8"))
+                elif kind == _KIND_FRAME:
+                    a = np.frombuffer(payload, np.float32)
+                    viz.update(a[1:1 + n_cpg],
+                               a[1 + n_cpg:1 + n_cpg + n_tim],
+                               a[1 + n_cpg + n_tim:], int(a[0]))
+                    n += 1
+            if not viz.alive():
+                print(f"  window closed after {n} frames")
+                return
+            if not got:
+                viz.pump()
+                time.sleep(0.01)
+    finally:
+        viz.close()
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Render the live CPG-SNN visualisation for a robot running "
+                    "run_inference.py --viz_mode remote. Streams ~7 kB/s of "
+                    "numbers instead of a framebuffer, so it stays smooth on "
+                    "a link where X11 forwarding or VNC will not.")
+    ap.add_argument("--listen", type=int, default=5555,
+                    help="TCP port to wait for the robot on.")
+    ap.add_argument("--bind", type=str, default="",
+                    help="Interface to bind. Default all. Leave as-is when "
+                         "using an SSH reverse tunnel.")
+    ap.add_argument("--gaits_dir", type=str, default="../gaits",
+                    help="Local folder of gait CSVs, relative to this file. "
+                         "Needed for the per-joint trace scaling.")
+    ap.add_argument("--viz_fps", type=float, default=12.0)
+    ap.add_argument("--viz_trace_cycles", type=float, default=5.0)
+    ap.add_argument("--viz_cpg_cycles", type=float, default=1.5)
+    a = ap.parse_args()
+    serve_visualizer(
+        a.listen, Path(os.path.dirname(os.path.abspath(__file__)), a.gaits_dir),
+        host=a.bind, fps=a.viz_fps, trace_cycles=a.viz_trace_cycles,
+        cpg_cycles=a.viz_cpg_cycles)
+
+
+if __name__ == "__main__":
+    main()

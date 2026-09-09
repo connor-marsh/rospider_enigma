@@ -485,14 +485,23 @@ def main():
                          "default, so its ~16 ms redraw cannot stall the "
                          "control loop; see --viz_mode.")
     ap.add_argument("--viz_mode", type=str, default="process",
-                    choices=["process", "inline"],
+                    choices=["process", "remote", "inline"],
                     help="'process' (default): the visualiser runs in a child "
                          "process fed by a bounded queue, so the control loop "
                          "only pays a few microseconds per frame and frames "
                          "are dropped rather than the robot being made to "
-                         "wait. 'inline': draw inside the control loop, which "
-                         "overruns a 16 ms step on an 18-joint hexapod. Use "
-                         "inline only to debug the visualiser itself.")
+                         "wait. 'remote': same, but the figure is rendered "
+                         "on another machine over a socket (see --viz_host) — "
+                         "~7 kB/s of numbers instead of a framebuffer, which "
+                         "is the way to watch it over SSH without the lag of "
+                         "X11 forwarding or VNC. 'inline': draw inside the "
+                         "control loop, which overruns a 16 ms step on an "
+                         "18-joint hexapod; use only to debug the visualiser.")
+    ap.add_argument("--viz_host", type=str, default="localhost:5555",
+                    help="host:port for --viz_mode remote. With an SSH reverse "
+                         "tunnel ('ssh -R 5555:localhost:5555 user@robot') the "
+                         "default reaches the laptop. Start the viewer there "
+                         "with 'python live_visualization.py --listen 5555'.")
     ap.add_argument("--viz_fps", type=float, default=12.0,
                     help="Redraw rate for --viz. Buffering still happens every "
                          "timestep; only drawing is throttled.")
@@ -560,6 +569,22 @@ def main():
             viz = VisualizerProxy(cfg, this_dir / args.gaits_dir, **opts)
             print(f"  live visualisation in a child process (pid "
                   f"{viz.proc.pid}); the control loop cannot be stalled by it")
+        elif args.viz_mode == "remote":
+            from live_visualization import VisualizerClient
+            host, _, port = args.viz_host.partition(":")
+            try:
+                viz = VisualizerClient(cfg, host or "localhost",
+                                       int(port or 5555))
+            except OSError as e:
+                raise SystemExit(
+                    f"Could not reach the remote visualiser at "
+                    f"{args.viz_host} ({e}). Start it on the viewing machine "
+                    f"with 'python live_visualization.py --listen "
+                    f"{port or 5555}', and if you are on SSH make sure the "
+                    f"reverse tunnel is up: "
+                    f"ssh -R {port or 5555}:localhost:{port or 5555} user@robot")
+            print(f"  live visualisation streaming to {args.viz_host} "
+                  f"(~7 kB/s; rendering happens there, not here)")
         else:
             from live_visualization import LiveVisualizer
             viz = LiveVisualizer(cfg, this_dir / args.gaits_dir, **opts)
