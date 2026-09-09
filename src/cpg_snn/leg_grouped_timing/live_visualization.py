@@ -33,6 +33,8 @@ Needs a display. Over SSH that means X forwarding (ssh -X); headless fails
 with a clear message.
 """
 
+import multiprocessing as mp
+import queue
 import time
 
 import numpy as np
@@ -555,8 +557,157 @@ class LiveVisualizer:
         h = hexstr.lstrip("#")
         return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
+    def pump(self):
+        """
+        Process GUI events without redrawing.
+
+        Needed when the draw is throttled: without this the window stops
+        responding (drags, resizes, the close button) between frames. Uses
+        flush_events rather than plt.pause, because pause triggers a
+        draw_idle that would fight the cached blit background.
+        """
+        try:
+            self.fig.canvas.flush_events()
+        except Exception:
+            pass
+
+    def alive(self):
+        """False once the window has been closed."""
+        return bool(self.plt.fignum_exists(self.fig.number))
+
     def close(self):
         try:
             self.plt.close(self.fig)
         except Exception:
             pass
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 6.  Out-of-process driver
+# ═══════════════════════════════════════════════════════════════════
+#
+# WHY A PROCESS AND NOT A THREAD. matplotlib's GUI backends are not
+# thread-safe, and Tk and Qt both want their event loop on the main thread --
+# driving a figure from a worker thread gives intermittent crashes rather than
+# a working window. A child process owns matplotlib outright and runs it in
+# ITS OWN main thread, which is both correct and simpler.
+#
+# The control loop's only cost becomes one small array put on a queue, tens of
+# microseconds, instead of a ~16 ms redraw. The queue is BOUNDED and the put
+# is non-blocking: if the visualiser falls behind, frames are dropped and the
+# robot loop carries on. It can never be stalled by the window.
+
+_KIND_FRAME, _KIND_GAIT, _KIND_STOP = 0, 1, 2
+
+
+def _viz_child(q, cfg, gaits_dir, kwargs):
+    """Child entry point: owns the figure, drains the queue, redraws."""
+    try:
+        viz = LiveVisualizer(cfg, gaits_dir, **kwargs)
+    except BaseException as e:                      # includes SystemExit
+        print(f"  [viz] could not start: {type(e).__name__}: {e}")
+        return
+    n_frames = 0
+    try:
+        while True:
+            got = False
+            # Drain everything pending before drawing: update() buffers
+            # cheaply and only redraws on its own fps schedule, so a backlog
+            # collapses into one redraw with all the spikes OR-ed in -- which
+            # is exactly the accumulate-between-frames behaviour wanted.
+            while True:
+                try:
+                    kind, payload = q.get_nowait()
+                except queue.Empty:
+                    break
+                got = True
+                if kind == _KIND_STOP:
+                    viz.close()
+                    print(f"  [viz] stopped after {n_frames} frames")
+                    return
+                if kind == _KIND_GAIT:
+                    viz.notify_gait_switch(*payload)
+                else:
+                    n_cpg, n_tim = viz.n_cpg, viz.n_timing
+                    a = payload
+                    viz.update(a[1:1 + n_cpg],
+                               a[1 + n_cpg:1 + n_cpg + n_tim],
+                               a[1 + n_cpg + n_tim:], int(a[0]))
+                    n_frames += 1
+            if not viz.alive():                     # user closed the window
+                print(f"  [viz] window closed after {n_frames} frames")
+                return
+            if not got:
+                # Idle: keep the window responsive and yield the CPU.
+                viz.pump()
+                time.sleep(0.01)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        viz.close()
+
+
+class VisualizerProxy:
+    """
+    Drop-in replacement for LiveVisualizer that runs it in a child process.
+
+    Same three methods the inference loop uses -- update / notify_gait_switch
+    / close -- so the caller does not care which one it holds.
+    """
+
+    def __init__(self, cfg, gaits_dir, maxsize=256, **kwargs):
+        self.n_cpg = int(cfg_get(cfg, "n_cpg_neurons", 4))
+        self.n_joints = int(cfg_get(cfg, "n_joints", 8))
+        nt = cfg_get(cfg, "n_timing")
+        self.n_timing = int(nt) if nt else 0
+        self.dropped = self.sent = 0
+        # "spawn", not the Linux default "fork": the parent has torch (and
+        # possibly a CUDA context) loaded, and forking that is a known hazard.
+        # The child re-imports cleanly instead. Costs a few seconds at startup,
+        # which is spent during the settle period anyway.
+        ctx = mp.get_context("spawn")
+        self.q = ctx.Queue(maxsize=maxsize)
+        self.proc = ctx.Process(target=_viz_child, daemon=True,
+                                args=(self.q, cfg, str(gaits_dir), kwargs))
+        self.proc.start()
+
+    def _put(self, kind, payload):
+        if self.proc is None or not self.proc.is_alive():
+            return
+        try:
+            self.q.put_nowait((kind, payload))
+            self.sent += 1
+        except queue.Full:
+            # Deliberate: the robot loop is never made to wait on the plot.
+            self.dropped += 1
+
+    def update(self, cpg_spk, timing_spk, joints, gait_idx):
+        # One contiguous float32 buffer rather than a tuple of arrays, so the
+        # whole frame is a single small pickle. Layout: [gait, cpg, timing,
+        # joints], unpacked by known lengths in the child.
+        self._put(_KIND_FRAME, np.concatenate((
+            np.float32([gait_idx]),
+            np.asarray(cpg_spk, np.float32).reshape(-1),
+            np.asarray(timing_spk, np.float32).reshape(-1),
+            np.asarray(joints, np.float32).reshape(-1))))
+
+    def notify_gait_switch(self, old, new, mode):
+        self._put(_KIND_GAIT, (int(old), int(new), str(mode)))
+
+    def alive(self):
+        return self.proc is not None and self.proc.is_alive()
+
+    def close(self):
+        if self.proc is None:
+            return
+        if self.proc.is_alive():
+            self._put(_KIND_STOP, None)
+            self.proc.join(timeout=3.0)
+            if self.proc.is_alive():
+                self.proc.terminate()
+        if self.sent or self.dropped:
+            pct = 100.0 * self.dropped / max(self.sent + self.dropped, 1)
+            print(f"  visualiser: {self.sent} frames sent, {self.dropped} "
+                  f"dropped ({pct:.1f}%) — drops mean the plot fell behind, "
+                  f"not that the control loop stalled")
+        self.proc = None

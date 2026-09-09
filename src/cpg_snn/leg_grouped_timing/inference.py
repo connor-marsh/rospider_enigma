@@ -330,7 +330,8 @@ def run(model, cfg, pub, sel, viz, args, device):
     print(f"  settling {settle} steps ({args.settle_cycles} cycles) before "
           f"publishing\n")
 
-    lat, t_start, step, started = [], time.perf_counter(), 0, False
+    lat, vlat = [], []
+    t_start, step, started = time.perf_counter(), 0, False
     try:
         while n_steps < 0 or step < n_steps:
             # Selection lives entirely in the selector's own thread; the loop
@@ -356,10 +357,13 @@ def run(model, cfg, pub, sel, viz, args, device):
                     pub.publish(joints)
                 if viz is not None:
                     # aux is (timing spikes,) for timing_grouped, None for
-                    # dense. Buffering is cheap; viz decides when to redraw.
+                    # dense. In process mode this is a queue put of a few
+                    # hundred bytes; in inline mode it may redraw.
                     spk_t = (aux[0][0].cpu().numpy() if aux
                              else np.zeros(0, np.float32))
+                    t_v = time.perf_counter()
                     viz.update(x[0].cpu().numpy(), spk_t, joints, sel.index)
+                    vlat.append((time.perf_counter() - t_v) * 1e3)
 
             step += 1
             # Sleep the remainder of this step's budget rather than a fixed
@@ -372,6 +376,12 @@ def run(model, cfg, pub, sel, viz, args, device):
     finally:
         sel.stop()
 
+    if vlat:
+        v = np.array(vlat)
+        print(f"\n  viz handoff cost per step (ms): mean {v.mean():.3f}  "
+              f"p95 {np.percentile(v, 95):.3f}  max {v.max():.3f}")
+        print(f"  (process mode should be well under 1 ms; anything near the "
+              f"step budget means it is drawing inline)")
     if lat:
         l = np.array(lat)
         print(f"\n  model.step latency over {len(l)} calls (ms): "
@@ -471,12 +481,18 @@ def main():
     ap.add_argument("--viz", action="store_true",
                     help="Open the live visualisation window (see "
                          "live_visualization.py). Needs a display -- over SSH "
-                         "that means 'ssh -X'. NOTE the redraw happens inside "
-                         "the control loop and costs ~16 ms for an 18-joint "
-                         "hexapod, which overruns a 16 ms control step; the "
-                         "loop uses absolute deadlines so phase does not drift "
-                         "permanently, but prefer --no_robot or a low "
-                         "--viz_fps for anything but debugging.")
+                         "that means 'ssh -X'. Runs in a separate PROCESS by "
+                         "default, so its ~16 ms redraw cannot stall the "
+                         "control loop; see --viz_mode.")
+    ap.add_argument("--viz_mode", type=str, default="process",
+                    choices=["process", "inline"],
+                    help="'process' (default): the visualiser runs in a child "
+                         "process fed by a bounded queue, so the control loop "
+                         "only pays a few microseconds per frame and frames "
+                         "are dropped rather than the robot being made to "
+                         "wait. 'inline': draw inside the control loop, which "
+                         "overruns a 16 ms step on an 18-joint hexapod. Use "
+                         "inline only to debug the visualiser itself.")
     ap.add_argument("--viz_fps", type=float, default=12.0,
                     help="Redraw rate for --viz. Buffering still happens every "
                          "timestep; only drawing is throttled.")
@@ -535,14 +551,21 @@ def main():
     viz = None
     if args.viz:
         # Imported lazily so matplotlib is not pulled in on the robot unless
-        # the visualisation is actually asked for.
-        from live_visualization import LiveVisualizer
-        viz = LiveVisualizer(cfg, this_dir / args.gaits_dir,
-                             trace_cycles=args.viz_trace_cycles,
-                             cpg_cycles=args.viz_cpg_cycles,
-                             fps=args.viz_fps)
+        # the visualisation is actually asked for. In "process" mode the parent
+        # never imports a GUI backend at all -- only the child does.
+        opts = dict(trace_cycles=args.viz_trace_cycles,
+                    cpg_cycles=args.viz_cpg_cycles, fps=args.viz_fps)
+        if args.viz_mode == "process":
+            from live_visualization import VisualizerProxy
+            viz = VisualizerProxy(cfg, this_dir / args.gaits_dir, **opts)
+            print(f"  live visualisation in a child process (pid "
+                  f"{viz.proc.pid}); the control loop cannot be stalled by it")
+        else:
+            from live_visualization import LiveVisualizer
+            viz = LiveVisualizer(cfg, this_dir / args.gaits_dir, **opts)
+            print("  live visualisation INLINE — redraws run inside the "
+                  "control loop and will overrun the step budget")
         sel.on_change = viz.notify_gait_switch
-        print("  live visualisation open")
 
     print("\n[3/3] Running ...")
     try:
