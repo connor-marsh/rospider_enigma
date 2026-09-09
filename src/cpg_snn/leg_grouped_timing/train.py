@@ -1744,7 +1744,7 @@ class TimingGroupedSNN(nn.Module):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
             v1 = self.film1(gait).view(-1, 2, G, Hg)
-            cur1 = cur1 * v1[:, 0]# + v1[:, 1]
+            cur1 = cur1 * v1[:, 0] + v1[:, 1]
         if gated:
             cur1 = gate * cur1
         new1 = dec1 * mem1 + cur1
@@ -1767,7 +1767,7 @@ class TimingGroupedSNN(nn.Module):
             cur2 = self.ln2(cur2)
         if self.sub_film in ("l2", "both"):
             v2 = self.film2(gait).view(-1, 2, G, Hg)
-            cur2 = cur2 * v2[:, 0]# + v2[:, 1]
+            cur2 = cur2 * v2[:, 0] + v2[:, 1]
         if gated:
             cur2 = gate * cur2
         new2 = dec2 * mem2 + cur2
