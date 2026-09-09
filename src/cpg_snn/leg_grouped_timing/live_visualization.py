@@ -445,24 +445,40 @@ class LiveVisualizer:
         if self.n_seen:
             self.bswitch[(self.n_seen - 1) % self.W] = True
 
+    @staticmethod
+    def _fit(a, n):
+        """Coerce to exactly n float32 values, zero-padding or truncating."""
+        a = np.asarray(a, np.float32).reshape(-1)
+        if a.size == n:
+            return a
+        out = np.zeros(n, np.float32)
+        out[:min(a.size, n)] = a[:n]
+        return out
+
     def update(self, cpg_spk, timing_spk, joints, gait_idx):
-        """Cheap on every call; redraws only at the target fps."""
+        """
+        Cheap on every call; redraws only at the target fps.
+
+        Inputs are coerced to the expected widths rather than trusted: this is
+        fed from a socket in remote mode, and a wrong-length array should
+        degrade the plot, not raise inside the render loop.
+        """
+        joints = self._fit(joints, self.n_joints)
+        gait_idx = int(gait_idx) if np.isfinite(gait_idx) else 0
         i = self.n_seen % self.W
         self.buf[i]     = joints
         # Recorded EVERY timestep, unlike the node lighting below which ORs
         # between frames: the plot is the true spike train, the nodes answer
         # "did this neuron fire since the last redraw".
-        self.bcpg[i]    = np.asarray(cpg_spk).reshape(-1)[:self.n_cpg]
+        self.bcpg[i]    = self._fit(cpg_spk, self.n_cpg)
         self.bgait[i]   = gait_idx
         self.bswitch[i] = False if self.n_seen >= self.W else self.bswitch[i]
         self.n_seen += 1
 
         # OR spikes into the accumulators so nothing between frames is lost.
-        a = np.asarray(cpg_spk).reshape(-1) > 0.5
-        self._acc_cpg[:len(a)] |= a
+        self._acc_cpg |= self._fit(cpg_spk, self.n_cpg) > 0.5
         if self.n_timing:
-            b = np.asarray(timing_spk).reshape(-1) > 0.5
-            self._acc_tim[:len(b)] |= b
+            self._acc_tim |= self._fit(timing_spk, self.n_timing) > 0.5
 
         now = time.perf_counter()
         if now - self._last_draw < 1.0 / self.fps:
@@ -743,6 +759,10 @@ class VisualizerProxy:
 
 _MSG_HELLO = 2          # payload: JSON of the run config
 _HDR = struct.Struct(">BI")
+# A length field is the one thing a corrupt stream can turn into an enormous
+# allocation, so it is bounded. The largest legitimate message is the config
+# handshake, a few kB.
+_MAX_MSG = 1 << 20
 
 
 def _send_msg(sock, kind, payload):
@@ -760,12 +780,66 @@ def _recv_exact(sock, n):
 
 
 def _recv_msg(sock):
+    """One whole message from a BLOCKING socket. Handshake use only."""
     hdr = _recv_exact(sock, _HDR.size)
     if hdr is None:
         return None
     kind, n = _HDR.unpack(hdr)
+    if n > _MAX_MSG:
+        raise ValueError(f"message length {n} exceeds the {_MAX_MSG} cap")
     payload = _recv_exact(sock, n) if n else b""
     return None if payload is None else (kind, payload)
+
+
+class _MsgReader:
+    """
+    Incremental length-prefixed reader for a NON-BLOCKING socket.
+
+    The point is that partial reads must never lose bytes. Assembling a whole
+    message inside a recv loop looks fine until the socket runs dry mid-header
+    or mid-payload: the BlockingIOError unwinds, whatever had been read is
+    thrown away, and the next read takes its "header" from the middle of a
+    frame. From then on every length field is garbage -- which shows up as
+    empty payloads and an IndexError on the first field, not as an obvious
+    protocol error. So bytes are appended to a persistent buffer and only
+    consumed once a complete message is present.
+    """
+
+    def __init__(self, sock, chunk=1 << 16):
+        self.sock, self.chunk = sock, chunk
+        self.buf = bytearray()
+        self.closed = False
+        self.error = None
+
+    def poll(self):
+        """Drain the socket, then return every complete message buffered."""
+        while not self.closed:
+            try:
+                b = self.sock.recv(self.chunk)
+            except (BlockingIOError, socket.timeout):
+                break
+            except OSError as e:
+                self.closed, self.error = True, e
+                break
+            if not b:
+                self.closed = True
+                break
+            self.buf += b
+
+        out = []
+        while len(self.buf) >= _HDR.size:
+            kind, n = _HDR.unpack_from(self.buf, 0)
+            if n > _MAX_MSG:
+                self.closed = True
+                self.error = ValueError(
+                    f"length field {n} over the {_MAX_MSG} cap — stream "
+                    f"corrupt, dropping the connection")
+                break
+            if len(self.buf) < _HDR.size + n:
+                break                      # incomplete; wait for more bytes
+            out.append((kind, bytes(self.buf[_HDR.size:_HDR.size + n])))
+            del self.buf[:_HDR.size + n]
+        return out
 
 
 class VisualizerClient:
@@ -895,46 +969,85 @@ def serve_visualizer(port, gaits_dir, host="", **kwargs):
 
 
 def _serve_one(conn, gaits_dir, kwargs):
-    msg = _recv_msg(conn)
+    # Handshake on a BLOCKING socket with a deadline, so a client that
+    # connects and says nothing cannot wedge the server.
+    conn.settimeout(15.0)
+    try:
+        msg = _recv_msg(conn)
+    except (socket.timeout, ValueError, OSError) as e:
+        print(f"  no usable handshake ({type(e).__name__}: {e}); dropping")
+        return
     if msg is None or msg[0] != _MSG_HELLO:
         print("  expected a config handshake first; dropping")
         return
-    cfg = json.loads(msg[1].decode("utf-8"))
+    try:
+        cfg = json.loads(msg[1].decode("utf-8"))
+        if not isinstance(cfg, dict):
+            raise ValueError("config is not a JSON object")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
+        print(f"  unreadable config ({type(e).__name__}: {e}); dropping")
+        return
     print(f"  config received: n_cpg={cfg_get(cfg, 'n_cpg_neurons')} "
           f"n_timing={cfg_get(cfg, 'n_timing')} "
           f"n_joints={cfg_get(cfg, 'n_joints')}")
+
     viz = LiveVisualizer(cfg, gaits_dir, **kwargs)
-    n_cpg, n_tim = viz.n_cpg, viz.n_timing
-    # Non-blocking reads so the GUI still gets pumped while idle.
-    conn.settimeout(0.0)
-    n = 0
+    n_cpg, n_tim, n_j = viz.n_cpg, viz.n_timing, viz.n_joints
+    # gait + cpg + timing + joints, all float32
+    want = 4 * (1 + n_cpg + n_tim + n_j)
+
+    conn.settimeout(0.0)               # non-blocking from here
+    reader = _MsgReader(conn)
+    n = n_bad = 0
+    warned = set()
+
+    def warn(tag, msg):
+        # Once per kind of problem: at 60 Hz a per-frame print would itself
+        # become the bottleneck.
+        if tag not in warned:
+            warned.add(tag)
+            print(f"  {msg} (reported once)")
+
     try:
         while True:
-            got = False
-            while True:
-                try:
-                    m = _recv_msg(conn)
-                except (BlockingIOError, socket.timeout):
-                    break
-                if m is None:
-                    print(f"  robot disconnected after {n} frames")
-                    return
-                kind, payload = m
-                got = True
-                if kind == _KIND_GAIT:
-                    old, new = struct.unpack(">ii", payload[:8])
-                    viz.notify_gait_switch(old, new,
-                                           payload[8:].decode("utf-8"))
-                elif kind == _KIND_FRAME:
+            msgs = reader.poll()
+            for kind, payload in msgs:
+                if kind == _KIND_FRAME:
+                    if len(payload) != want:
+                        n_bad += 1
+                        warn("size", f"frame is {len(payload)} B, expected "
+                                     f"{want} B for n_cpg={n_cpg} "
+                                     f"n_timing={n_tim} n_joints={n_j} — "
+                                     f"skipping mismatched frames")
+                        continue
                     a = np.frombuffer(payload, np.float32)
                     viz.update(a[1:1 + n_cpg],
                                a[1 + n_cpg:1 + n_cpg + n_tim],
                                a[1 + n_cpg + n_tim:], int(a[0]))
                     n += 1
+                elif kind == _KIND_GAIT:
+                    if len(payload) < 8:
+                        n_bad += 1
+                        warn("gait", "short gait message; skipping")
+                        continue
+                    old, new = struct.unpack(">ii", payload[:8])
+                    viz.notify_gait_switch(
+                        old, new, payload[8:].decode("utf-8", "replace"))
+                else:
+                    n_bad += 1
+                    warn("kind", f"unknown message kind {kind}; skipping")
+
+            if reader.closed:
+                if reader.error is not None:
+                    print(f"  connection dropped: {reader.error}")
+                else:
+                    print(f"  robot disconnected after {n} frames"
+                          + (f" ({n_bad} bad messages skipped)" if n_bad else ""))
+                return
             if not viz.alive():
                 print(f"  window closed after {n} frames")
                 return
-            if not got:
+            if not msgs:
                 viz.pump()
                 time.sleep(0.01)
     finally:
