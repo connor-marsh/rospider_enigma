@@ -3492,7 +3492,7 @@ def main():
                          "(G, H, H) — at G=4, hidden=128 lands near the dense "
                          "hidden=256 parameter count and is the matched-"
                          "parameter baseline; hidden=256 is ~4x that.")
-    ap.add_argument("--max_gaits",  type=int,   default=16,
+    ap.add_argument("--max_gaits",  type=int,   default=8,
                     help="Rows allocated in the FiLM embedding tables. "
                          "Only the first n_gaits are used. Fixing this keeps "
                          "every parameter shape independent of the gait "
@@ -3905,8 +3905,7 @@ def main():
                   f"{cpg_rate:.1f}, so the network starts able to render the "
                   f"waveform and prunes from there)")
         else:
-            # band_lo, band_hi = 0.5 * cpg_rate, 2.0 * cpg_rate
-            band_lo, band_hi = 2.0 * cpg_rate, 4.0 * cpg_rate # TODO remove, this is the effective of the above case, but with natural gating
+            band_lo, band_hi = 1.0 * cpg_rate, 3.0 * cpg_rate
         calib = calibrate_gains(
             model, spikes, len(gait_tables), device, period,
             lo=band_lo, hi=band_hi)
