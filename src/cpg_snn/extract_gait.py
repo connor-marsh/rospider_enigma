@@ -30,8 +30,20 @@ class GaitExtractor(Node):
 
         self.controllers = {}
         connected_ids = {}
-        for i in self.joints:
-            joint = self.get_parameters_by_prefix(i)
+
+        param_names = ['id', 'init', 'min', 'max']
+        param_values = {
+            'id':[5, 3, 1, 11, 9, 7, 17, 15, 13, 18, 16, 14, 12, 10, 8, 6, 4, 2],
+            'init':[500 for i in range(18)],
+            'min':[1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 0, 0, 0, 0, 0, 1000, 0, 0],
+            'max':[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, 1000, 1000, 1000, 1000, 0, 1000, 1000]
+        }
+        for index, i in enumerate(self.joints):
+            for name in param_names:
+                self.declare_parameter(name, param_values[name][index])
+            joint = {}
+            for name in param_names:
+                joint[name] = self.get_parameter(name)
             connected_ids[str(joint['id'].value)] = i
             controller = JointPositionController(joint, i)
             self.controllers[i] = controller
