@@ -628,10 +628,10 @@ def cycle_phase(T, onsets):
 # preserved here verbatim rather than re-derived.
 QUADRUPED_GAIT_FILES = ["bittle_wkF", "bittle_bk", "bittle_wkL", "bittle_wkR"]
 HEXAPOD_GAIT_FILES = [
-    "tripod", "tripod_right",
-    "ripple", "ripple_right",
-    "tripod_backwards", "tripod_left",
-    "ripple_backwards", "ripple_left"
+    "tripod", "tripod_backwards",
+    "tripod_right", "tripod_left",
+    "ripple", "ripple_backwards",
+    "ripple_right", "ripple_left"
 ]
 GAIT_FILES_BY_N = {4: QUADRUPED_GAIT_FILES, 6: HEXAPOD_GAIT_FILES}
 
