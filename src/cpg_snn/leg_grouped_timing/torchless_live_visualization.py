@@ -42,7 +42,6 @@ import struct
 import threading
 import time
 from pathlib import Path
-from scipy.interpolate import interp1d
 
 import numpy as np
 
@@ -112,25 +111,25 @@ def load_gait_tables(names, gaits_dir):
             f"target array: {detail}")
     return tables, list(names)
 
-def upsample_gait_tables(tables, names, target_rows=None, verbose=True):
-    """Cubic-interpolate every table to a common row count (equal phase
-    resolution across gaits, so per-gait loss isn't skewed by quantisation)."""
-    if target_rows is None:
-        target_rows = max(t.shape[0] for t in tables)
-    out = []
-    for t, nm in zip(tables, names):
-        if t.shape[0] == target_rows:
-            out.append(t.copy())
-            if verbose:
-                print(f"      {nm:>4s} : {t.shape[0]} rows (unchanged)")
-        else:
-            x0 = np.linspace(0.0, 1.0, t.shape[0])
-            x1 = np.linspace(0.0, 1.0, target_rows)
-            f  = interp1d(x0, t, axis=0, kind="cubic", fill_value="extrapolate")
-            out.append(f(x1).astype(np.float32))
-            if verbose:
-                print(f"      {nm:>4s} : {t.shape[0]} -> {target_rows} rows (cubic)")
-    return out, int(target_rows)
+# def upsample_gait_tables(tables, names, target_rows=None, verbose=True):
+#     """Cubic-interpolate every table to a common row count (equal phase
+#     resolution across gaits, so per-gait loss isn't skewed by quantisation)."""
+#     if target_rows is None:
+#         target_rows = max(t.shape[0] for t in tables)
+#     out = []
+#     for t, nm in zip(tables, names):
+#         if t.shape[0] == target_rows:
+#             out.append(t.copy())
+#             if verbose:
+#                 print(f"      {nm:>4s} : {t.shape[0]} rows (unchanged)")
+#         else:
+#             x0 = np.linspace(0.0, 1.0, t.shape[0])
+#             x1 = np.linspace(0.0, 1.0, target_rows)
+#             f  = interp1d(x0, t, axis=0, kind="cubic", fill_value="extrapolate")
+#             out.append(f(x1).astype(np.float32))
+#             if verbose:
+#                 print(f"      {nm:>4s} : {t.shape[0]} -> {target_rows} rows (cubic)")
+#     return out, int(target_rows)
 
 CPG_C    = "#457b9d"
 TIMING_C = "#2a9d8f"
@@ -253,7 +252,7 @@ class LiveVisualizer:
         tables, _ = load_gait_tables(files, gaits_dir)
         rows = int(cfg_get(cfg, "target_rows",
                            max(t.shape[0] for t in tables)))
-        tables, _ = upsample_gait_tables(tables, files, rows, verbose=False)
+        # tables, _ = upsample_gait_tables(tables, files, rows, verbose=False)
         allg = np.stack(tables)                      # (n_gaits, rows, n_joints)
         r = np.stack([allg.min((0, 1)), allg.max((0, 1))], axis=-1)
         # A constant joint would divide by zero; give it a unit span so it
