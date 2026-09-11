@@ -25,8 +25,17 @@ class GaitExtractor(Node):
         self.joints = ['coxa_LF_joint', 'femur_LF_joint', 'tibla_LF_joint', 'coxa_LM_joint', 'femur_LM_joint', 'tibla_LM_joint', 
                        'coxa_LR_joint', 'femur_LR_joint', 'tibla_LR_joint', 'coxa_RF_joint', 'femur_RF_joint', 'tibla_RF_joint', 
                        'coxa_RM_joint', 'femur_RM_joint', 'tibla_RM_joint', 'coxa_RR_joint', 'femur_RR_joint', 'tibla_RR_joint', 
-                       'joint1', 'joint2', 'joint3','joint4','joint5','r_joint']       
+                       'joint1', 'joint2', 'joint3','joint4','joint5','r_joint'] 
+        self.leg_ids = [5, 3, 1, 11, 9, 7, 17, 15, 13, 18, 16, 14, 12, 10, 8, 6, 4, 2]      
 
+        self.controllers = {}
+        connected_ids = {}
+        for i in self.joints:
+            joint = self.get_parameters_by_prefix(i)
+            connected_ids[str(joint['id'].value)] = i
+            controller = JointPositionController(joint, i)
+            self.controllers[i] = controller
+        
         self.create_subscription(ServosPosition, 'servo_controller', self.servo_controller_callback, 1)
         self.gait = []
 
@@ -35,11 +44,18 @@ class GaitExtractor(Node):
         # self.get_logger().info('\033[1;32m%s\033[0m' % str(msg))
         print("###########################")
         positions = []
+        pulses = []
         indices = []
         for servo in msg.position:
-            positions.append(servo.position)
+            joint = self.joints[self.leg_ids.index(servo.id)]
+            position_pulse = servo.position
+            position_rad = self.controllers[joint].pos_pulse_to_rad(position_pulse)
+            position_deg = position_rad * 180.0 / np.pi
+            positions.append(position_deg)
+            pulses.append(position_pulse)
             indices.append(servo.id)
         print(positions)
+        print(pulses)
         print(indices)
         self.gait.append(positions)
         return
