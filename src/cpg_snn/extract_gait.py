@@ -38,12 +38,18 @@ class GaitExtractor(Node):
             'min':[1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 0, 0, 0, 0, 0, 1000, 0, 0],
             'max':[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, 1000, 1000, 1000, 1000, 0, 1000, 1000]
         }
-        for index, i in enumerate(self.joints):
-            for name in param_names:
-                self.declare_parameter(name, param_values[name][index])
+        for index, i in enumerate(self.joints[:18]):
             joint = {}
             for name in param_names:
-                joint[name] = self.get_parameter(name)
+                joint[name] = rclpy.parameter.Parameter(
+                            name,
+                            rclpy.Parameter.Type.INTEGER,
+                            param_values[name][index]
+                )
+                # self.declare_parameter(name, param_values[name][index])
+            
+            # for name in param_names:
+            #     joint[name] = self.get_parameter(name)
             connected_ids[str(joint['id'].value)] = i
             controller = JointPositionController(joint, i)
             self.controllers[i] = controller
