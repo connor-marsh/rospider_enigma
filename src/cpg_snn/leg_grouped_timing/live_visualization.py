@@ -46,7 +46,8 @@ from pathlib import Path
 import numpy as np
 
 from train import (
-    GAIT_FILES_BY_N, cfg_get, load_gait_tables, upsample_gait_tables,
+    GAIT_FILES_BY_N, cfg_get, joint_type_names, load_gait_tables,
+    upsample_gait_tables,
 )
 
 CPG_C    = "#457b9d"
@@ -56,11 +57,6 @@ SNN_C    = "#3d405b"     # decoder blocks: fixed colour, never highlighted
 ON_C     = "#e63946"
 OFF_A    = 0.60          # edge alpha when idle
 DIM      = "#c8cdd4"
-
-# Anatomical names for the k-th joint within a leg, keyed by joints-per-leg.
-JOINT_TYPE_NAMES = {2: ["shoulder", "knee"],
-                    3: ["coxa", "femur", "tibia"]}
-
 
 class LiveVisualizer:
     """
@@ -111,8 +107,7 @@ class LiveVisualizer:
         k = len(legs[0])
         self.types = [[leg[i] for leg in legs if i < len(leg)]
                       for i in range(k)]
-        self.type_names = JOINT_TYPE_NAMES.get(
-            k, [f"joint type {i}" for i in range(k)])
+        self.type_names = joint_type_names(k)
         self.n_legs = len(legs)
 
         self.ranges = self._joint_ranges(cfg, gaits_dir)

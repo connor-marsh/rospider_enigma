@@ -699,6 +699,15 @@ def in_path(in_dir, name):
     loose = Path(in_dir, name)
     return loose if loose.exists() else routed
 
+# Anatomical name for the k-th joint within a leg, keyed by joints-per-leg.
+# Used for axis labels wherever joints are grouped by type.
+JOINT_TYPE_NAMES = {2: ["shoulder", "knee"],
+                    3: ["coxa", "femur", "tibia"]}
+
+
+def joint_type_names(k):
+    """Names for k joints-per-leg, falling back to generic labels."""
+    return JOINT_TYPE_NAMES.get(k, [f"joint {i}" for i in range(k)])
 
 def outputs_path(this_file_dir, rel=""):
     """

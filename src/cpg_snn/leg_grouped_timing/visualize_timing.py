@@ -8,10 +8,10 @@ timing layer is doing against the CPG and against the gait tables.
 
 Usage
 -----
-    python visualize.py                              # outputs/  ->  outputs/visualize
-    python visualize.py --model_dir outputs/run7
-    python visualize.py --gaits wkF bk               # subset
-    python visualize.py --n_cycles 4 --no_pred       # tighter / faster
+    python visualize_timing.py                       # outputs/  ->  outputs/visualize
+    python visualize_timing.py --model_dir outputs/run7
+    python visualize_timing.py --gaits wkF bk         # subset
+    python visualize_timing.py --n_cycles 4 --no_pred # tighter / faster
 
 
 What is and is not recoverable
@@ -74,6 +74,7 @@ from train import (
     detect_burst_threshold, burst_onsets,
     upsample_gait_tables, build_group_cols,
     load_gait_tables, GAIT_FILES_BY_N, outputs_path, out_path,
+    joint_type_names,
     cfg_get, build_model_from_cfg, load_run,
     N_LEGS, N_JOINTS, CPG_PALETTE, CPG_FROM_FB_WEIGHT,
 )
@@ -294,25 +295,35 @@ def _savefig(fig, out_dir, name, dpi):
 
 
 def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
-                   group_cols, gait_name, out_dir, dpi, t_lo, t_hi):
+                   group_cols, leg_cols, gait_name, out_dir, dpi, t_lo, t_hi):
     """
     The main figure.  Two full-width rasters on top (CPG, then timing layer),
-    then a grid of G rows x C columns: one row per leg, one COLUMN PER JOINT
-    within that leg.
+    then a grid of ONE ROW PER LEG and ONE COLUMN PER JOINT WITHIN THAT LEG.
 
-    C is read from group_cols, so it follows the robot -- 3 joints per leg for
-    the hexapod (coxa/femur/tibia), 2 for the quadruped -- with no flag to set.
+    The grid comes from `leg_cols` (the robot's anatomy), NOT from
+    `group_cols` (how the network happens to be grouped). Those coincide at
+    --n_timing n_legs, but at --n_timing 18 every group is a single column,
+    which used to give 18 single-panel rows -- far too many to read. Anatomy
+    is the right axis for this plot either way: 6 rows x 3 columns for the
+    hexapod, 4 x 2 for the quadruped, regardless of n_timing.
 
     Splitting per joint rather than overlaying them matters because the joints
     within a leg have different amplitudes and shapes; overlaid on one axis the
     small-amplitude ones were unreadable and a shared y-scale flattened them.
-    Every joint subplot still carries its leg's timing spikes, since one timing
-    neuron drives the whole group, and every axis shares x with the rasters --
-    vertical alignment across the whole figure is the point of the plot.
+
+    Each panel's spike rug is the timing neuron that actually drives THAT
+    column, looked up through group_cols -- so with per-leg grouping all three
+    of a leg's panels share one rug, and with per-joint grouping each panel
+    shows its own. Every axis shares x with the rasters; vertical alignment
+    across the whole figure is the point.
     """
     n_cpg = spikes.shape[1]
-    G     = tspk.shape[1]
-    C     = len(group_cols[0])
+    G     = tspk.shape[1]                   # timing neurons (raster lanes)
+    n_legs = len(leg_cols)
+    C     = len(leg_cols[0])
+    tnames = joint_type_names(C)
+    # column -> the timing neuron that drives it
+    owner = {c: g for g, cols in enumerate(group_cols) for c in cols}
     sl    = slice(t_lo, t_hi)
     t     = np.arange(t_lo, t_hi)
 
@@ -324,20 +335,20 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     # from the trace rows.
     CPG_H, LEG_H = 1.1, 1.5
     tim_h = max(CPG_H, CPG_H * G / max(n_cpg, 1))
-    units = CPG_H + tim_h + LEG_H * G
+    units = CPG_H + tim_h + LEG_H * n_legs
     fig = plt.figure(figsize=(max(14.0, 5.8 * C), 1.05 * units + 1.0))
     # top/bottom pinned so the suptitle sits close to the first raster instead
     # of leaving a band of dead space (bbox_inches="tight" crops the OUTER
     # margin, not internal gaps).
-    gs  = gridspec.GridSpec(2 + G, C, hspace=0.62, wspace=0.20,
+    gs  = gridspec.GridSpec(2 + n_legs, C, hspace=0.62, wspace=0.20,
                             top=0.935, bottom=0.045, left=0.055, right=0.99,
-                            height_ratios=[CPG_H, tim_h] + [LEG_H] * G)
+                            height_ratios=[CPG_H, tim_h] + [LEG_H] * n_legs)
 
     # The two rasters span every column; the leg rows do not.
     ax_cpg = fig.add_subplot(gs[0, :])
     ax_tim = fig.add_subplot(gs[1, :], sharex=ax_cpg)
     ax_leg = [[fig.add_subplot(gs[2 + j, k], sharex=ax_cpg)
-               for k in range(C)] for j in range(G)]
+               for k in range(C)] for j in range(n_legs)]
     all_axes = [ax_cpg, ax_tim] + [a for row in ax_leg for a in row]
 
     # sharex= does not auto-hide tick labels the way plt.subplots(sharex=True)
@@ -381,15 +392,21 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     ax_tim.grid(axis="x", alpha=0.15)
 
     # ── leg rows x joint columns ──────────────────────────────────
-    for j in range(G):
-        col_ = TIMING_PALETTE[j % len(TIMING_PALETTE)]
-        spk_idx = np.where(tspk[sl, j] > 0)[0] + t_lo
-        bursts  = spike_bursts(spk_idx, burst_thr)
-
-        for k, c in enumerate(group_cols[j]):
+    for j in range(n_legs):
+        for k, c in enumerate(leg_cols[j]):
             ax = ax_leg[j][k]
+            # Whichever timing neuron drives this column, not this leg: they
+            # differ once n_timing > n_legs.
+            g_own = owner.get(c)
+            col_ = (TIMING_PALETTE[g_own % len(TIMING_PALETTE)]
+                    if g_own is not None else "#c8cdd4")
+            spk_idx = (np.where(tspk[sl, g_own] > 0)[0] + t_lo
+                       if g_own is not None else np.empty(0, int))
+            bursts = spike_bursts(spk_idx, burst_thr)
+
             ax.plot(t, gt[sl, c], color=GT_COLOR, lw=1.7, label="GT", zorder=3)
-            title = f"leg {j} · col {c}"
+            title = (f"leg {j} · {tnames[k]} (col {c})"
+                     + (f" ← T{g_own}" if g_own is not None else ""))
             if pred is not None:
                 ax.plot(t, pred[sl, c], color=PRED_COLOR, lw=1.2, ls="--",
                         alpha=0.9, label="pred", zorder=4)
@@ -427,9 +444,10 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     for k in range(C):
         ax_leg[-1][k].set_xlabel("CPG timestep", fontsize=8)
     ax_cpg.set_xlim(t_lo, t_hi)
-    fig.suptitle(f"{gait_name} — timing alignment  "
-                 f"(rug along each panel base = that leg's own timing spikes; "
-                 f"full-height line = burst onset)",
+    fig.suptitle(f"{gait_name} — timing alignment   "
+                 f"rows = legs, columns = joints within a leg   |   "
+                 f"rug = the timing neuron driving THAT joint (T# in each "
+                 f"title); full-height line = its burst onset",
                  fontsize=11, fontweight="bold")
     _savefig(fig, out_dir, f"timing_alignment_{gait_name}.png", dpi)
 
@@ -754,9 +772,10 @@ def _build_parser():
     ap.add_argument("--out_dir",   type=str, default=None,
                     help="Where plots and timing_summary.json are written, "
                          "resolved as outputs/<out_dir> (same rule as "
-                         "--model_dir). Default None = <model_dir>/visualize, "
-                         "so nothing needs to change between runs besides "
-                         "--model_dir.")
+                         "--model_dir). Default None = the model dir itself, "
+                         "so figures join that run's existing category "
+                         "folders and nothing needs changing between runs "
+                         "besides --model_dir.")
     ap.add_argument("--gaits_dir", type=str, default="../gaits",
                     help="Folder of {name}.csv gait tables, resolved as "
                          "this_file_dir/<gaits_dir> — same default as "
@@ -805,10 +824,9 @@ def run_visualization(model_dir, out_dir=None, args=None):
     """
     Everything the CLI does, callable directly.
 
-    `out_dir=None` keeps the historical default of <model_dir>/visualize --
-    but train.py passes model_dir itself, so the figures land in the run's own
-    category folders alongside its other output rather than in a nested
-    directory.
+    `out_dir=None` means the run directory itself, which is what train.py
+    passes explicitly too -- the figures land in that run's own category
+    folders (see OUT_ROUTES in train.py) alongside its other output.
 
     The checkpoint and config are re-read from disk rather than taking a live
     model, which also serves as an end-of-run check that the saved artifacts
@@ -816,7 +834,12 @@ def run_visualization(model_dir, out_dir=None, args=None):
     """
     args = args if args is not None else default_args()
     model_dir = Path(model_dir)
-    out_dir = Path(out_dir) if out_dir is not None else model_dir / "visualize"
+    # Default is the run directory ITSELF, not a nested visualize/ folder:
+    # out_path routes every figure into recons/ timing_alignments/
+    # membrane_waveforms/ phase_folds/ misc_info/ inside it, so a subfolder
+    # would just bury those one level deeper. Standalone and
+    # called-from-train.py therefore write to the same place.
+    out_dir = Path(out_dir) if out_dir is not None else Path(model_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(args.seed)
@@ -846,9 +869,21 @@ def run_visualization(model_dir, out_dir=None, args=None):
     # whether called from the CLI or from train.py.
     gaits_dir = Path(os.path.dirname(os.path.abspath(__file__)),
                      args.gaits_dir)
+    # Anatomical leg layout, used for the timing-alignment grid. Falls back
+    # to the network's own grouping for configs written before leg_cols was
+    # recorded -- which is exact whenever n_timing == n_legs, the only case
+    # that existed then.
+    cfg_leg_cols = cfg_get(cfg, "leg_cols")
+
     gait_tables_orig, all_names = load_gait_tables(gait_files, gaits_dir)
     print(f"  Loaded {len(all_names)} gait CSV(s) from {gaits_dir.resolve()}: "
           f"{all_names}")
+    leg_cols = ([list(c) for c in cfg_leg_cols] if cfg_leg_cols
+                else [list(c) for c in model.group_cols])
+    print(f"  Alignment grid: {len(leg_cols)} legs x {len(leg_cols[0])} "
+          f"joints/leg"
+          + ("" if cfg_leg_cols else "  (leg_cols absent from config — "
+                                     "using the network grouping)"))
 
     tgt_range  = (float(cfg_get(cfg, "global_min", -124.0)),
                   float(cfg_get(cfg, "global_max", 124.0)))
@@ -921,8 +956,8 @@ def run_visualization(model_dir, out_dir=None, args=None):
         group_cols = model.group_cols
 
         plot_alignment(spikes, tspk, gt, pred, phase, onsets, period,
-                       burst_thr, group_cols, gname, out_dir, args.dpi,
-                       t_lo, t_hi)
+                       burst_thr, group_cols, leg_cols, gname, out_dir,
+                       args.dpi, t_lo, t_hi)
         plot_phase_fold(tspk, phase, gait_tables, gi, group_cols, gname,
                         phase_zero, out_dir, args.dpi)
         if mems and not args.no_membranes:
