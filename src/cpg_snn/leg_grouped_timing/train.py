@@ -229,6 +229,103 @@ def build_group_cols(n_timing, leg_cols=LEG_COLS, n_joints=N_JOINTS):
     return groups
 
 
+STRUCTURE_SHAPES = ("per_leg", "per_joint")
+
+
+def build_partition(shape, leg_cols, n_joints, what="structure"):
+    """
+    Output columns owned by each unit of a "per_leg" or "per_joint" structure.
+
+    This is the single primitive behind both --timing_shape and
+    --decoder_shape.  Saying a layer is shaped "per_leg" means it has one unit
+    per leg and that unit is responsible for that leg's columns; "per_joint"
+    means one unit per column.  Expressing both layers in the same currency --
+    which output columns does each unit own -- is what lets `build_timing_map`
+    connect them without any special-casing per combination.
+
+    `build_group_cols` is the older form of this, keyed on a neuron COUNT
+    rather than a name.  It is kept because configs written before
+    --timing_shape existed record only `n_timing`, and reconstructing those
+    checkpoints has to keep working.
+    """
+    if shape == "per_leg":
+        groups = [list(c) for c in leg_cols]
+    elif shape == "per_joint":
+        groups = [[j] for j in range(n_joints)]
+    else:
+        raise ValueError(f"{what} must be one of "
+                         f"{'|'.join(STRUCTURE_SHAPES)}, got {shape!r}")
+
+    flat = [c for grp in groups for c in grp]
+    if sorted(flat) != list(range(n_joints)):
+        raise ValueError(
+            f"{what}={shape!r} gives {groups}, not a partition of "
+            f"0..{n_joints - 1} (flattened: {sorted(flat)}). Check --leg_cols.")
+    if len({len(g) for g in groups}) != 1:
+        raise ValueError(f"{what}={shape!r} gives unequal groups {groups}; "
+                         f"w1/w_out would be ragged. Check --leg_cols.")
+    return groups
+
+
+def build_timing_map(timing_cols, group_cols):
+    """
+    Which timing units feed each sub-network: a (G, K) list of indices.
+
+    THE RULE: sub-network g takes every timing unit whose output columns
+    overlap g's own.  One rule covers every combination of the two shapes,
+    including the two where the counts differ:
+
+      timing per_joint + decoder per_leg   K=3, disjoint.  18 timing units,
+          6 decoders, each decoder fed by the 3 timing units for its leg.
+          The interesting case: a decoder sees three independent phase
+          references and can learn inter-joint structure within its leg.
+
+      timing per_leg + decoder per_joint   K=1, SHARED.  6 timing units, 18
+          decoders; the 3 decoders of a leg are all fed the same spike train,
+          so they differ only in their own weights.  Legal but nearly
+          pointless -- it spends 3x the sub-network parameters on 1x the
+          timing information.
+
+      matched shapes                       K=1, disjoint.  What this model did
+          before either arg existed.
+
+    K must come out equal across groups, because `w1` is a dense (G, K, Hg)
+    tensor and a ragged fan-in has nowhere to live.  Both shapes partition the
+    same columns, so equality is automatic when one shape refines the other;
+    it is validated anyway because --leg_cols is user-supplied.
+    """
+    G = len(group_cols)
+    tmap = []
+    for gcols in group_cols:
+        own = set(gcols)
+        tmap.append([t for t, tcols in enumerate(timing_cols)
+                     if own & set(tcols)])
+
+    if any(not m for m in tmap):
+        bad = [g for g, m in enumerate(tmap) if not m]
+        raise ValueError(
+            f"sub-network(s) {bad} have no timing input: group_cols "
+            f"{group_cols} and timing_cols {timing_cols} do not overlap. A "
+            f"sub-network with no input is permanently silent.")
+    sizes = {len(m) for m in tmap}
+    if len(sizes) != 1:
+        raise ValueError(
+            f"timing fan-in must be equal for every sub-network (w1 is a "
+            f"dense (G, K, Hg) tensor); got sizes {sorted(sizes)} from "
+            f"group_cols {group_cols} and timing_cols {timing_cols}.")
+
+    used = {t for m in tmap for t in m}
+    missing = sorted(set(range(len(timing_cols))) - used)
+    if missing:
+        raise ValueError(
+            f"timing unit(s) {missing} feed no sub-network, so their "
+            f"CPG->timing weights would receive zero gradient forever. "
+            f"group_cols {group_cols}, timing_cols {timing_cols}.")
+
+    assert len(tmap) == G
+    return tmap
+
+
 # ═══════════════════════════════════════════════════════════════════
 # 0b.  Small utilities
 # ═══════════════════════════════════════════════════════════════════
@@ -1272,12 +1369,18 @@ class TimingGroupedSNN(nn.Module):
     ------------------
         x            (B, n_neurons)   CPG spikes, at most one fires per step
         timing       (B, n_timing)    LIF, per-gait weights from CPG spikes
-        sub-net g    (B, Hg) x2 + memo   driven by timing neuron g ALONE
+        sub-net g    (B, Hg) x2 + memo   driven by ITS OWN K timing units
         y            (B, n_joints)    group g writes its own columns only
 
-    G == n_timing: exactly one sub-network per timing neuron, and
-    `group_cols[g]` says which gait-table columns that sub-network owns
-    (see build_group_cols).
+    G and n_timing are INDEPENDENT. `group_cols[g]` says which gait-table
+    columns sub-network g owns, and `timing_map[g]` says which K timing units
+    feed it; both come from --decoder_shape / --timing_shape via
+    `build_partition` and `build_timing_map`. K=1 with G == n_timing is the
+    matched-shape case and is what this class did before those existed.
+
+    Sub-networks stay fully disconnected from each other in either case: a
+    shared timing unit (per_leg timing, per_joint decoders) is a shared INPUT,
+    not a shared parameter, so the block-diagonal structure is untouched.
 
     Why split it this way
     ---------------------
@@ -1405,8 +1508,9 @@ class TimingGroupedSNN(nn.Module):
     follows and supplies per-group per-gait affine anyway.
 
     State (5 tensors, mixed rank):
-        mem_timing (B, n_timing)
-        since_upd  (B, n_timing)   timesteps since each sub-net last advanced
+        mem_timing (B, n_timing) -- the TIMING layer, T units
+        since_upd  (B, G)        timesteps since each sub-net last advanced;
+                                 per SUB-NETWORK, so it is G-wide, not T
         mem1, mem2 (B, G, Hg)
         memo       (B, G, H_o)   -- narrower; see the readout note in __init__
     """
@@ -1419,6 +1523,7 @@ class TimingGroupedSNN(nn.Module):
 
     def __init__(self, hidden_per_group=128, n_gaits=4, max_gaits=16,
                  n_neurons=4, n_timing=N_LEGS, group_cols=None,
+                 timing_map=None,
                  n_joints=N_JOINTS, readout_hidden=32,
                  tau_min=2.0, tau_max=256.0,
                  tau_timing_min=2.0, tau_timing_max=64.0,
@@ -1444,13 +1549,38 @@ class TimingGroupedSNN(nn.Module):
         group_cols = (build_group_cols(n_timing, n_joints=n_joints)
                       if group_cols is None else
                       [list(g) for g in group_cols])
-        if len(group_cols) != n_timing:
-            raise ValueError(
-                f"group_cols has {len(group_cols)} groups but n_timing="
-                f"{n_timing}; there is exactly one sub-network per timing "
-                f"neuron.")
 
-        G   = int(n_timing)
+        G = len(group_cols)
+        T = int(n_timing)
+        # timing_map[g] lists the timing units feeding sub-network g. The
+        # None fallback is EXACTLY what this class did before timing_map
+        # existed -- one timing unit per sub-network, in order -- so a config
+        # predating the arg reconstructs as the model it actually was.
+        if timing_map is None:
+            if T != G:
+                raise ValueError(
+                    f"group_cols has {G} groups but n_timing={T}, and no "
+                    f"timing_map was given. Without a map there is exactly "
+                    f"one sub-network per timing neuron, so the two counts "
+                    f"must match. Pass timing_map (see build_timing_map) for "
+                    f"a fan-in other than 1.")
+            timing_map = [[g] for g in range(G)]
+        else:
+            timing_map = [list(m) for m in timing_map]
+            if len(timing_map) != G:
+                raise ValueError(
+                    f"timing_map has {len(timing_map)} entries but there are "
+                    f"{G} sub-networks.")
+        K = len(timing_map[0])
+        if any(len(m) != K for m in timing_map):
+            raise ValueError(
+                f"timing_map fan-in must be uniform; got sizes "
+                f"{sorted({len(m) for m in timing_map})}.")
+        bad = [i for m in timing_map for i in m if not 0 <= i < T]
+        if bad:
+            raise ValueError(f"timing_map indexes units {sorted(set(bad))} "
+                             f"outside 0..{T - 1}.")
+
         Hg  = int(hidden_per_group)
         Ho  = int(readout_hidden)
         C   = len(group_cols[0])            # output columns per group
@@ -1459,7 +1589,13 @@ class TimingGroupedSNN(nn.Module):
         self.Hg         = Hg
         self.Ho         = Ho
         self.C          = C
-        self.n_timing   = G
+        self.K          = K           # timing units feeding each sub-network
+        self.n_timing   = T           # NOT G: the two are independent now
+        self.timing_map_list = [list(m) for m in timing_map]
+        self.register_buffer(
+            "timing_map",
+            torch.tensor(timing_map, dtype=torch.long).view(G, K),
+            persistent=False)
         self.n_neurons  = int(n_neurons)
         self.n_joints   = int(n_joints)
         self.n_gaits    = int(n_gaits)
@@ -1520,7 +1656,7 @@ class TimingGroupedSNN(nn.Module):
         # FURTHER from threshold, so a unit born net-negative cannot be
         # rescued by calibration at all.  Sign is fixed here; magnitude is
         # calibration's job.
-        self.w_in_gait = nn.Embedding(max_gaits, self.n_neurons * G)
+        self.w_in_gait = nn.Embedding(max_gaits, self.n_neurons * T)
         nn.init.normal_(self.w_in_gait.weight, mean=_W_IN_INIT, std=_W_IN_INIT)
 
         # Per-gait excitability.  See BIAS MODES in the class docstring.
@@ -1532,21 +1668,35 @@ class TimingGroupedSNN(nn.Module):
         #              membrane, so it cannot manufacture a spike on a step
         #              where no input arrived.
         if bias_mode == "current":
-            self.b_t = nn.Embedding(max_gaits, G)
+            self.b_t = nn.Embedding(max_gaits, T)
             nn.init.zeros_(self.b_t.weight)
         elif bias_mode == "voltage":
-            self.v_t = nn.Embedding(max_gaits, G)
+            self.v_t = nn.Embedding(max_gaits, T)
             nn.init.zeros_(self.v_t.weight)
         self.beta_t_logit = nn.Parameter(
-            init_beta_logit((G,), tau_timing_min, tau_timing_max))
+            init_beta_logit((T,), tau_timing_min, tau_timing_max))
 
-        # ── sub-network layer 1: ONE binary spike -> Hg units ─────
+        # ── sub-network layer 1: K binary spikes -> Hg units ──────
         # Fixed init scale, deliberately NOT calibrated.  A dead timing
         # neuron silences a whole sub-network, which is why that layer gets
         # calibration; a few dead units out of Hg here are noise, and w1 plus
         # film1's gamma are both learnable so the init only sets the
         # optimisation path, not what is reachable.
-        self.w1 = nn.Parameter(torch.randn(G, Hg) * _W1_INIT)
+        #
+        # Shape (G, K, Hg): K is the number of timing units feeding this
+        # sub-network, so this is K independent (1 -> Hg) weight vectors per
+        # group, contracted over K in `step`.  The leading G is the
+        # sub-network index, not an input axis -- same role it plays in w2's
+        # (G, Hg, Hg).
+        #
+        # The 1/sqrt(K) keeps the injection variance independent of fan-in:
+        # with K=3 timing units able to fire on the same timestep, an
+        # uncorrected init would deliver up to 3x the layer-1 current that
+        # K=1 was tuned around, and layer 1 is not calibrated. At K=1 the
+        # factor is exactly 1.0, so this is bit-identical to the old
+        # (G, Hg) init for a matched-shape run.
+        self.w1 = nn.Parameter(
+            torch.randn(G, K, Hg) * (_W1_INIT / math.sqrt(K)))
 
         # ── sub-network layer 2: block diagonal (G, Hg, Hg) ───────
         self.w2 = nn.Parameter(torch.randn(G, Hg, Hg) / math.sqrt(Hg))
@@ -1632,8 +1782,10 @@ class TimingGroupedSNN(nn.Module):
     # ---------------------------------------------------------------
     def init_state(self, batch, device, dtype=torch.float32):
         z = lambda w: torch.zeros(batch, self.G, w, device=device, dtype=dtype)
-        mem_t = torch.zeros(batch, self.G, device=device, dtype=dtype)
+        mem_t = torch.zeros(batch, self.n_timing, device=device, dtype=dtype)
         # since_upd: timesteps elapsed since each sub-network last advanced.
+        # Per SUB-NETWORK (G), whereas mem_t above is per TIMING UNIT (T);
+        # the two differ whenever --timing_shape and --decoder_shape differ.
         # Only used by gate_mode="freeze", but always present so the state
         # shape and the ONNX signature do not depend on the mode.  Zero means
         # "no elapsed time", so the first update applies no decay.
@@ -1644,7 +1796,9 @@ class TimingGroupedSNN(nn.Module):
     # ---------------------------------------------------------------
     def _timing(self, x, gait, mem_t):
         """
-        One timestep of the timing layer.  x (B, n_neurons) -> spk_t (B, G).
+        One timestep of the timing layer.  x (B, n_neurons) -> spk_t (B, T),
+        T = n_timing.  Independent of the number of sub-networks: `step` maps
+        these spikes onto sub-networks through `timing_map`.
 
         Factored out so calibration and diagnostics can run this layer without
         the sub-networks, and without going through the compiled `step` (which
@@ -1661,7 +1815,7 @@ class TimingGroupedSNN(nn.Module):
         spacing and the burst comes out at the CPG's own width and count.
         `LIFGeneralArray` (the CPG) does exactly this: `v[spike] = 0`.
         """
-        W   = self.w_in_gait(gait).view(-1, self.n_neurons, self.G)
+        W   = self.w_in_gait(gait).view(-1, self.n_neurons, self.n_timing)
         cur = torch.bmm(x.unsqueeze(1), W).squeeze(1)
         if self.bias_mode == "current":
             cur = cur + self.b_t(gait)
@@ -1694,7 +1848,13 @@ class TimingGroupedSNN(nn.Module):
         mem_t, since, mem1, mem2, memo = state
         G, Hg = self.G, self.Hg
 
-        spk_t, mem_t = self._timing(x, gait, mem_t)          # (B, G)
+        spk_t, mem_t = self._timing(x, gait, mem_t)          # (B, T)
+
+        # ---- timing -> sub-network routing -------------------------
+        # timing_map is (G, K), so this gathers each sub-network's own K
+        # timing spikes. At K=1 with a matched-shape map this is exactly
+        # spk_t.unsqueeze(-1), i.e. the old behaviour.
+        spk_sel = spk_t[:, self.timing_map]                  # (B, G, K)
 
         # ---- event gate -------------------------------------------
         # gate_mode:
@@ -1731,7 +1891,12 @@ class TimingGroupedSNN(nn.Module):
         # scale factor, and stronger gradient into the timing layer is wanted.
         gated  = self.gate_mode != "none"
         freeze = self.gate_mode == "freeze"
-        gate = spk_t.unsqueeze(-1) if gated else None
+        # A sub-network updates when ANY of its K timing units fires, so the
+        # gate is the OR over that group's selected spikes. At K=1 amax is a
+        # no-op and this is spk_t.unsqueeze(-1) exactly. Using amax rather
+        # than a sum keeps the gate strictly 0/1, which the forward relies on
+        # (gate*gate == gate) and which freeze's since_upd counter needs.
+        gate = spk_sel.amax(dim=-1, keepdim=True) if gated else None
         if freeze:
             # Detached: since_upd is a counter, not a differentiable path, and
             # the hard 0/1 spike is what determines whether an update happened.
@@ -1746,18 +1911,21 @@ class TimingGroupedSNN(nn.Module):
             deco = torch.sigmoid(self.betao_logit)
 
         # ---- sub-net layer 1 ---------------------------------------
-        # w1 and b1 are redundant when gated (only their sum enters) because
-        # the gate replaced the spk_t multiplication that used to separate
-        # them. Both kept so checkpoint shapes are unchanged.
         # In "current" mode and gated, w1 and b1 are redundant (only their sum
         # enters). In "voltage" mode the bias has moved out of the injection
         # entirely, which is the point: injection magnitude is what drives the
         # jerk, and a threshold offset does not inflate it.
+        #
+        # The gated branch used to skip the spike multiply entirely
+        # (cur1 = w1 + b1) on the grounds that the gate reintroduced it. That
+        # shortcut is only valid at K=1: with K>1 the injection is
+        # sum_k spk_k * w1[g,k], which is NOT gate * sum_k w1[g,k] unless all
+        # K units happen to fire together. So the contraction is always done
+        # explicitly now, and the gate below is a no-op on spiking steps
+        # (gate=1 wherever any spk_sel is 1). Verified bit-identical to the
+        # old gated path at K=1.
         b1 = self.b1 if self.bias_mode == "current" else 0.0
-        if gated:
-            cur1 = self.w1 + b1                               # (G, Hg)
-        else:
-            cur1 = spk_t.unsqueeze(-1) * self.w1 + b1         # (B, G, Hg)
+        cur1 = torch.einsum("bgk,gkh->bgh", spk_sel, self.w1) + b1
         if self.sub_ln in ("l1", "both"):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
@@ -1853,7 +2021,9 @@ class TimingGroupedSNN(nn.Module):
         """
         B = x_seq.shape[1]
         if mem_t is None:
-            mem_t = torch.zeros(B, self.G, device=x_seq.device,
+            # n_timing, NOT G: this is the timing layer's own membrane, and
+            # the two counts differ whenever the shapes differ.
+            mem_t = torch.zeros(B, self.n_timing, device=x_seq.device,
                                 dtype=x_seq.dtype)
         out = []
         for t in range(x_seq.shape[0]):
@@ -2043,7 +2213,11 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
     if not hasattr(model, "w_in_gait"):
         return {}
 
-    MG, n_cpg, G = model.max_gaits, model.n_neurons, model.G
+    # G here is the TIMING-unit count, which is model.n_timing and is no
+    # longer the same as model.G (the sub-network count) -- w_in_gait is
+    # indexed by timing unit. Named G only because the bisection below is
+    # written against it.
+    MG, n_cpg, G = model.max_gaits, model.n_neurons, model.n_timing
     # (max_gaits, n_cpg, n_timing) view; column l is timing unit l's inputs.
     W = model.w_in_gait.weight.data.view(MG, n_cpg, G)
     base = W.clone()
@@ -2401,22 +2575,43 @@ def reinit_dead_units(model, dead, generator=None, verbose=True):
     Deliberately does NOT touch w2/w_read/w_out for that group: those DID
     train (on the constant b1-driven activity) and may hold something useful
     about the group's output range.
+
+    `w1` is indexed by SUB-NETWORK, not by timing unit, and the two are no
+    longer the same thing. A dead timing unit l starves the (g, k) slots where
+    timing_map[g][k] == l, which may be several sub-networks (timing per_leg
+    with decoder per_joint) or one slot of several in one sub-network (timing
+    per_joint with decoder per_leg). Only those slots are re-rolled: the other
+    K-1 slots of a shared sub-network were driven by live units and did train.
     """
     if not dead or not hasattr(model, "w_in_gait"):
         return
     dev = model.w_in_gait.weight.device
-    MG, nn_, G = model.max_gaits, model.n_neurons, model.G
-    W = model.w_in_gait.weight.view(MG, nn_, G)
+    MG, nn_, T = model.max_gaits, model.n_neurons, model.n_timing
+    W = model.w_in_gait.weight.view(MG, nn_, T)
+    K = model.K
+    scale = _W1_INIT / math.sqrt(K)          # same as the constructor's init
+    slots = {}
     for l in dead:
         W[:, :, l] = (torch.randn(MG, nn_, generator=generator).to(dev)
                       * _W_IN_INIT + _W_IN_INIT)
-        model.b_t.weight[:, l] = 0.0
-        model.w1[l] = (torch.randn(model.Hg, generator=generator).to(dev)
-                       * _W1_INIT)
+        # Per-gait excitability back to neutral, in whichever form is in use.
+        # Guarded because "voltage" mode has v_t and no b_t at all, and
+        # "none" mode has neither.
+        for name in ("b_t", "v_t"):
+            emb = getattr(model, name, None)
+            if emb is not None:
+                emb.weight[:, l] = 0.0
+        hit = [(g, k) for g, m in enumerate(model.timing_map_list)
+               for k, t in enumerate(m) if t == l]
+        for g, k in hit:
+            model.w1[g, k] = (torch.randn(model.Hg, generator=generator)
+                              .to(dev) * scale)
+        slots[l] = hit
     if verbose:
         print(f"      [reinit] timing unit(s) {dead}: re-rolled w_in_gait "
               f"column (all gaits), zeroed its per-gait bias, and re-rolled "
-              f"sub-net w1 (which had received zero gradient while dead)")
+              f"sub-net w1 slot(s) {slots} (which had received zero gradient "
+              f"while dead)")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3164,6 +3359,12 @@ def build_model_from_cfg(cfg, device):
             gc_kwargs["leg_cols"] = cfg_leg_cols
         group_cols = cfg_get(cfg, "group_cols") or build_group_cols(
             n_timing, **gc_kwargs)
+        # timing_map fallback is None, which the constructor turns into the
+        # one-timing-unit-per-sub-network identity map -- i.e. exactly what
+        # this model was before --timing_shape/--decoder_shape existed. A
+        # config predating those args therefore reconstructs as the model it
+        # actually was, not as the current default.
+        timing_map = cfg_get(cfg, "timing_map")
         # A config from the (reverted) shared-router era has router_hidden
         # set and a checkpoint containing w_r/w_t, neither of which exists in
         # this class any more -- load_run's strict=False report will flag it.
@@ -3184,6 +3385,7 @@ def build_model_from_cfg(cfg, device):
             hidden_per_group = _hidden,
             n_timing         = n_timing,
             group_cols       = group_cols,
+            timing_map       = timing_map,
             tau_timing_min   = float(cfg_get(cfg, "tau_timing_min", 2.0)),
             tau_timing_max   = float(cfg_get(cfg, "tau_timing_max",
                                                _P / _n_cpg)),
@@ -3370,18 +3572,31 @@ def main():
                          "timing layer -> n_timing disconnected sub-networks, "
                          "one per timing neuron. Keep 'dense' runnable so A/B "
                          "at matched gradient steps stays possible.")
-    ap.add_argument("--n_timing", type=int, default=None,
-                    help="[timing_grouped] Number of timing-layer LIF "
-                         "neurons, and therefore the number of sub-networks. "
-                         "Must equal n_legs or n_joints OF THE RESOLVED GAIT "
-                         "SET (printed at startup as 'gait layout'), not a "
-                         f"fixed number — e.g. n_legs={N_LEGS}/n_joints="
-                         f"{N_JOINTS} for the verified quadruped layout, but "
-                         "whatever --leg_cols implies otherwise. Defaults to "
-                         "n_legs when the layout is known, else n_joints (see "
-                         "--leg_cols). Independent of --n_cpg_neurons: the "
-                         "timing layer is densely driven by all CPG spikes, "
-                         "so the two counts need not match.")
+    ap.add_argument("--timing_shape", type=str, default="per_leg",
+                    choices=list(STRUCTURE_SHAPES),
+                    help="[timing_grouped] Structure of the timing layer. "
+                         "per_leg: one timing LIF per leg (n_legs units). "
+                         "per_joint: one per output column (n_joints units). "
+                         "Independent of --n_cpg_neurons — the timing layer "
+                         "is densely driven by all CPG spikes, so the counts "
+                         "need not match. Replaces --n_timing, which said the "
+                         "same thing as a bare integer that also silently "
+                         "fixed the sub-network count.")
+    ap.add_argument("--decoder_shape", type=str, default="per_leg",
+                    choices=list(STRUCTURE_SHAPES),
+                    help="[timing_grouped] Structure of the angle decoders, "
+                         "i.e. the disconnected sub-networks. per_leg: one "
+                         "sub-network per leg, each emitting that leg's "
+                         "columns (3 joints on the hexapod). per_joint: one "
+                         "per column, emitting a single angle. Combined with "
+                         "--timing_shape this fixes the fan-in K: a "
+                         "sub-network is fed by every timing unit whose "
+                         "columns overlap its own. per_joint timing + per_leg "
+                         "decoders gives K=3, so each decoder sees three "
+                         "independent phase references for its own leg. The "
+                         "reverse (per_leg timing + per_joint decoders) is "
+                         "legal but wasteful: K=1 and the three decoders of a "
+                         "leg are handed identical spike trains.")
     ap.add_argument("--readout_hidden", type=int, default=32,
                     help="[timing_grouped] Width of the analog readout "
                          "membrane per group. Was implicitly --hidden, i.e. a "
@@ -3769,10 +3984,26 @@ def main():
     print(f"      gait layout: n_legs={n_legs}  n_joints={n_joints}  "
           f"source={layout_src}  leg_cols={leg_cols}")
 
-    if args.n_timing is None:
-        args.n_timing = n_legs
-    group_cols = (build_group_cols(args.n_timing, leg_cols=leg_cols, n_joints=n_joints)
-                  if args.arch == "timing_grouped" else None)
+    if args.arch == "timing_grouped":
+        timing_cols = build_partition(args.timing_shape, leg_cols, n_joints,
+                                      what="--timing_shape")
+        group_cols  = build_partition(args.decoder_shape, leg_cols, n_joints,
+                                      what="--decoder_shape")
+        timing_map  = build_timing_map(timing_cols, group_cols)
+        args.n_timing = len(timing_cols)
+        print(f"      structure: timing {args.timing_shape} "
+              f"({len(timing_cols)} units) -> decoders {args.decoder_shape} "
+              f"({len(group_cols)} sub-nets), fan-in K="
+              f"{len(timing_map[0])}, {len(group_cols[0])} column(s) out per "
+              f"sub-net")
+        if len(timing_cols) < len(group_cols):
+            print(f"      NOTE every sub-network of a leg is fed the SAME "
+                  f"timing unit, so they receive identical input and differ "
+                  f"only in their own weights. Consider --timing_shape "
+                  f"per_joint.")
+    else:
+        timing_cols = group_cols = timing_map = None
+        args.n_timing = None
 
     # ── 1. CPG ──────────────────────────────────────────────────
     print("\n[1/6] Bursting-LIF CPG ...")
@@ -3870,6 +4101,7 @@ def main():
             hidden_per_group=args.hidden, n_gaits=len(gait_tables),
             max_gaits=args.max_gaits, n_neurons=args.n_cpg_neurons,
             n_timing=args.n_timing, group_cols=group_cols,
+            timing_map=timing_map,
             n_joints=n_joints, readout_hidden=args.readout_hidden,
             tau_min=args.tau_min, tau_max=args.tau_max,
             tau_timing_min=args.tau_timing_min,
@@ -3930,12 +4162,17 @@ def main():
 
     n_par = sum(p.numel() for p in model.parameters())
     if args.arch == "timing_grouped":
+        n_dec = len(group_cols)
+        fan_in = len(timing_map[0])
         print(f"      hidden={args.hidden} PER GROUP  "
-              f"n_timing={args.n_timing}  params={n_par:,}")
+              f"n_timing={args.n_timing}  n_decoders={n_dec}  "
+              f"params={n_par:,}")
         print(f"      CPG({args.n_cpg_neurons}) -> timing"
-              f"({args.n_timing}, LIF, per-gait weights) "
-              f"-> {args.n_timing} x [{args.hidden} -> {args.hidden} -> "
-              f"readout({args.readout_hidden})], no cross talk (todo 3a)")
+              f"({args.n_timing}, {args.timing_shape}, LIF, per-gait weights) "
+              f"-> {n_dec} x ({args.decoder_shape}) "
+              f"[{fan_in} -> {args.hidden} -> {args.hidden} -> "
+              f"readout({args.readout_hidden}) -> {len(group_cols[0])}], "
+              f"no cross talk (todo 3a)")
         print(f"      timing reset={args.timing_reset}  "
               f"sub_film={args.sub_film}  sub_ln={args.sub_ln}  "
               f"gate_mode={args.gate_mode}  bias_mode={args.bias_mode}")
@@ -4163,6 +4400,22 @@ def main():
                              if args.arch == "timing_grouped" else None),
         "group_cols":       ([list(g) for g in group_cols]
                              if group_cols is not None else None),
+        # The structure is recorded three ways on purpose: the two shape
+        # NAMES are the deployment contract, timing_map is what the model
+        # actually wired up, and timing_cols/group_cols are what each unit
+        # owns. build_model_from_cfg reads timing_map, so a hand-edited shape
+        # name cannot silently change the architecture out from under a
+        # checkpoint.
+        "timing_shape":     (str(args.timing_shape)
+                             if args.arch == "timing_grouped" else None),
+        "decoder_shape":    (str(args.decoder_shape)
+                             if args.arch == "timing_grouped" else None),
+        "timing_cols":      ([list(t) for t in timing_cols]
+                             if timing_cols is not None else None),
+        "timing_map":       ([list(m) for m in timing_map]
+                             if timing_map is not None else None),
+        "timing_fan_in":    (len(timing_map[0])
+                             if timing_map is not None else None),
         "gait_names":       gait_names,
         # Same list as gait_names for CSV-loaded gaits (file stem == display
         # name, matching train_snn.py's convention) — kept as a separate key
@@ -4238,6 +4491,14 @@ def main():
             "n_cpg_neurons":    int(args.n_cpg_neurons),
             "n_timing":         (int(args.n_timing)
                                  if args.arch == "timing_grouped" else None),
+            "n_decoders":       (len(group_cols)
+                                 if group_cols is not None else None),
+            "timing_shape":     (str(args.timing_shape)
+                                 if args.arch == "timing_grouped" else None),
+            "decoder_shape":    (str(args.decoder_shape)
+                                 if args.arch == "timing_grouped" else None),
+            "timing_map":       ([list(m) for m in timing_map]
+                                 if timing_map is not None else None),
             "hidden_per_group": (int(args.hidden)
                                  if args.arch == "timing_grouped" else None),
             "tau_min":          float(args.tau_min),
