@@ -1051,6 +1051,15 @@ def spike_fn(x, slope=25.0):
 # default changed to "l2".
 _W_IN_INIT = 0.5
 _W1_INIT   = 0.5
+
+# Highest fraction of the phase-blind ceiling that gain calibration is allowed
+# to target.  The ceiling is n_cpg * cpg_rate spikes per cycle -- one timing
+# spike per CPG spike -- at which point the unit's spike train is the OR of
+# the CPG's, identical for every saturated unit, and carries no phase.  A unit
+# already at 0.6 of that is firing on most CPG spikes and is close to useless,
+# so the calibration band is capped here rather than at 1.0.
+_SAT_FRAC = 0.6
+
 # Smallest gap kept between a voltage-mode bias and `thresh`, so the
 # effective threshold `thresh - v` stays strictly positive.  See
 # TimingGroupedSNN.clamp_bias_voltage.
@@ -1953,7 +1962,7 @@ def measure_rates(model, spikes, n_gaits, device,
 @torch.no_grad()
 def calibrate_gains(model, spikes, n_gaits, device, period,
                     lo=1.0, hi=5.0, iters=18, g_lo=1e-3, g_hi=1e3,
-                    verbose=True):
+                    per_gait=True, cpg_rate_hint=None, verbose=True):
     """
     Scale each timing unit's CPG->timing weight column so its firing rate
     starts inside [lo, hi] spikes per cycle.
@@ -1989,10 +1998,47 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
     positive-mean init on `w_in_gait` exists to prevent that.  Units that
     cannot be brought into band are reported, not silently left.
 
-    WHICH GAIT.  One gain per unit, applied to that unit's column in EVERY
-    gait's matrix, so the relative shape across gaits is preserved.  The rate
-    targeted is the MINIMUM over gaits, because the failure that matters is
-    dead-for-one-particular-gait, not dead-on-average.
+    WHICH GAIT.  `per_gait=True` (the default) bisects a SEPARATE gain for
+    every (gait, unit) pair, so every pair lands in the band.  `per_gait=False`
+    is the old behaviour: one gain per unit, applied to that unit's column in
+    every gait, bisected against the MINIMUM rate across gaits.
+
+    Per-gait is the default because one-gain-per-unit is a saturation
+    generator.  Only the minimum was constrained, nothing bounded the maximum,
+    so a unit weakly driven in ONE gait had its gain raised until that gait
+    fired -- dragging every other gait up with it.  Measured over 24 draws of
+    the real init (w ~ N(_W_IN_INIT, _W_IN_INIT), 6 CPG inputs, 4 gaits), the
+    min-over-gaits gain left max-over-gaits rates of 5 to 48 spk/cyc against a
+    target band of [1, 5]: typically 3-10x over, and 20-48x when one gait's
+    column happened to sum near zero.
+
+    That inflation is not recoverable by training.  A unit pinned at the
+    ceiling (n_cpg * cpg_rate spikes per cycle, one per CPG spike) sits far
+    above threshold, where spike_fn's surrogate 1/(slope*|x|+1)^2 is down by
+    1e2 to 1e3, so the spike penalty's gradient is order 1e-6.  Adam is
+    scale-invariant -- lr * m/sqrt(v) is unchanged if every gradient is
+    multiplied by a constant -- so raising --spike_stats_lambda does NOT speed
+    the descent up: a 10,000x increase moved the gain 1.5% in a 4000-step
+    simulation, leaving the rate at 39 spk/cyc.  The gain has to travel ~40x
+    multiplicatively, and gradient descent will not walk that far.  Hence:
+    start in the band, per gait, rather than trying to get back to it.
+
+    The old behaviour justified one gain per unit as preserving "the relative
+    shape across gaits".  There is no such shape at init -- `w_in_gait` is a
+    single `normal_` over the whole (max_gaits, n_cpg * n_timing) tensor, so
+    every gait's matrix is already independent -- and per-gait gains cost no
+    extra forward passes, because `measure_rates` measures every gait on every
+    call either way.
+
+    Rows of `w_in_gait` beyond `n_gaits` are left unscaled (gain 1.0) in
+    per-gait mode: they are never indexed during this run, so there is no rate
+    to measure for them.
+
+    `cpg_rate_hint` is the CPG's own spikes-per-cycle from `cpg_spike_stats`.
+    Only used to print the saturation warning: the ceiling a timing unit can
+    reach is n_cpg * cpg_rate, one spike per CPG spike, because the BLIF CPG
+    never fires two neurons in the same timestep. Passed in rather than
+    measured again so there is one source of truth for that number.
     """
     if not hasattr(model, "w_in_gait"):
         return {}
@@ -2002,15 +2048,32 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
     W = model.w_in_gait.weight.data.view(MG, n_cpg, G)
     base = W.clone()
 
-    lo_g = torch.full((G,), g_lo, device=device)
-    hi_g = torch.full((G,), g_hi, device=device)
+    # Bisection brackets. Per-gait mode carries one bracket per (gait, unit);
+    # the old mode carries one per unit. Everything below is written against
+    # `shape` so the two paths share a single bisection loop.
+    shape = (n_gaits, G) if per_gait else (G,)
+    lo_g = torch.full(shape, g_lo, device=device)
+    hi_g = torch.full(shape, g_hi, device=device)
 
     def rates_at(gain):
-        # gain is (G,); broadcast over (max_gaits, n_cpg, G) so each timing
-        # unit's whole column is scaled in every gait at once.
-        W.copy_(base * gain.view(1, 1, G))
-        r = measure_rates(model, spikes, n_gaits, device, period=period)
-        return torch.as_tensor(r, device=device).min(dim=0).values
+        """
+        Write `gain` into w_in_gait and measure. Returns a tensor shaped like
+        `gain`, so the comparisons against lo/hi are elementwise in both modes.
+        """
+        if per_gait:
+            # (n_gaits, G) -> (max_gaits, 1, G). Rows past n_gaits are never
+            # indexed this run and have no measured rate, so they stay at 1.
+            full = torch.ones(MG, G, device=device, dtype=base.dtype)
+            full[:n_gaits] = gain
+            W.copy_(base * full.unsqueeze(1))
+        else:
+            # gain is (G,); broadcast over (max_gaits, n_cpg, G) so each timing
+            # unit's whole column is scaled in every gait at once.
+            W.copy_(base * gain.view(1, 1, G))
+        r = torch.as_tensor(
+            measure_rates(model, spikes, n_gaits, device, period=period),
+            device=device)                                  # (n_gaits, G)
+        return r if per_gait else r.min(dim=0).values
 
     for _ in range(iters):
         mid = torch.sqrt(lo_g * hi_g)                   # geometric midpoint
@@ -2029,19 +2092,68 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
     final_gain  = torch.sqrt(lo_g * hi_g)
     final_rates = rates_at(final_gain)
     ok = ((final_rates >= lo * 0.5) & (final_rates <= hi * 2.0))
+
+    # `rate_by_gait` is always the full (n_gaits, G) measurement, whichever
+    # mode ran, so the two modes stay directly comparable in the config dump.
+    # In per-gait mode that IS final_rates; in the old mode final_rates is
+    # only the per-unit minimum, so re-read the full matrix.
+    rate_by_gait = final_rates if per_gait else torch.as_tensor(
+        measure_rates(model, spikes, n_gaits, device, period=period),
+        device=device)
+
+    tolist = lambda t: t.cpu().tolist()
     report = {"timing": {
-        "gain":     [float(v) for v in final_gain.cpu()],
-        "min_rate": [float(v) for v in final_rates.cpu()],
-        "in_band":  [bool(v) for v in ok.cpu()],
+        "per_gait":     bool(per_gait),
+        "band":         [float(lo), float(hi)],
+        "gain":         tolist(final_gain),      # (n_gaits, G) or (G,) by mode
+        "rate_by_gait": tolist(rate_by_gait),    # always (n_gaits, G)
+        # Kept under their original names and meanings so anything reading an
+        # older config still finds them; max_rate is the number the old mode
+        # never constrained and is the one to watch.
+        "min_rate":     tolist(rate_by_gait.min(dim=0).values),
+        "max_rate":     tolist(rate_by_gait.max(dim=0).values),
+        "in_band":      tolist(ok),
     }}
+
     if verbose:
-        fmt = lambda v: " ".join(f"{x:6.2f}" for x in v)
-        print(f"      calibrated timing: gain [{fmt(report['timing']['gain'])}]")
-        print(f"                         min spk/cyc across gaits "
-              f"[{fmt(report['timing']['min_rate'])}]")
-        bad = [i for i, v in enumerate(ok.cpu()) if not v]
+        fmt  = lambda v: " ".join(f"{x:6.2f}" for x in v)
+        tim  = report["timing"]
+        mode = "per (gait, unit)" if per_gait else "per unit, min over gaits"
+        print(f"      calibrated timing [{mode}], band [{lo}, {hi}] spk/cyc")
+        if per_gait:
+            for g in range(n_gaits):
+                print(f"        gait {g}: gain [{fmt(tim['gain'][g])}]")
+                print(f"                 rate [{fmt(tim['rate_by_gait'][g])}]")
+        else:
+            print(f"        gain     [{fmt(tim['gain'])}]")
+        print(f"        min spk/cyc across gaits [{fmt(tim['min_rate'])}]")
+        print(f"        MAX spk/cyc across gaits [{fmt(tim['max_rate'])}]")
+
+        # A unit at the ceiling fires once per CPG spike, so its spike train is
+        # the OR of the CPG's and carries no phase information at all. Flagged
+        # separately from the band check because it is the failure that kills a
+        # sub-network outright, and because training cannot undo it.
+        #
+        # Threshold is _SAT_FRAC, the same constant the band cap uses, NOT
+        # something looser like 0.9. Measured: min-over-gaits calibration on
+        # the ungated band [1.5, 2.0] x cpg_rate left a (gait, unit) pair at
+        # 51.5 of a 60 ceiling -- 86%, thoroughly phase-blind, and a 0.9
+        # threshold would have said nothing about it.
+        ceiling = float(n_cpg) * float(cpg_rate_hint) if cpg_rate_hint else None
+        if ceiling:
+            sat = (rate_by_gait >= _SAT_FRAC * ceiling).nonzero().cpu().tolist()
+            if sat:
+                print(f"      WARNING: (gait, unit) {sat} are at >="
+                      f"{_SAT_FRAC:g} x the {ceiling:.0f} spk/cyc ceiling "
+                      f"(one spike per CPG spike), so they carry little or no "
+                      f"phase. Training will not fix this — the spike "
+                      f"penalty's gradient is ~1e-6 there and Adam is "
+                      f"scale-invariant.")
+
+        bad = ok.logical_not().nonzero().cpu().tolist()
         if bad:
-            print(f"      WARNING: timing unit(s) {bad} could not be brought "
+            label = "(gait, unit)" if per_gait else "unit"
+            print(f"      WARNING: timing {label} {bad} could not be brought "
                   f"into [{lo}, {hi}] spk/cyc by scaling alone — likely "
                   f"net-negative input current, which a positive gain cannot "
                   f"fix. The spike objective will keep pushing; if they stay "
@@ -3371,6 +3483,23 @@ def main():
                          "is no band to configure). Forward passes only, a "
                          "second of compute, and it is why there is no "
                          "--timing_w_scale to guess at. 0 = skip.")
+    ap.add_argument("--calibrate_per_gait", type=int, default=1,
+                    help="[timing_grouped, needs --calibrate_gains 1] 1 = "
+                         "bisect a separate gain for every (gait, unit) pair, "
+                         "so every pair lands in the band. 0 = the old "
+                         "behaviour: one gain per unit, bisected against that "
+                         "unit's MINIMUM rate across gaits. 0 is a saturation "
+                         "generator and is kept only for A/B: nothing bounded "
+                         "the maximum, so a unit weakly driven in one gait had "
+                         "its gain raised until that gait fired, dragging "
+                         "every other gait up with it -- measured at 3-10x "
+                         "over the band typically and 20-48x when a column "
+                         "summed near zero. Training cannot undo it: a "
+                         "saturated unit sits far above threshold where "
+                         "spike_fn's surrogate is down 1e2-1e3x, so the spike "
+                         "penalty's gradient is ~1e-6, and Adam is "
+                         "scale-invariant, so raising --spike_stats_lambda "
+                         "10,000x moves the gain 1.5%%.")
     ap.add_argument("--spike_objective", type=str, default="min_count",
                     choices=sorted(SPIKE_OBJECTIVES),
                     help="[timing_grouped] Which objective shapes the timing "
@@ -3905,10 +4034,37 @@ def main():
                   f"{cpg_rate:.1f}, so the network starts able to render the "
                   f"waveform and prunes from there)")
         else:
-            band_lo, band_hi = 1.0 * cpg_rate, 3.0 * cpg_rate
+            band_lo, band_hi = 1.5 * cpg_rate, 2.0 * cpg_rate
+
+        # A timing unit cannot exceed one spike per CPG spike: the BLIF CPG
+        # never fires two neurons in the same timestep, so there are exactly
+        # n_cpg * cpg_rate opportunities per cycle, and at calibration time
+        # b_t is zero and the reset is to zero, so nothing fires between them.
+        # AT that ceiling a unit's spike train is the OR of the CPG's and
+        # identical for every such unit -- zero phase information, sub-network
+        # effectively dead.
+        #
+        # This has to be enforced HERE, not inside calibrate_gains, because the
+        # band above can exceed the ceiling. The gated + min_count branch asks
+        # for 8 * cpg_rate = 80 spk/cyc against a ceiling of 60 for a 6-neuron
+        # CPG, and a band whose top is above the ceiling makes the `too_loud`
+        # test unreachable -- so the bisection drives units TO saturation and
+        # then reports them as in-band. Inert for the ungated branch, whose
+        # band tops out at 2 * cpg_rate.
+        ceiling = float(args.n_cpg_neurons) * float(cpg_rate)
+        cap     = _SAT_FRAC * ceiling
+        if band_hi > cap:
+            print(f"      NOTE band top {band_hi:.0f} exceeds "
+                  f"{_SAT_FRAC:g} x the {ceiling:.0f} spk/cyc ceiling "
+                  f"(n_cpg {args.n_cpg_neurons} x cpg_rate {cpg_rate:.1f}); "
+                  f"capping to {cap:.0f} so calibration cannot target a "
+                  f"phase-blind unit.")
+            band_hi = cap
+            band_lo = min(band_lo, 0.5 * band_hi)
         calib = calibrate_gains(
             model, spikes, len(gait_tables), device, period,
-            lo=band_lo, hi=band_hi)
+            lo=band_lo, hi=band_hi, per_gait=bool(args.calibrate_per_gait),
+            cpg_rate_hint=cpg_rate)
 
     # ── Spike objective (strategy) ──────────────────────────────
     spike_obj = make_spike_objective(
