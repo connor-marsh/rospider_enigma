@@ -3572,7 +3572,7 @@ def main():
                          "timing layer -> n_timing disconnected sub-networks, "
                          "one per timing neuron. Keep 'dense' runnable so A/B "
                          "at matched gradient steps stays possible.")
-    ap.add_argument("--timing_shape", type=str, default="per_leg",
+    ap.add_argument("--timing_shape", type=str, default="per_joint",
                     choices=list(STRUCTURE_SHAPES),
                     help="[timing_grouped] Structure of the timing layer. "
                          "per_leg: one timing LIF per leg (n_legs units). "

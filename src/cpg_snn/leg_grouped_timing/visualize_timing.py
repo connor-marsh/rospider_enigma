@@ -295,35 +295,38 @@ def _savefig(fig, out_dir, name, dpi):
 
 
 def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
-                   group_cols, leg_cols, gait_name, out_dir, dpi, t_lo, t_hi):
+                   timing_cols, leg_cols, gait_name, out_dir, dpi, t_lo, t_hi):
     """
     The main figure.  Two full-width rasters on top (CPG, then timing layer),
     then a grid of ONE ROW PER LEG and ONE COLUMN PER JOINT WITHIN THAT LEG.
 
-    The grid comes from `leg_cols` (the robot's anatomy), NOT from
-    `group_cols` (how the network happens to be grouped). Those coincide at
-    --n_timing n_legs, but at --n_timing 18 every group is a single column,
-    which used to give 18 single-panel rows -- far too many to read. Anatomy
-    is the right axis for this plot either way: 6 rows x 3 columns for the
-    hexapod, 4 x 2 for the quadruped, regardless of n_timing.
+    The grid comes from `leg_cols` (the robot's anatomy), NOT from the
+    network's grouping. Those coincide at --decoder_shape per_leg, but at
+    per_joint every sub-network is a single column, which used to give 18
+    single-panel rows -- far too many to read. Anatomy is the right axis for
+    this plot either way: 6 rows x 3 columns for the hexapod, 4 x 2 for the
+    quadruped, regardless of the network structure.
 
     Splitting per joint rather than overlaying them matters because the joints
     within a leg have different amplitudes and shapes; overlaid on one axis the
     small-amplitude ones were unreadable and a shared y-scale flattened them.
 
-    Each panel's spike rug is the timing neuron that actually drives THAT
-    column, looked up through group_cols -- so with per-leg grouping all three
-    of a leg's panels share one rug, and with per-joint grouping each panel
-    shows its own. Every axis shares x with the rasters; vertical alignment
-    across the whole figure is the point.
+    Each panel's spike rug is the timing unit responsible for THAT column,
+    looked up through `timing_cols` -- NOT through group_cols, which is
+    indexed by sub-network and is a different length once --timing_shape and
+    --decoder_shape differ. With per_leg timing all three of a leg's panels
+    share one rug; with per_joint timing each panel shows its own. Every axis
+    shares x with the rasters; vertical alignment across the whole figure is
+    the point.
     """
     n_cpg = spikes.shape[1]
     G     = tspk.shape[1]                   # timing neurons (raster lanes)
     n_legs = len(leg_cols)
     C     = len(leg_cols[0])
     tnames = joint_type_names(C)
-    # column -> the timing neuron that drives it
-    owner = {c: g for g, cols in enumerate(group_cols) for c in cols}
+    # column -> the timing unit responsible for it. Built from timing_cols so
+    # the index is always a valid raster lane.
+    owner = {c: t for t, cols in enumerate(timing_cols) for c in cols}
     sl    = slice(t_lo, t_hi)
     t     = np.arange(t_lo, t_hi)
 
@@ -452,19 +455,30 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     _savefig(fig, out_dir, f"timing_alignment_{gait_name}.png", dpi)
 
 
-def plot_phase_fold(tspk, phase, gait_tables, gait_idx, group_cols,
+def plot_phase_fold(tspk, phase, gait_tables, gait_idx, timing_cols,
                     gait_name, phase_zero, out_dir, dpi, n_bins=72):
     """
     Time folded onto cycle phase.  Removes the 'which cycle' axis so
-    alignment is a single picture per leg: the leg's trajectory over one
-    cycle, with its timing neuron's spike-phase histogram behind it.
+    alignment is a single picture per TIMING UNIT: the trajectory of the
+    column(s) that unit is responsible for over one cycle, with its own
+    spike-phase histogram behind it.
+
+    One row per timing unit, indexed through `timing_cols` -- not per
+    sub-network through group_cols, which is a different length once
+    --timing_shape and --decoder_shape differ. With per_joint timing each row
+    is a single joint and the reference fundamental is that joint's own, which
+    is the sharper alignment measure; with per_leg timing a row shows the
+    whole leg, as before.
     """
     G   = tspk.shape[1]
     tbl = gait_tables[gait_idx]
     R   = tbl.shape[0]
     ok  = np.isfinite(phase)
 
-    fig, axes = plt.subplots(G, 1, figsize=(11, 2.5 * G), sharex=True,
+    # Shorter rows once there are many units: per_joint timing gives 18 of
+    # them, and 2.5in each is a 45-inch figure no one can read.
+    row_h = 2.5 if G <= 8 else 1.6
+    fig, axes = plt.subplots(G, 1, figsize=(11, row_h * G), sharex=True,
                              squeeze=False)
     axes = axes[:, 0]
     x_tbl = ((np.arange(R) / R) - phase_zero) % 1.0
@@ -473,11 +487,12 @@ def plot_phase_fold(tspk, phase, gait_tables, gait_idx, group_cols,
     for j in range(G):
         ax   = axes[j]
         col_ = TIMING_PALETTE[j % len(TIMING_PALETTE)]
+        cols = timing_cols[j]
 
-        for k, c in enumerate(group_cols[j]):
+        for k, c in enumerate(cols):
             ax.plot(x_tbl[order], tbl[order, c], color=GT_COLOR, lw=1.9,
                     ls="-" if k == 0 else "-.", label=f"GT c{c}", zorder=3)
-        ax.set_ylabel(f"leg {j} (°)", fontsize=9)
+        ax.set_ylabel(f"T{j} cols {cols} (°)", fontsize=8)
         ax.grid(alpha=0.2)
 
         m  = (tspk[:, j] > 0) & ok
@@ -487,14 +502,15 @@ def plot_phase_fold(tspk, phase, gait_tables, gait_idx, group_cols,
                      color=col_, alpha=0.28, zorder=1)
             mu, R_ = circular_stats(phase[m])
             ax2.axvline(mu, color=col_, lw=2.0, ls="-", zorder=2)
-            f_ph = fundamental_phase(tbl[order, group_cols[j][0]])
+            f_ph = fundamental_phase(tbl[order, cols[0]])
             res  = circ_diff(mu, f_ph)
             ax.set_title(
                 f"T{j}: mean phase {mu:.3f}  R={R_:.2f}  |  "
-                f"leg {j} fundamental {f_ph:.3f}  |  "
+                f"col {cols[0]} fundamental {f_ph:.3f}  |  "
                 f"residual {res:+.3f} cyc", fontsize=8)
         else:
-            ax2.set_title(f"T{j}: NO SPIKES — sub-network {j} gets no input",
+            ax2.set_title(f"T{j}: NO SPIKES — every sub-network it feeds "
+                          f"gets no input from it",
                           fontsize=8, color="#e63946")
         ax2.set_ylabel("T spikes", fontsize=7)
         ax2.tick_params(labelsize=6)
@@ -885,6 +901,41 @@ def run_visualization(model_dir, out_dir=None, args=None):
           + ("" if cfg_leg_cols else "  (leg_cols absent from config — "
                                      "using the network grouping)"))
 
+    # ── timing units vs sub-networks ─────────────────────────────
+    # These are two different counts now (--timing_shape vs --decoder_shape),
+    # and conflating them is what broke this file: every per-timing-neuron
+    # loop was indexing `group_cols`, which is as long as the SUB-NETWORK
+    # count. At timing per_joint + decoder per_leg that is 18 lookups into a
+    # 6-entry list.
+    #
+    #   group_cols[g]  : output columns sub-network g EMITS
+    #   timing_cols[t] : output columns timing unit t is RESPONSIBLE FOR,
+    #                    i.e. what its phase should align to
+    #   timing_map[g]  : which timing units feed sub-network g
+    #
+    # timing_cols falls back to group_cols, which is exact for every config
+    # written before --timing_shape existed: there was one timing unit per
+    # sub-network, so a unit's columns WERE its group's columns.
+    group_cols  = [list(g) for g in model.group_cols]
+    cfg_tcols   = cfg_get(cfg, "timing_cols")
+    timing_cols = ([list(c) for c in cfg_tcols] if cfg_tcols
+                   else [list(g) for g in group_cols])
+    timing_map  = cfg_get(cfg, "timing_map")
+    if arch == "timing_grouped":
+        n_t = int(getattr(model, "n_timing", len(timing_cols)))
+        if len(timing_cols) != n_t:
+            raise ValueError(
+                f"timing_cols has {len(timing_cols)} entries but the model "
+                f"has {n_t} timing units. The config's timing_cols and "
+                f"checkpoint disagree — treat every figure as suspect.")
+        print(f"  Structure: {n_t} timing unit(s) "
+              f"({cfg_get(cfg, 'timing_shape', 'per_leg')}) -> "
+              f"{len(group_cols)} sub-network(s) "
+              f"({cfg_get(cfg, 'decoder_shape', 'per_leg')}), fan-in K="
+              f"{len(timing_map[0]) if timing_map else 1}"
+              + ("" if cfg_tcols else "  (timing_cols absent from config — "
+                                      "assuming one unit per sub-network)"))
+
     tgt_range  = (float(cfg_get(cfg, "global_min", -124.0)),
                   float(cfg_get(cfg, "global_max", 124.0)))
     phase_zero = float(cfg_get(cfg, "phase_zero", 0.0))
@@ -952,13 +1003,15 @@ def run_visualization(model_dir, out_dir=None, args=None):
             continue
 
         tspk = timing_raster(model, spikes, gi, device)
+        # G here is the TIMING-unit count (raster lanes), not the
+        # sub-network count. Everything below indexes timing_cols, which is
+        # this long by construction.
         G    = tspk.shape[1]
-        group_cols = model.group_cols
 
         plot_alignment(spikes, tspk, gt, pred, phase, onsets, period,
-                       burst_thr, group_cols, leg_cols, gname, out_dir,
+                       burst_thr, timing_cols, leg_cols, gname, out_dir,
                        args.dpi, t_lo, t_hi)
-        plot_phase_fold(tspk, phase, gait_tables, gi, group_cols, gname,
+        plot_phase_fold(tspk, phase, gait_tables, gi, timing_cols, gname,
                         phase_zero, out_dir, args.dpi)
         if mems and not args.no_membranes:
             plot_membranes(mems, [n.replace("_in", "")
@@ -975,11 +1028,13 @@ def run_visualization(model_dir, out_dir=None, args=None):
         for j in range(G):
             m = (tspk[:, j] > 0) & ok
             mu, R_ = circular_stats(phase[m])
-            f_ph   = fundamental_phase(tbl[order, group_cols[j][0]])
+            f_ph   = fundamental_phase(tbl[order, timing_cols[j][0]])
             res    = circ_diff(mu, f_ph)
             rows.append({
                 "timing_neuron":   j,
-                "cols":            list(group_cols[j]),
+                "cols":            list(timing_cols[j]),
+                "feeds_subnets":   ([g for g, m in enumerate(timing_map)
+                                     if j in m] if timing_map else [j]),
                 "rate_per_cycle":  float(tspk[:, j].sum() / ncyc),
                 "mean_phase":      None if not np.isfinite(mu) else float(mu),
                 "R":               float(R_),
@@ -989,7 +1044,7 @@ def run_visualization(model_dir, out_dir=None, args=None):
                 "dead":            bool(tspk[:, j].sum() == 0),
             })
             tag = "  <-- DEAD" if rows[-1]["dead"] else ""
-            print(f"    T{j} (cols {group_cols[j]}): "
+            print(f"    T{j} (cols {timing_cols[j]}): "
                   f"rate={rows[-1]['rate_per_cycle']:6.2f}/cyc  "
                   f"phase={mu:.3f}  R={R_:.2f}  "
                   f"leg_fund={f_ph:.3f}  "
