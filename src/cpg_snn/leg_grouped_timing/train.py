@@ -87,11 +87,12 @@ What changed vs. the previous (conductance-based CPG + event-window) version
     its own routing.  A shared-weights alternative (one weight pair plus a
     per-gait FiLM gate on a small LIF hidden layer) was built and reverted --
     it produced near-identical timing phases across gaits.  See the
-    TimingGroupedSNN docstring for the diagnosis and todo item 11.
+    TimingGroupedSNN docstring for the diagnosis.
 
-    This is todo 3a (no cross talk).  3b -- every sub-network sees all
-    n_timing timing spikes -- is a one-line change to sub-net layer 1 and
-    is deliberately not wired up yet.
+    Sub-networks never see each other's timing spikes. A sub-network's fan-in
+    is whichever timing units own its output columns (--timing_shape /
+    --decoder_shape); full cross talk, where every sub-network sees all
+    n_timing spikes, is not wired up.
 
 6.  CPG size is an argument.
     `--n_cpg_neurons {3,4,6}` selects a coupling matrix from CPG_W_BY_N and
@@ -127,7 +128,7 @@ Usage
     python train.py --epochs 300 --hidden 256
     python train.py --dry_run                       # data + plots, no training
 
-    # timing layer + per-leg sub-networks (todo 3a)
+    # timing layer + per-leg sub-networks
     python train.py --arch timing_grouped --hidden 256
 
     # matched-parameter comparison against dense --hidden 256
@@ -162,7 +163,6 @@ from scipy.interpolate import interp1d
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 torch.set_float32_matmul_precision('high')
 
 import matplotlib
@@ -1133,19 +1133,16 @@ def spike_fn(x, slope=25.0):
     return hard + (surr - surr.detach())
 
 
-# Init scales that used to be the single --timing_w_scale arg.  Split and
-# made internal because the arg was doing two unrelated jobs and neither
-# needed user input:
+# Weight init scales.  Internal rather than args because neither needs user
+# input:
 #   _W_IN_INIT : CPG->timing weights.  calibrate_gains rescales these before
 #                training, so this only sets relative shape and the sign of
-#                the mean -- there is nothing for a user to tune.
+#                the mean -- there is nothing to tune.
 #   _W1_INIT   : timing->sub-net layer 1.  Deliberately uncalibrated (see the
 #                note at self.w1), and learnable, so this is a starting point
-#                rather than a setting.
-# Historical note: under the older sub_ln="both" default, layer 1 had
-# LayerNorm and LN is exactly scale-invariant with b1 init at zero, so the
-# shared arg had LITERALLY no effect there.  It only became live when the
-# default changed to "l2".
+#                rather than a setting.  Note it is inert whenever layer 1 has
+#                LayerNorm (--sub_ln l1/both), since LN is exactly
+#                scale-invariant with b1 init at zero.
 _W_IN_INIT = 0.5
 _W1_INIT   = 0.5
 
@@ -1393,10 +1390,12 @@ class TimingGroupedSNN(nn.Module):
     sub-networks get a clean phase reference instead of re-deriving it
     once per leg.
 
-    This is todo 3a: NO cross talk between sub-networks.  Sub-network g
-    sees exactly one binary channel.  Layers 2+ are block diagonal, the
-    readout is block diagonal, and there is no path between groups
-    anywhere after the timing layer.
+    NO cross talk between sub-networks.  Sub-network g sees only the K
+    binary channels of the timing units that own its output columns.  Layers
+    2+ are block diagonal, the readout is block diagonal, and there is no
+    path between groups anywhere after the timing layer.  A timing unit shared
+    by several sub-networks is a shared INPUT, not a shared parameter, so
+    block diagonality holds either way.
 
     Per-gait input weights, and why the shared router was reverted
     -------------------------------------------------------------
@@ -1465,14 +1464,16 @@ class TimingGroupedSNN(nn.Module):
     identical spike trains). So nothing is given up.
 
     Where they differ, voltage is preferable:
-      - Under gating the bias is already gated, so it is not tonic drive -- but
-        it IS part of the per-spike injection, and w1/b1 become redundant
-        because only their sum enters. Injection magnitude is what produces the
-        jerk on each spike, so moving the bias out of the injection and into a
+      - A bias CURRENT is tonic drive: it flows on every timestep, gate or no
+        gate, so a sub-network keeps firing during timing-layer silence and
+        the timing spikes stop being the only input. A threshold offset never
+        touches the membrane, so it cannot manufacture activity. This is what
+        makes NATURAL GATING possible (below) and is the main reason voltage
+        is the default.
+      - It also removes w1/b1 redundancy under explicit gating, where only
+        their sum enters. Injection magnitude is what produces the jerk on
+        each spike, so moving the bias out of the injection and into a
         persistent threshold attacks that directly.
-      - A threshold never touches the membrane, so a frozen sub-network
-        provably cannot have spiked. With bias_mode="current" and
-        gate_mode="none" that guarantee does not hold.
 
     The RESET still subtracts the fixed `thresh`, not the offset threshold.
     Resetting by the offset would let a unit that learns a low threshold fire
@@ -1497,10 +1498,52 @@ class TimingGroupedSNN(nn.Module):
     this (the dense model has the same property and works); a 6-wide one
     will not.
 
-    Instead, the firing regime is set explicitly: `calibrate_gains` bisects
-    a per-unit multiplier into FiLM's gamma before training so every unit
-    starts inside a target spikes-per-cycle band, and the chosen
-    SpikeObjective then shapes it from there.  See those.
+    Instead, the firing regime is set explicitly: `calibrate_gains` bisects a
+    multiplier into each (gait, unit) column of `w_in_gait` before training so
+    every gait of every unit starts inside a target spikes-per-cycle band.
+    Calibrating per gait rather than once per unit matters: a single gain
+    bisected against a unit's MINIMUM rate across gaits silently drove its
+    loud gaits toward the ceiling of one spike per CPG spike, at which point
+    the spike train is the OR of the CPG's and carries no phase at all. See
+    `calibrate_gains`.
+
+    NATURAL GATING
+    --------------
+    The operating setup. `gate_mode="none"` with `bias_mode="voltage"`: there
+    is no explicit gate, but the sub-networks are nonetheless driven only by
+    timing spikes, because in voltage mode layer 1's injection is
+    `spk_t * w1` and there is no bias current to flow during silence. A
+    positive membrane can then only decay toward zero, and `spike_fn` uses a
+    strict `>`, so a unit with no input cannot cross threshold.
+
+    Three things can break that and let a hidden unit fire on a timing-silent
+    step. Two are closed by the settings above:
+
+      bias current      closed by bias_mode="voltage"
+      film beta         OPEN -- FiLM's additive term is applied every step,
+                        gated or not, so a unit with positive beta has tonic
+                        drive. The remaining leak.
+      subtractive reset OPEN -- a unit left above threshold after a spike
+                        keeps firing on subsequent silent steps until the
+                        residual is spent.
+
+    Both remaining leaks are deliberate. `hidden_reset="zero"` closes the
+    second and gives similar alignment but slightly worse RMSE, because
+    subtractive reset is what converts injection magnitude into a spike COUNT
+    over the following steps -- a useful expansion that both zero reset and
+    explicit gating throw away. `--sub_film none` closes the first at the cost
+    of per-gait conditioning. In practice most hidden units are naturally
+    gated and alignment does emerge, so the leaks are left in.
+
+    `check_bias_voltage.py` decides, from a checkpoint alone, exactly which
+    units can fire without a timing spike and by which mechanism.
+
+    The known cost of relying on natural gating rather than the explicit gate:
+    the gate multiplies `cur` and `spk` at every layer, which scales up the
+    gradient reaching `spk_t`, so ungated runs get a weaker "put the spike
+    here" signal. Improving on this probably needs a second-order synaptic
+    filter so a single injection produces a smooth response rather than a
+    sharp one; not implemented.
 
     Inside the sub-networks LN is optional (`sub_ln`) and uses
     elementwise_affine=False: a shared gamma/beta over (G, Hg) would be a
@@ -1509,8 +1552,8 @@ class TimingGroupedSNN(nn.Module):
 
     State (5 tensors, mixed rank):
         mem_timing (B, n_timing) -- the TIMING layer, T units
-        since_upd  (B, G)        timesteps since each sub-net last advanced;
-                                 per SUB-NETWORK, so it is G-wide, not T
+        since_upd  (B, G)        vestigial, never read; kept only to hold the
+                                 exported ONNX signature fixed
         mem1, mem2 (B, G, Hg)
         memo       (B, G, H_o)   -- narrower; see the readout note in __init__
     """
@@ -1529,7 +1572,7 @@ class TimingGroupedSNN(nn.Module):
                  tau_timing_min=2.0, tau_timing_max=64.0,
                  tau_readout_max=40.0,
                  sub_ln="l2", sub_film="both",
-                 timing_reset="zero", hidden_reset="subtract", gate_mode="freeze",
+                 timing_reset="zero", hidden_reset="subtract", gate_mode="none",
                  bias_mode="voltage",
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
@@ -1613,8 +1656,8 @@ class TimingGroupedSNN(nn.Module):
         self.sub_film   = sub_film
         self.timing_reset = timing_reset
         self.hidden_reset = hidden_reset
-        if gate_mode not in ("none", "decay", "freeze"):
-            raise ValueError(f"gate_mode must be none|decay|freeze, got "
+        if gate_mode not in ("none", "decay"):
+            raise ValueError(f"gate_mode must be none|decay, got "
                              f"{gate_mode!r}")
         self.gate_mode = gate_mode
         if bias_mode not in ("current", "voltage", "none"):
@@ -1637,16 +1680,15 @@ class TimingGroupedSNN(nn.Module):
         # nothing shared.  See the class docstring for why the shared-router
         # alternative was tried and reverted.
         #
-        # There is NO FiLM on this layer.  There used to be, and its gamma was
-        # provably redundant: with W already a free per-gait matrix,
+        # There is NO FiLM on this layer: its gamma would be provably
+        # redundant, since with W already a free per-gait matrix,
         #     gamma_g * (x W_g + b) + beta_g  ==  x (W_g gamma_g) + (gamma_g b + beta_g)
         # so gamma is exactly absorbable into W_g and adds no expressiveness
-        # (verified numerically to 1e-16).  FiLM's beta was NOT redundant --
-        # it supplied a PER-GAIT bias where b_t was gait-shared -- so that
-        # capability is kept, expressed directly as a per-gait bias embedding
-        # below rather than hidden inside a gate.  If the per-gait weight
-        # table is ever replaced by a shared scheme, gamma becomes
-        # load-bearing again and FiLM should come back here.
+        # (verified numerically to 1e-16).  A per-gait BIAS is not redundant,
+        # and is supplied directly by the embedding below rather than hidden
+        # inside a FiLM gate.  If the per-gait weight table is ever replaced
+        # by a shared scheme, gamma becomes load-bearing and FiLM should come
+        # back here.
         #
         # INIT SCALE is arbitrary: calibrate_gains rescales these columns to
         # hit a target firing rate before training starts, so whatever is set
@@ -1783,12 +1825,9 @@ class TimingGroupedSNN(nn.Module):
     def init_state(self, batch, device, dtype=torch.float32):
         z = lambda w: torch.zeros(batch, self.G, w, device=device, dtype=dtype)
         mem_t = torch.zeros(batch, self.n_timing, device=device, dtype=dtype)
-        # since_upd: timesteps elapsed since each sub-network last advanced.
-        # Per SUB-NETWORK (G), whereas mem_t above is per TIMING UNIT (T);
-        # the two differ whenever --timing_shape and --decoder_shape differ.
-        # Only used by gate_mode="freeze", but always present so the state
-        # shape and the ONNX signature do not depend on the mode.  Zero means
-        # "no elapsed time", so the first update applies no decay.
+        # since_upd: vestigial. It was the update counter for the removed
+        # gate_mode="freeze"; nothing reads it now. Kept, and kept G-wide,
+        # only so the exported ONNX signature keeps its arity and names.
         since = torch.zeros(batch, self.G, device=device, dtype=dtype)
         # memo is Ho wide, not Hg (see the readout comment in __init__).
         return (mem_t, since, z(self.Hg), z(self.Hg), z(self.Ho))
@@ -1858,57 +1897,38 @@ class TimingGroupedSNN(nn.Module):
 
         # ---- event gate -------------------------------------------
         # gate_mode:
-        #   "none"   ungated. Biases flow every step, sub-net spikes fire
-        #            freely, membranes decay every step. The task loss is then
-        #            EXACTLY invariant to the timing layer's burst phase (a
-        #            sub-net whose taus span a cycle has a complete
-        #            "time since burst" basis, so any shift is absorbed by
-        #            relearning the waveform offset).
-        #   "decay"  input gated (bias included), sub-net spikes gated, but
-        #            membranes still leak every step. Output relaxes toward
-        #            b_out between spikes, so a weighted sum of Ho decaying
-        #            exponentials can still reconstruct most of the waveform
-        #            from ONE injection -- measured ~183 steps of usable coast.
-        #            That is why spike placement mattered only weakly.
-        #   "freeze" nothing moves without a spike. On a silent step the
-        #            sub-network is bit-for-bit unchanged and the output is
-        #            HELD. On a spiking step the accumulated leak is applied
-        #            as beta**since_upd, then current is injected.
-        #
-        # Why beta**since_upd rather than just skipping the decay: it makes the
-        # state AT EACH UPDATE exactly equal to what per-step decay would have
-        # produced, so the internal dynamics are unchanged and this is a pure
-        # zero-order hold on the OUTPUT, not a different model. It is also the
-        # form that allows genuinely sparse updates at deployment.
-        #
-        # This only became viable once fake_cpg removed the inter-burst gaps:
-        # with the real CPG's long silences, a frozen sub-network would hold a
-        # stale output across a third of the cycle.
+        #   "none"   (default) ungated. Sub-net spikes fire freely and
+        #            membranes decay every step. This is the NATURAL GATING
+        #            setup -- see the class docstring. Under bias_mode
+        #            "voltage" the sub-networks receive current only on a
+        #            timing spike anyway, so most hidden units cannot fire
+        #            without one and the explicit gate has little left to do.
+        #   "decay"  input and sub-net spikes explicitly gated; membranes
+        #            still leak every step. Kept because it forces the
+        #            spike-train-only property rather than relying on it, and
+        #            because it strengthens the gradient into the timing layer
+        #            (see the NOTE below). Not the default: it also destroys
+        #            the magnitude-to-spike-count expansion that subtractive
+        #            reset provides, since a gated unit can emit at most one
+        #            spike per timing spike.
         #
         # NOTE the gate multiplies both `cur` and `spk` on each layer, so
         # gradient reaching spk_t through those paths is scaled up. Forward is
         # exact (gate is 0/1, so gate*gate == gate). Left uncorrected: it is a
         # scale factor, and stronger gradient into the timing layer is wanted.
-        gated  = self.gate_mode != "none"
-        freeze = self.gate_mode == "freeze"
+        # This is the one real advantage "decay" retains over natural gating,
+        # whose forward pass is otherwise equivalent when no hidden unit can
+        # fire on a timing-silent step.
+        gated = self.gate_mode != "none"
         # A sub-network updates when ANY of its K timing units fires, so the
         # gate is the OR over that group's selected spikes. At K=1 amax is a
         # no-op and this is spk_t.unsqueeze(-1) exactly. Using amax rather
         # than a sum keeps the gate strictly 0/1, which the forward relies on
-        # (gate*gate == gate) and which freeze's since_upd counter needs.
+        # (gate*gate == gate).
         gate = spk_sel.amax(dim=-1, keepdim=True) if gated else None
-        if freeze:
-            # Detached: since_upd is a counter, not a differentiable path, and
-            # the hard 0/1 spike is what determines whether an update happened.
-            g_hard = gate.detach()
-            dt = since.unsqueeze(-1).detach()                  # (B, G, 1)
-            dec1 = torch.exp(F.logsigmoid(self.beta1_logit) * dt)
-            dec2 = torch.exp(F.logsigmoid(self.beta2_logit) * dt)
-            deco = torch.exp(F.logsigmoid(self.betao_logit) * dt)
-        else:
-            dec1 = torch.sigmoid(self.beta1_logit)
-            dec2 = torch.sigmoid(self.beta2_logit)
-            deco = torch.sigmoid(self.betao_logit)
+        dec1 = torch.sigmoid(self.beta1_logit)
+        dec2 = torch.sigmoid(self.beta2_logit)
+        deco = torch.sigmoid(self.betao_logit)
 
         # ---- sub-net layer 1 ---------------------------------------
         # In "current" mode and gated, w1 and b1 are redundant (only their sum
@@ -1916,14 +1936,12 @@ class TimingGroupedSNN(nn.Module):
         # entirely, which is the point: injection magnitude is what drives the
         # jerk, and a threshold offset does not inflate it.
         #
-        # The gated branch used to skip the spike multiply entirely
-        # (cur1 = w1 + b1) on the grounds that the gate reintroduced it. That
-        # shortcut is only valid at K=1: with K>1 the injection is
-        # sum_k spk_k * w1[g,k], which is NOT gate * sum_k w1[g,k] unless all
-        # K units happen to fire together. So the contraction is always done
-        # explicitly now, and the gate below is a no-op on spiking steps
-        # (gate=1 wherever any spk_sel is 1). Verified bit-identical to the
-        # old gated path at K=1.
+        # The contraction over K is done explicitly in both gate modes. Under
+        # gating it is tempting to write cur1 = w1 + b1 and let the gate
+        # reintroduce the spike, but that is only valid at K=1: with K>1 the
+        # injection is sum_k spk_k * w1[g,k], which is NOT gate * sum_k
+        # w1[g,k] unless all K units fire together. The gate below is then a
+        # no-op on spiking steps (gate=1 wherever any spk_sel is 1).
         b1 = self.b1 if self.bias_mode == "current" else 0.0
         cur1 = torch.einsum("bgk,gkh->bgh", spk_sel, self.w1) + b1
         if self.sub_ln in ("l1", "both"):
@@ -1934,7 +1952,7 @@ class TimingGroupedSNN(nn.Module):
         if gated:
             cur1 = gate * cur1
         new1 = dec1 * mem1 + cur1
-        mem1 = torch.lerp(mem1, new1, g_hard) if freeze else new1
+        mem1 = new1
         th1 = (self.thresh - self.v1 if self.bias_mode == "voltage"
                else self.thresh)
         spk1 = spike_fn(mem1 - th1, self.slope)
@@ -1957,7 +1975,7 @@ class TimingGroupedSNN(nn.Module):
         if gated:
             cur2 = gate * cur2
         new2 = dec2 * mem2 + cur2
-        mem2 = torch.lerp(mem2, new2, g_hard) if freeze else new2
+        mem2 = new2
         th2 = (self.thresh - self.v2 if self.bias_mode == "voltage"
                else self.thresh)
         spk2 = spike_fn(mem2 - th2, self.slope)
@@ -1974,15 +1992,13 @@ class TimingGroupedSNN(nn.Module):
             curo = curo + self.b_read
         if gated:
             curo = gate * curo
-        newo = deco * memo + curo
-        memo = torch.lerp(memo, newo, g_hard) if freeze else newo
+        memo = deco * memo + curo
 
-        # since_upd: 0 at an update, else +1.  (1 - gate)*since + 1 gives
-        # exactly "timesteps elapsed since the last update" at the next update:
-        # update at t leaves 1, each silent step adds 1, so an update at t+k
-        # reads k.  Detached, integer-valued in practice.
-        if freeze:
-            since = (1.0 - g_hard.squeeze(-1)) * since + 1.0
+        # `since` is passed through untouched. It was the update counter for
+        # the removed gate_mode="freeze"; the slot is retained only so the
+        # exported ONNX signature keeps its input/output arity and names, and
+        # nothing reads it. Remove it from state_names_in/out if the signature
+        # is ever allowed to change.
 
         y_grp = torch.einsum("bgh,ghc->bgc", memo, self.w_out) + self.b_out
         y     = y_grp.flatten(1).index_select(1, self.out_perm)
@@ -2137,11 +2153,8 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
     Scale each timing unit's CPG->timing weight column so its firing rate
     starts inside [lo, hi] spikes per cycle.
 
-    This is what `--timing_w_scale` used to be for, done by measurement
-    instead of by a user-supplied number.  It writes directly into
-    `w_in_gait` (it used to go through FiLM's gamma, which was only ever a
-    convenient handle -- and that gamma is gone now, being provably
-    absorbable into a free per-gait matrix).
+    Set by measurement rather than by a user-supplied scale factor.  Writes
+    directly into `w_in_gait`.
 
     HOW.  Rate is monotone non-decreasing in a unit's own gain: more input
     current can only add threshold crossings, never remove them.  So a
@@ -2158,9 +2171,9 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
     tonic drive, present during CPG silence too, so raising it manufactures
     activity that is unrelated to the CPG rhythm -- alive and uninformative.
     Scaling the weights amplifies whatever phase preference the unit already
-    has.  (The per-gait bias is still free to LEARN tonic drive, which under
-    event gating is how a unit fires between bursts at all; the point is only
-    that calibration should not be the thing that sets it.)
+    has.  (The per-gait bias is still free to LEARN tonic drive if the task
+    wants it; the point is only that calibration should not be the thing that
+    sets it.)
 
     WHY IT CAN STILL FAIL.  Gain cannot fix a wrong sign.  If a unit's net
     input current is negative, multiplying by a larger positive gain moves it
@@ -2457,7 +2470,7 @@ class CPGMatchSpikeObjective(SpikeObjective):
             the surrogate gradient, so this is differentiable as written.
             One-sided because a burst tighter than the CPG's is not a problem.
 
-    KNOWN LIMITATION (todo item 10): R uses the fundamental only, so two
+    KNOWN LIMITATION: R uses the fundamental only, so two
     bursts at opposite phases cancel to R ~ 0 and are punished as hard as
     spikes smeared uniformly.  Correct for gaits where each leg swings once
     per cycle; wrong for a genuinely two-burst gait.
@@ -3195,11 +3208,9 @@ def plot_reconstruction(model, spikes, targets, valid, device,
     Free-run the network on held-out steps, one plot per gait.
 
     `gait_names`, `leg_cols`, `n_joints` are required, explicit parameters —
-    this used to read GAIT_NAMES / LEG_COLS / N_JOINTS off the module, which
-    broke the moment a run could be quadruped OR hexapod: the module
-    constants are the quadruped layout only (see default_leg_layout), and a
-    hexapod run silently plotted under the wrong legend would be worse than
-    an import error.
+    the layout is passed in rather than read off the module constants, which
+    are the quadruped layout only (see default_leg_layout). A hexapod run
+    silently plotted under the wrong legend would be worse than an error.
 
     `leg_cols` may have any number of equal-size groups (not just 4 groups
     of 2) -- the subplot grid below sizes itself from len(leg_cols) and the
@@ -3579,13 +3590,13 @@ def main():
                          "per_joint: one per output column (n_joints units). "
                          "Independent of --n_cpg_neurons — the timing layer "
                          "is densely driven by all CPG spikes, so the counts "
-                         "need not match. Replaces --n_timing, which said the "
-                         "same thing as a bare integer that also silently "
-                         "fixed the sub-network count.")
-    ap.add_argument("--decoder_shape", type=str, default="per_leg",
+                         "need not match.")
+    ap.add_argument("--decoder_shape", type=str, default=None,
                     choices=list(STRUCTURE_SHAPES),
                     help="[timing_grouped] Structure of the angle decoders, "
-                         "i.e. the disconnected sub-networks. per_leg: one "
+                         "i.e. the disconnected sub-networks. Default None = "
+                         "match --timing_shape, which gives one decoder per "
+                         "timing unit and a fan-in of K=1. per_leg: one "
                          "sub-network per leg, each emitting that leg's "
                          "columns (3 joints on the hexapod). per_joint: one "
                          "per column, emitting a single angle. Combined with "
@@ -3649,18 +3660,29 @@ def main():
     ap.add_argument("--hidden_reset", type=str, default="subtract",
                         choices=["zero", "subtract"],
                         help="[timing_grouped] Membrane reset for the hidden "
-                             "layer. 'zero' matches the CPG (LIFGeneralArray does "
-                             "v[spike]=0). With 'subtract' the residual "
-                             "mem-thresh can still exceed threshold, so the unit "
-                             "re-fires on the SILENT steps between CPG spikes: "
-                             )
+                             "layer. 'subtract' (default) leaves the residual "
+                             "mem-thresh, which can still exceed threshold, so "
+                             "a strongly-driven unit re-fires on the SILENT "
+                             "steps after a timing spike. That converts "
+                             "injection MAGNITUDE into a spike COUNT spread "
+                             "over the following steps, which is a real "
+                             "expansion of what layer 1 can represent, and it "
+                             "measured slightly better on RMSE. "
+                             "'zero' matches the CPG (LIFGeneralArray does "
+                             "v[spike]=0) and caps each unit at one spike per "
+                             "timing spike, which closes one of the two "
+                             "natural-gating leaks (see NATURAL GATING in "
+                             "TimingGroupedSNN's docstring) at the cost of "
+                             "that expansion; alignment came out similar, RMSE "
+                             "slightly worse.")
     ap.add_argument("--timing_slope", type=float, default=5.0,
                     help="[timing_grouped] Surrogate-gradient slope for the "
                          "TIMING layer only; --slope still applies to the "
                          "sub-networks. The surrogate "
-                         "derivative is 1/(slope*|x|+1)^2, so at slope=25 a "
-                         "unit a few units below threshold is nearly "
-                         "invisible to gradients. This is the layer where "
+                         "derivative is 1/(slope*|x|+1)^2, so at the "
+                         "sub-networks' default of 25 a unit a few units below "
+                         "threshold is nearly invisible to gradients. This is "
+                         "the layer where "
                          "a dead unit is catastrophic rather than merely "
                          "wasteful (it cuts off a whole sub-network), so it "
                          "gets a wider (gentler) surrogate by default.")
@@ -3688,16 +3710,16 @@ def main():
                          "decaying between cycles, so the unit accumulates "
                          "and fires continuously instead of once per cycle. "
                          "Taus stay learnable, so this is an init range, not "
-                         "a cap; raise it if you want to test the "
-                         "hold-across-the-cycle hypothesis directly.")
+                         "a cap; raise it to test whether a sub-network can "
+                         "usefully hold its output across a whole cycle.")
     ap.add_argument("--calibrate_gains", type=int, default=1,
                     help="[timing_grouped] 1 = before training, bisect each "
                          "timing unit's CPG->timing weight column until its "
                          "firing rate lands within a factor of 2 of the CPG's "
                          "own spikes-per-cycle (measured at startup, so there "
                          "is no band to configure). Forward passes only, a "
-                         "second of compute, and it is why there is no "
-                         "--timing_w_scale to guess at. 0 = skip.")
+                         "second of compute, so there is no scale factor to "
+                         "guess at. 0 = skip.")
     ap.add_argument("--calibrate_per_gait", type=int, default=1,
                     help="[timing_grouped, needs --calibrate_gains 1] 1 = "
                          "bisect a separate gain for every (gait, unit) pair, "
@@ -3721,17 +3743,21 @@ def main():
                          "layer's spike train. "
                          "'min_count' (default): pay a flat L1 cost per spike "
                          "and let the TASK loss decide where spikes are worth "
-                         "spending — with --gate_mode decay/freeze this yields an "
-                         "adaptive sampling clock (dense through swing, sparse "
-                         "through stance) with no supervision. "
+                         "spending. The intended result is an adaptive "
+                         "sampling clock (dense through swing, sparse through "
+                         "stance) with no supervision. Note it needs the "
+                         "output to depend on the spike train ALONE to mean "
+                         "anything -- see NATURAL GATING in TimingGroupedSNN's "
+                         "docstring. "
                          "'cpg_match': match the CPG's spikes-per-cycle and "
                          "burst tightness; produces clean CPG-like bursts but "
-                         "conflicts with event gating, since it wants every "
-                         "spike at one phase. "
+                         "conflicts with min_count's premise, since it wants "
+                         "every spike at one phase rather than wherever the "
+                         "output must change. "
                          "'none': unconstrained. "
                          "New strategies: subclass SpikeObjective, set a "
                          "`name`, and it appears here automatically.")
-    ap.add_argument("--spike_stats_lambda", type=float, default=0.005,
+    ap.add_argument("--spike_stats_lambda", type=float, default=0.0,
                     help="[timing_grouped] Weight on the chosen spike "
                          "objective. For 'min_count' the penalty IS the duty "
                          "cycle, so this reads directly as the loss cost of a "
@@ -3778,28 +3804,22 @@ def main():
                          "because it keeps the bias out of the per-spike "
                          "injection, whose magnitude is what causes the jerk. "
                          "See BIAS MODES in TimingGroupedSNN's docstring.")
-    ap.add_argument("--gate_mode", type=str, default="decay",
-                    choices=["none", "decay", "freeze"],
-                    help="[timing_grouped] How much a sub-network may do "
-                         "without a spike from its own timing neuron. "
-                         "'none': ungated -- biases flow every step, so the "
-                         "task loss is EXACTLY invariant to the timing layer's "
-                         "burst phase and alignment cannot emerge. "
-                         "'decay': input and sub-net spikes gated, membranes "
-                         "still leak every step -- the output can still be "
-                         "reconstructed from one injection by a sum of "
-                         "decaying exponentials (~183 steps of usable coast "
-                         "measured), so spike placement matters only weakly. "
-                         "'freeze' (default): nothing moves without a spike; "
-                         "the output is HELD and the accumulated leak is "
-                         "applied as beta**since_upd at the next update. That "
-                         "makes the state at each update identical to per-step "
-                         "decay, so it is a pure zero-order hold on the "
-                         "OUTPUT, and it is the form that permits genuinely "
-                         "sparse updates at deployment. Only viable with "
-                         "--fake_cpg, since the real CPG's inter-burst "
-                         "silences would hold a stale output for a third of "
-                         "the cycle.")
+    ap.add_argument("--gate_mode", type=str, default="none",
+                    choices=["none", "decay"],
+                    help="[timing_grouped] Whether to gate the sub-networks "
+                         "on their own timing spikes explicitly. "
+                         "'none' (default): no explicit gate. With "
+                         "--bias_mode voltage the sub-networks receive current "
+                         "only on a timing spike anyway, so most hidden units "
+                         "cannot fire without one -- see NATURAL GATING in "
+                         "TimingGroupedSNN's docstring. "
+                         "'decay': input and sub-net spikes explicitly gated, "
+                         "membranes still leak every step. Forces the "
+                         "spike-train-only property instead of relying on it, "
+                         "and strengthens the gradient into the timing layer, "
+                         "but caps each hidden unit at one spike per timing "
+                         "spike and so discards the magnitude-to-count "
+                         "expansion that subtractive reset provides.")
     ap.add_argument("--sub_film", type=str, default="both",
                     choices=["none", "l1", "l2", "both"],
                     help="[timing_grouped] Which sub-network layers get "
@@ -3826,8 +3846,7 @@ def main():
                          "has exactly two possible values and LN normalises "
                          "away the amplitude of the sole drive it gets, "
                          "leaving FiLM gamma to put it back. Dropping it also "
-                         "saves LN's retained tensors per timestep. Set "
-                         "'both' to restore the old behaviour.")
+                         "saves LN's retained tensors per timestep.")
 
     ap.add_argument("--hidden",     type=int,   default=128,
                     help="Hidden width. For --arch dense this is the TOTAL "
@@ -3940,8 +3959,8 @@ def main():
     print(f"Arch   : {args.arch}\n")
 
     # ── 0. Gait tables + leg layout ───────────────────────────────
-    # Resolved before the CPG run and before --n_timing's default, since
-    # both depend on n_joints / n_legs, which depend on what got loaded.
+    # Resolved before the CPG run and before the timing/decoder shapes, since
+    # those depend on n_joints / n_legs, which depend on what got loaded.
     print("[0/6] Gait tables ...")
     gaits_dir = Path(this_file_dir + "/" + args.gaits_dir)
     if args.gaits is not None:
@@ -3965,7 +3984,7 @@ def main():
     if len(gait_tables_orig) == args.max_gaits:
         print(f"      NOTE: n_gaits ({len(gait_tables_orig)}) == max_gaits "
               f"({args.max_gaits}) — zero headroom to add a gait later "
-              f"without invalidating this checkpoint (todo item 1).")
+              f"without invalidating this checkpoint.")
 
     if args.leg_cols is not None:
         leg_cols = [list(c) for c in json.loads(args.leg_cols)]
@@ -3985,6 +4004,11 @@ def main():
           f"source={layout_src}  leg_cols={leg_cols}")
 
     if args.arch == "timing_grouped":
+        # None means "same as the timing layer", i.e. one decoder per timing
+        # unit and K=1. Resolved onto args itself so the config dump records
+        # the shape that actually ran rather than a null.
+        if args.decoder_shape is None:
+            args.decoder_shape = args.timing_shape
         timing_cols = build_partition(args.timing_shape, leg_cols, n_joints,
                                       what="--timing_shape")
         group_cols  = build_partition(args.decoder_shape, leg_cols, n_joints,
@@ -4172,31 +4196,24 @@ def main():
               f"-> {n_dec} x ({args.decoder_shape}) "
               f"[{fan_in} -> {args.hidden} -> {args.hidden} -> "
               f"readout({args.readout_hidden}) -> {len(group_cols[0])}], "
-              f"no cross talk (todo 3a)")
+              f"no cross talk between sub-networks")
         print(f"      timing reset={args.timing_reset}  "
               f"sub_film={args.sub_film}  sub_ln={args.sub_ln}  "
               f"gate_mode={args.gate_mode}  bias_mode={args.bias_mode}")
-        if args.gate_mode == "freeze":
-            print(f"      gate_mode=freeze: sub-networks are BIT-FOR-BIT "
-                  f"unchanged on silent steps and the output is HELD; the "
-                  f"accumulated leak is applied as beta**since_upd at the next "
-                  f"update, so the output is a pure zero-order hold.")
-            if not args.fake_cpg:
-                print(f"      WARNING: gate_mode=freeze without --fake_cpg. The "
-                      f"real CPG has long inter-burst silences, so a frozen "
-                      f"sub-network will hold a stale output across a large "
-                      f"fraction of the cycle.")
         if args.gate_mode == "decay":
-            print(f"      event gating ON: each sub-network advances only on "
-                  f"its own timing spike; membranes still decay, so the "
-                  f"output relaxes toward b_out in between — which is what "
-                  f"makes spike placement visible to the task loss.")
-        if args.gate_mode != "none" and args.spike_objective == "cpg_match":
-            print(f"      WARNING: --spike_objective cpg_match wants every "
-                  f"spike at ONE cycle phase, while event gating needs spikes "
-                  f"wherever the output must change. These two pull in "
-                  f"opposite directions; 'min_count' is the matching "
-                  f"objective for a gated network.")
+            print(f"      explicit gating ON: each sub-network is injected "
+                  f"only on its own timing spike, and its spikes are "
+                  f"suppressed in between; membranes still decay.")
+        elif args.bias_mode == "voltage":
+            print(f"      natural gating: no explicit gate, but voltage-mode "
+                  f"bias means the sub-networks are driven only on timing "
+                  f"spikes. Run check_bias_voltage.py to see which units can "
+                  f"still fire without one (film beta is the remaining path).")
+        if args.spike_objective == "cpg_match":
+            print(f"      NOTE --spike_objective cpg_match wants every spike "
+                  f"at ONE cycle phase, whereas the sub-networks need spikes "
+                  f"wherever the output must change. 'min_count' is the "
+                  f"objective that lets the task loss place them.")
         print(f"      group -> gait-table cols : " +
               "  ".join(f"g{i}={grp}" for i, grp in enumerate(group_cols)))
         for k, v in model.param_breakdown().items():
@@ -4224,7 +4241,7 @@ def main():
               f"max_gaits={args.max_gaits}")
         print(f"               (the shared-router alternative produced "
               f"near-identical timing phases across gaits and was reverted — "
-              f"see the TimingGroupedSNN docstring and todo item 11)")
+              f"see the TimingGroupedSNN docstring)")
     print(f"      tau range [{args.tau_min:.0f}, {args.tau_max:.0f}] steps "
           f"vs CPG period {period:.0f}")
     if args.tau_max < period:
@@ -4266,7 +4283,7 @@ def main():
         # start high and let the L1 term prune downward.
         if args.gate_mode != "none" and args.spike_objective == "min_count":
             band_lo, band_hi = 2.0 * cpg_rate, 8.0 * cpg_rate
-            print(f"      (event-gated + min_count: calibrating to "
+            print(f"      (gated + min_count: calibrating to "
                   f"{band_lo:.0f}-{band_hi:.0f} spk/cyc, well above the CPG's "
                   f"{cpg_rate:.1f}, so the network starts able to render the "
                   f"waveform and prunes from there)")
