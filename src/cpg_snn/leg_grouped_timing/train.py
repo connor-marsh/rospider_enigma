@@ -3978,7 +3978,7 @@ def main():
     # training
     ap.add_argument("--epochs",           type=int,   default=100)
     ap.add_argument("--chunks_per_epoch", type=int,   default=40)
-    ap.add_argument("--val_chunks",       type=int,   default=2)
+    ap.add_argument("--val_chunks",       type=int,   default=8)
     ap.add_argument("--bptt",             type=int,   default=None,
                     help="Gradient truncation horizon. NOT the network's "
                          "receptive field -- state is carried and detached "
