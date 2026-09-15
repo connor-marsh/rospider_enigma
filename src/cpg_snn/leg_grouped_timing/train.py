@@ -4737,8 +4737,12 @@ def main():
         print("\n[7/7] Timing-layer visualisation ...")
         try:
             from visualize_timing import default_args, run_visualization
+            # recon=0: phase 6 above has already written recon_*.png and
+            # transition.png with this run's --recon_cycles, so regenerating
+            # them here would be duplicate work. Run visualize_timing.py by
+            # hand with --recon 1 to re-plot an existing checkpoint.
             run_visualization(out_dir, out_dir,
-                              default_args(gaits_dir=args.gaits_dir))
+                              default_args(gaits_dir=args.gaits_dir, recon=0))
         except Exception as e:
             # Never let plotting lose a finished run: the checkpoint, config
             # and metrics are already on disk by this point.
