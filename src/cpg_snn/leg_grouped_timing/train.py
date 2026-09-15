@@ -42,7 +42,9 @@ What changed vs. the previous (conductance-based CPG + event-window) version
     while slightly improving step time and memory, so they were removed.
     See git history before the removal commit to reproduce that test.
 
-4.  `--arch dense` (StatefulSNN): fully connected.
+4.  `--arch dense` (DenseSNN): fully connected. Kept as the ablation
+    baseline, and it accepts the same feature flags as the grouped model
+    so the comparison isolates the factorisation.
     Every CPG spike reaches every hidden unit, both hidden layers are
     dense, and the readout maps the whole hidden state to all 8 joints.
 
@@ -1175,7 +1177,7 @@ def init_beta_logit(shape, tau_min, tau_max, generator=None):
     return torch.log(beta / (1.0 - beta))
 
 
-class StatefulSNN(nn.Module):
+class DenseSNN(nn.Module):
     """
     Input  : n_neurons binary CPG spikes per timestep  (nothing else)
     Gait   : integer index, used only for FiLM conditioning
@@ -1227,7 +1229,22 @@ class StatefulSNN(nn.Module):
     checkpoint trained on 4 gaits loads into a run using 8.  Embedding
     lookup is O(1) in table size, so spare rows cost file size only.
 
-    State (all (B, H)): mem1, mem2, memo.
+    State: mem1, mem2 are (B, H); memo is (B, Ho), which equals H unless
+    --readout_hidden narrows it.
+
+    Shared options with TimingGroupedSNN
+    ------------------------------------
+    readout_hidden, tau_readout_max, bias_mode, hidden_reset, sub_ln and
+    sub_film all mean exactly what they mean there, and are accepted here so
+    the dense ABLATION differs from the grouped model in the factorisation
+    and in nothing else. An ablation whose baseline also differs in
+    normalisation placement, bias parameterisation, readout width and reset
+    convention cannot isolate what it claims to test.
+
+    The defaults are the values this class used BEFORE the options existed --
+    readout_hidden=None meaning "as wide as hidden", tau_readout_max=40,
+    bias currents, subtractive reset, LayerNorm and FiLM on both layers -- so
+    an old checkpoint still reconstructs as what it actually ran.
     """
 
     # Consumed by export_onnx / config so neither has to branch on isinstance.
@@ -1237,14 +1254,33 @@ class StatefulSNN(nn.Module):
 
     def __init__(self, hidden=128, n_gaits=4, max_gaits=16,
                  tau_min=2.0, tau_max=256.0,
-                 slope=25.0, thresh=1.0, n_neurons=4, n_joints=N_JOINTS):
+                 slope=25.0, thresh=1.0, n_neurons=4, n_joints=N_JOINTS,
+                 readout_hidden=None, tau_readout_max=40.0,
+                 bias_mode="current", hidden_reset="subtract",
+                 sub_ln="both", sub_film="both"):
         super().__init__()
         if n_gaits > max_gaits:
             raise ValueError(
                 f"n_gaits ({n_gaits}) > max_gaits ({max_gaits}); raise "
                 f"--max_gaits. Note that changing max_gaits changes the FiLM "
                 f"parameter shape and so invalidates old checkpoints.")
+        for nm, val, ok in (("bias_mode", bias_mode,
+                             ("current", "voltage", "none")),
+                            ("hidden_reset", hidden_reset,
+                             ("subtract", "zero")),
+                            ("sub_ln", sub_ln, ("none", "l1", "l2", "both")),
+                            ("sub_film", sub_film,
+                             ("none", "l1", "l2", "both"))):
+            if val not in ok:
+                raise ValueError(f"{nm} must be one of {ok}, got {val!r}")
         self.H         = hidden
+        # None = as wide as the hidden layers, which is what this class did
+        # before the option existed.
+        self.Ho        = int(readout_hidden) if readout_hidden else hidden
+        self.bias_mode    = bias_mode
+        self.hidden_reset = hidden_reset
+        self.sub_ln       = sub_ln
+        self.sub_film     = sub_film
         self.n_gaits   = n_gaits
         self.max_gaits = max_gaits
         self.slope     = slope
@@ -1260,73 +1296,105 @@ class StatefulSNN(nn.Module):
         # the magnitude matches the old design; LayerNorm follows anyway, so
         # this mostly sets the gradient scale.
         self.w_in   = nn.Parameter(torch.randn(n_neurons, hidden) * 0.8)
-        self.b1     = nn.Parameter(torch.zeros(hidden))
         self.ln1    = nn.LayerNorm(hidden)
 
         # ── layer 2 ───────────────────────────────────────────────
         self.w2     = nn.Parameter(torch.randn(hidden, hidden) / math.sqrt(hidden))
-        self.b2     = nn.Parameter(torch.zeros(hidden))
         self.ln2    = nn.LayerNorm(hidden)
 
         # ── readout: non-spiking leaky membrane, then joint angles ─
-        self.w_read = nn.Parameter(torch.randn(hidden, hidden) / math.sqrt(hidden))
-        self.b_read = nn.Parameter(torch.zeros(hidden))
-        self.w_out  = nn.Parameter(torch.randn(hidden, n_joints) / math.sqrt(hidden))
+        Ho = self.Ho
+        self.w_read = nn.Parameter(torch.randn(hidden, Ho) / math.sqrt(hidden))
+        self.w_out  = nn.Parameter(torch.randn(Ho, n_joints) / math.sqrt(Ho))
         self.b_out  = nn.Parameter(torch.zeros(n_joints))
+
+        # ── bias: additive current, or an offset to the threshold ─
+        # b_read has no voltage equivalent (memo is analog and never spikes,
+        # so there is no threshold to offset); it is dropped outside "current"
+        # mode and b_out carries the output offset, which is added to y rather
+        # than to a membrane and so is not a bias current in the sense that
+        # matters.
+        if bias_mode == "current":
+            self.b1     = nn.Parameter(torch.zeros(hidden))
+            self.b2     = nn.Parameter(torch.zeros(hidden))
+            self.b_read = nn.Parameter(torch.zeros(Ho))
+        elif bias_mode == "voltage":
+            self.v1 = nn.Parameter(torch.zeros(hidden))
+            self.v2 = nn.Parameter(torch.zeros(hidden))
 
         # ── heterogeneous, learnable time constants ───────────────
         self.beta1_logit = nn.Parameter(init_beta_logit((hidden,), tau_min, tau_max))
         self.beta2_logit = nn.Parameter(init_beta_logit((hidden,), tau_min, tau_max))
-        self.betao_logit = nn.Parameter(init_beta_logit((hidden,), 2.0, 40.0))
+        self.betao_logit = nn.Parameter(
+            init_beta_logit((self.Ho,), 2.0, float(tau_readout_max)))
 
         # ── FiLM: per-gait scale/shift, over-allocated ────────────
-        self.film1 = nn.Embedding(max_gaits, 2 * hidden)
-        self.film2 = nn.Embedding(max_gaits, 2 * hidden)
-        for e in (self.film1, self.film2):
-            nn.init.zeros_(e.weight)
-            e.weight.data[:, :hidden] = 1.0     # gamma := 1, beta := 0
+        if sub_film in ("l1", "both"):
+            self.film1 = nn.Embedding(max_gaits, 2 * hidden)
+        if sub_film in ("l2", "both"):
+            self.film2 = nn.Embedding(max_gaits, 2 * hidden)
+        for e in (getattr(self, "film1", None), getattr(self, "film2", None)):
+            if e is not None:
+                nn.init.zeros_(e.weight)
+                e.weight.data[:, :hidden] = 1.0   # gamma := 1, beta := 0
 
     # ---------------------------------------------------------------
     def init_state(self, batch, device, dtype=torch.float32):
-        """State is (mem1, mem2, memo) -- the three leaky membranes."""
-        z = lambda: torch.zeros(batch, self.H, device=device, dtype=dtype)
-        return (z(), z(), z())
+        """(mem1, mem2, memo). memo is Ho wide, which is H unless narrowed."""
+        z = lambda w: torch.zeros(batch, w, device=device, dtype=dtype)
+        return (z(self.H), z(self.H), z(self.Ho))
 
     def step(self, x, gait, state):
         """
         x     : (B, n_neurons) float — CPG spikes this timestep
         gait  : (B,) int64
-        state : 3-tuple (mem1, mem2, memo), each (B, H)
+        state : 3-tuple (mem1, mem2, memo); mem1/mem2 are (B, H) and
+                memo is (B, Ho)
 
         Feedforward within a timestep: spk1/spk2 are local, consumed by the
         next layer in the same step and never carried across steps.
         `addmm` folds each bias into its matmul, one kernel per layer.
         """
         mem1, mem2, memo = state
-
-        v1 = self.film1(gait)                              # (B, 2H)
-        v2 = self.film2(gait)
-        g1, f1 = v1[:, :self.H], v1[:, self.H:]
-        g2, f2 = v2[:, :self.H], v2[:, self.H:]
+        cur_bias = self.bias_mode == "current"
 
         # ---- layer 1 -------------------------------------------------
-        cur1  = torch.addmm(self.b1, x, self.w_in)
-        cur1  = self.ln1(cur1) * g1 + f1
+        cur1 = (torch.addmm(self.b1, x, self.w_in) if cur_bias
+                else x @ self.w_in)
+        if self.sub_ln in ("l1", "both"):
+            cur1 = self.ln1(cur1)
+        if self.sub_film in ("l1", "both"):
+            v1 = self.film1(gait)                          # (B, 2H)
+            cur1 = cur1 * v1[:, :self.H] + v1[:, self.H:]
         beta1 = torch.sigmoid(self.beta1_logit)
         mem1  = beta1 * mem1 + cur1
-        spk1  = spike_fn(mem1 - self.thresh, self.slope)
-        mem1  = mem1 - self.thresh * spk1
+        # Comparison threshold only: the reset below subtracts the fixed
+        # self.thresh, matching TimingGroupedSNN. Resetting by the offset
+        # threshold instead lets a unit that learns a low threshold fire
+        # easily AND reset by almost nothing, which runs away.
+        th1  = self.thresh - self.v1 if self.bias_mode == "voltage" else self.thresh
+        spk1 = spike_fn(mem1 - th1, self.slope)
+        mem1 = (mem1 * (1.0 - spk1) if self.hidden_reset == "zero"
+                else mem1 - self.thresh * spk1)
 
         # ---- layer 2 -------------------------------------------------
-        cur2  = torch.addmm(self.b2, spk1, self.w2)
-        cur2  = self.ln2(cur2) * g2 + f2
+        cur2 = (torch.addmm(self.b2, spk1, self.w2) if cur_bias
+                else spk1 @ self.w2)
+        if self.sub_ln in ("l2", "both"):
+            cur2 = self.ln2(cur2)
+        if self.sub_film in ("l2", "both"):
+            v2 = self.film2(gait)
+            cur2 = cur2 * v2[:, :self.H] + v2[:, self.H:]
         beta2 = torch.sigmoid(self.beta2_logit)
         mem2  = beta2 * mem2 + cur2
-        spk2  = spike_fn(mem2 - self.thresh, self.slope)
-        mem2  = mem2 - self.thresh * spk2
+        th2  = self.thresh - self.v2 if self.bias_mode == "voltage" else self.thresh
+        spk2 = spike_fn(mem2 - th2, self.slope)
+        mem2 = (mem2 * (1.0 - spk2) if self.hidden_reset == "zero"
+                else mem2 - self.thresh * spk2)
 
         # ---- analog readout -----------------------------------------
-        curo  = torch.addmm(self.b_read, spk2, self.w_read)
+        curo  = (torch.addmm(self.b_read, spk2, self.w_read) if cur_bias
+                 else spk2 @ self.w_read)
         betao = torch.sigmoid(self.betao_logit)
         memo  = betao * memo + curo
 
@@ -3203,7 +3271,8 @@ def plot_training_curves(hist, out_dir):
 @torch.no_grad()
 def plot_reconstruction(model, spikes, targets, valid, device,
                         out_dir, tgt_range, t0, gait_names, leg_cols, n_joints,
-                        n_steps=1200, warm=600):
+                        period=None, n_cycles=4.0, warm_cycles=2.0,
+                        n_steps=None, warm=None):
     """
     Free-run the network on held-out steps, one plot per gait.
 
@@ -3216,7 +3285,17 @@ def plot_reconstruction(model, spikes, targets, valid, device,
     of 2) -- the subplot grid below sizes itself from len(leg_cols) and the
     per-group column count, the same squeeze=False + hide-unused pattern
     plotting_utils.py already uses elsewhere in this repo.
+
+    The window is set in CPG CYCLES, not raw timesteps. The old fixed
+    n_steps=1200 was ~3.4 cycles at the real CPG's period of 352 but ~10 at
+    fake_cpg's 120, which squashed the traces to the point of being
+    unreadable. n_steps/warm still override for a caller wanting exact counts.
     """
+    if n_steps is None:
+        n_steps = int(round(n_cycles * float(period))) if period else 1200
+    if warm is None:
+        warm = int(round(warm_cycles * float(period))) if period else 600
+
     lo, hi = tgt_range
     scale, shift = (hi - lo) / 2.0, (hi + lo) / 2.0
     model.eval()
@@ -3420,7 +3499,19 @@ def build_model_from_cfg(cfg, device):
             sub_ln           = str(cfg_get(cfg, "sub_ln", "l2")),
             **common)
     else:
-        model = StatefulSNN(hidden=int(cfg_get(cfg, "hidden", 256)), **common)
+        # Fallbacks are what this class did BEFORE each option existed, so an
+        # old dense checkpoint reconstructs as what it actually ran:
+        # readout as wide as hidden, tau_readout_max 40, bias currents,
+        # subtractive reset, LayerNorm and FiLM on both layers.
+        model = DenseSNN(
+            hidden          = int(cfg_get(cfg, "hidden", 256)),
+            readout_hidden  = cfg_get(cfg, "readout_hidden"),
+            tau_readout_max = float(cfg_get(cfg, "tau_readout_max", 40.0)),
+            bias_mode       = str(cfg_get(cfg, "bias_mode", "current")),
+            hidden_reset    = str(cfg_get(cfg, "hidden_reset", "subtract")),
+            sub_ln          = str(cfg_get(cfg, "sub_ln", "both")),
+            sub_film        = str(cfg_get(cfg, "sub_film", "both")),
+            **common)
 
     return model.to(device), arch
 
@@ -3578,7 +3669,7 @@ def main():
     # architecture
     ap.add_argument("--arch", type=str, default="timing_grouped",
                     choices=["dense", "timing_grouped"],
-                    help="dense: StatefulSNN, one fully connected network. "
+                    help="dense: DenseSNN, one fully connected network. "
                          "timing_grouped: TimingGroupedSNN — CPG -> small "
                          "timing layer -> n_timing disconnected sub-networks, "
                          "one per timing neuron. Keep 'dense' runnable so A/B "
@@ -3642,7 +3733,7 @@ def main():
                          "passage is 0.71, and the bank spans [2, that], "
                          "giving units from near-perfect passage down to the "
                          "corner. Reproduces the value hardcoded in the "
-                         "original StatefulSNN almost exactly at the "
+                         "original DenseSNN almost exactly at the "
                          "quadruped period (254/2*pi = 40.4 vs 40.0), which "
                          "is why that number worked; it just did not "
                          "generalise to 352, where it should be ~56.")
@@ -3657,6 +3748,12 @@ def main():
                          "spikes per burst than the CPG has. That was the "
                          "cause of the observed over-firing AND the "
                          "too-tight-burst R values. Kept only for A/B.")
+    ap.add_argument("--recon_cycles", type=float, default=4.0,
+                    help="CPG cycles shown in each recon_<gait>.png. In cycles "
+                         "rather than timesteps so the plot stays readable "
+                         "whether the period is 352 (real CPG) or 120 "
+                         "(--fake_cpg); the old fixed 1200-step window was 10 "
+                         "cycles at the latter and unreadably dense.")
     ap.add_argument("--hidden_reset", type=str, default="subtract",
                         choices=["zero", "subtract"],
                         help="[timing_grouped] Membrane reset for the hidden "
@@ -4136,11 +4233,22 @@ def main():
             gate_mode=args.gate_mode, bias_mode=args.bias_mode,
             slope=args.slope, timing_slope=args.timing_slope).to(device)
     else:
-        model = StatefulSNN(hidden=args.hidden, n_gaits=len(gait_tables),
+        # The dense ABLATION. Every option below is shared with
+        # TimingGroupedSNN so the two differ in the factorisation and nothing
+        # else. NOTE on matched capacity: the dense hidden layer is H x H where
+        # the grouped model has G blocks of Hg x Hg, so at the same --hidden
+        # the dense model is G times smaller; scale --hidden by sqrt(G) to
+        # compare at equal parameter count.
+        model = DenseSNN(hidden=args.hidden, n_gaits=len(gait_tables),
                             max_gaits=args.max_gaits,
                             n_neurons=args.n_cpg_neurons,
-                            tau_min=args.tau_min, tau_max=args.tau_max,
-                            slope=args.slope, n_joints=n_joints).to(device)
+                         tau_min=args.tau_min, tau_max=args.tau_max,
+                         slope=args.slope, n_joints=n_joints,
+                         readout_hidden=args.readout_hidden,
+                         tau_readout_max=args.tau_readout_max,
+                         bias_mode=args.bias_mode,
+                         hidden_reset=args.hidden_reset,
+                         sub_ln=args.sub_ln, sub_film=args.sub_film).to(device)
 
     # ── Compile the single timestep, NOT forward() ────────────────
     # forward() loops over L (= --bptt, 256-512) timesteps in Python.
@@ -4381,7 +4489,8 @@ def main():
     rmse = plot_reconstruction(model, spikes, targets, valid, device,
                                out_dir, tgt_range, t0=t_eval,
                                gait_names=gait_names, leg_cols=leg_cols,
-                               n_joints=n_joints)
+                               n_joints=n_joints, period=period,
+                               n_cycles=args.recon_cycles)
     plot_transition(model, spikes, targets, device, out_dir, tgt_range,
                     t0=t_eval, gait_names=gait_names, leg_cols=leg_cols,
                     g_from=0, g_to=1)
@@ -4524,24 +4633,27 @@ def main():
                                  if args.arch == "timing_grouped" else None),
             "tau_timing_max":   (float(args.tau_timing_max)
                                  if args.arch == "timing_grouped" else None),
-            "sub_ln":           (args.sub_ln
-                                 if args.arch == "timing_grouped" else None),
+            # The six below apply to BOTH arches now that DenseSNN accepts
+            # them, so they are recorded unconditionally: a None here would
+            # make build_model_from_cfg fall back to a default and rebuild a
+            # dense checkpoint as something it never was.
+            "sub_ln":           str(args.sub_ln),
             "timing_layernorm": False,
-            "readout_hidden":   (int(args.readout_hidden)
-                                 if args.arch == "timing_grouped" else None),
-            "tau_readout_max":  (float(args.tau_readout_max)
-                                 if args.arch == "timing_grouped" else None),
+            "readout_hidden":   int(args.readout_hidden),
+            "tau_readout_max":  float(args.tau_readout_max),
             "timing_reset":     (args.timing_reset
                                  if args.arch == "timing_grouped" else None),
             "freeze_blocks":    (args.freeze_blocks or None),
-            "bias_mode":        (args.bias_mode
-                                 if args.arch == "timing_grouped" else None),
+            "bias_mode":        str(args.bias_mode),
             "gate_mode":        (args.gate_mode
                                  if args.arch == "timing_grouped" else None),
             "spike_objective":  (spike_obj.describe()
                                  if args.arch == "timing_grouped" else None),
-            "sub_film":         (args.sub_film
-                                 if args.arch == "timing_grouped" else None),
+            "sub_film":         str(args.sub_film),
+            # Was read by build_model_from_cfg but never written, so a
+            # --hidden_reset zero checkpoint silently reconstructed as
+            # "subtract" for EITHER architecture. Pre-existing bug.
+            "hidden_reset":     str(args.hidden_reset),
             "warm_steps":       warm_steps,
 
 
