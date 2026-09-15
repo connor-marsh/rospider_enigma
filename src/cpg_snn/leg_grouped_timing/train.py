@@ -3261,7 +3261,7 @@ def plot_training_curves(hist, out_dir):
             label="val (post-switch)")
     ax.set_xlabel("epoch"); ax.set_ylabel("masked MSE"); ax.set_yscale("log")
     ax.legend(); ax.grid(alpha=0.3)
-    ax.set_title("Stateful TBPTT training")
+    ax.set_title("TBPTT training")
     plt.tight_layout()
     p = out_path(out_dir, "training_curves.png")
     plt.savefig(p, dpi=140); plt.close()
