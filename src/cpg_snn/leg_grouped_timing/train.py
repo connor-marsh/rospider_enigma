@@ -1257,7 +1257,7 @@ class DenseSNN(nn.Module):
                  slope=25.0, thresh=1.0, n_neurons=4, n_joints=N_JOINTS,
                  readout_hidden=None, tau_readout_max=40.0,
                  bias_mode="current", hidden_reset="subtract",
-                 sub_ln="both", sub_film="both"):
+                 sub_ln="both", sub_film="both", film_mode="gamma_only"):
         super().__init__()
         if n_gaits > max_gaits:
             raise ValueError(
@@ -1281,6 +1281,7 @@ class DenseSNN(nn.Module):
         self.hidden_reset = hidden_reset
         self.sub_ln       = sub_ln
         self.sub_film     = sub_film
+        self.film_mode    = film_mode
         self.n_gaits   = n_gaits
         self.max_gaits = max_gaits
         self.slope     = slope
@@ -1365,7 +1366,11 @@ class DenseSNN(nn.Module):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
             v1 = self.film1(gait)                          # (B, 2H)
-            cur1 = cur1 * v1[:, :self.H] + v1[:, self.H:]
+            # See TimingGroupedSNN's film_mode note: gamma is multiplicative
+            # and vanishes with the injection, beta is tonic drive.
+            cur1 = cur1 * v1[:, :self.H]
+            if self.film_mode == "gamma_beta":
+                cur1 = cur1 + v1[:, self.H:]
         beta1 = torch.sigmoid(self.beta1_logit)
         mem1  = beta1 * mem1 + cur1
         # Comparison threshold only: the reset below subtracts the fixed
@@ -1384,7 +1389,9 @@ class DenseSNN(nn.Module):
             cur2 = self.ln2(cur2)
         if self.sub_film in ("l2", "both"):
             v2 = self.film2(gait)
-            cur2 = cur2 * v2[:, :self.H] + v2[:, self.H:]
+            cur2 = cur2 * v2[:, :self.H]
+            if self.film_mode == "gamma_beta":
+                cur2 = cur2 + v2[:, self.H:]
         beta2 = torch.sigmoid(self.beta2_logit)
         mem2  = beta2 * mem2 + cur2
         th2  = self.thresh - self.v2 if self.bias_mode == "voltage" else self.thresh
@@ -1627,10 +1634,16 @@ class TimingGroupedSNN(nn.Module):
     """
 
     arch = "timing_grouped"
+    # syn1/syn2/syno are the second-order synaptic currents. Allocated
+    # unconditionally, like the alpha logits and like the vestigial
+    # since_upd, so neither the state arity nor the exported ONNX signature
+    # depends on --synaptic. They stay exactly zero when synaptic="none".
     state_names_in  = ("mem_timing_in", "since_upd_in",
-                       "mem1_in",  "mem2_in",  "memo_in")
+                       "mem1_in",  "mem2_in",  "memo_in",
+                       "syn1_in",  "syn2_in",  "syno_in")
     state_names_out = ("mem_timing_out", "since_upd_out",
-                       "mem1_out", "mem2_out", "memo_out")
+                       "mem1_out", "mem2_out", "memo_out",
+                       "syn1_out", "syn2_out", "syno_out")
 
     def __init__(self, hidden_per_group=128, n_gaits=4, max_gaits=16,
                  n_neurons=4, n_timing=N_LEGS, group_cols=None,
@@ -1639,9 +1652,10 @@ class TimingGroupedSNN(nn.Module):
                  tau_min=2.0, tau_max=256.0,
                  tau_timing_min=2.0, tau_timing_max=64.0,
                  tau_readout_max=40.0,
-                 sub_ln="l2", sub_film="both",
+                 sub_ln="l2", sub_film="both", film_mode="gamma_only",
                  timing_reset="zero", hidden_reset="subtract", gate_mode="none",
-                 bias_mode="voltage",
+                 bias_mode="voltage", readout_gait_bias=True,
+                 synaptic="none", tau_syn_min=2.0, tau_syn_max=20.0,
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
         if n_gaits > max_gaits:
@@ -1656,6 +1670,12 @@ class TimingGroupedSNN(nn.Module):
         if timing_reset not in ("zero", "subtract"):
             raise ValueError(f"timing_reset must be zero|subtract, got "
                              f"{timing_reset!r}")
+        if film_mode not in ("gamma_only", "gamma_beta"):
+            raise ValueError(f"film_mode must be gamma_only|gamma_beta, got "
+                             f"{film_mode!r}")
+        if synaptic not in ("none", "hidden", "all"):
+            raise ValueError(f"synaptic must be none|hidden|all, got "
+                             f"{synaptic!r}")
 
         group_cols = (build_group_cols(n_timing, n_joints=n_joints)
                       if group_cols is None else
@@ -1722,6 +1742,8 @@ class TimingGroupedSNN(nn.Module):
         self.thresh     = thresh
         self.sub_ln     = sub_ln
         self.sub_film   = sub_film
+        self.film_mode  = film_mode
+        self.synaptic   = synaptic
         self.timing_reset = timing_reset
         self.hidden_reset = hidden_reset
         if gate_mode not in ("none", "decay"):
@@ -1852,6 +1874,83 @@ class TimingGroupedSNN(nn.Module):
             nn.init.zeros_(e.weight)
             e.weight.data[:, :G * Hg] = 1.0
 
+        # ── per-gait readout bias CURRENT ─────────────────────────
+        # A per-gait constant DC offset on the output, injected into `memo`
+        # rather than added to `y`.
+        #
+        # WHY IT IS NEEDED.  w_read, w_out, b_out, b1, b2 and b_read all have
+        # NO gait axis, so with film_mode="gamma_only" there is no per-gait
+        # constant anywhere in the sub-networks: every gait relaxes toward the
+        # same shared b_out between spikes.  Gaits that differ in MEAN joint
+        # angle rather than in waveform shape -- turning gaits, where the left
+        # and right legs sit at different average positions -- then have to
+        # express that offset through the spike RATE, since gamma can only
+        # scale the response to spikes.  That works (memo is an integrator, so
+        # level is proportional to rate) but it couples three things: raising
+        # the mean costs spikes, favours the positive-weight hidden units and
+        # so shrinks that gait's downward range, and leaves visible ripple,
+        # because `memo` LEAKS between spikes -- a level held at ~15 spk/cyc
+        # with tau_o 60 sags ~12% between consecutive spikes.
+        #
+        # WHY INTO memo AND NOT ONTO y.  Added to `y` it would step
+        # instantaneously when the gait index changes.  Injected as a current
+        # it is filtered by the readout's own tau, so the offset fades in over
+        # tau_o at a gait switch instead of jumping.
+        #
+        # WHY THIS DOES NOT REINTRODUCE THE PHASE DEGENERACY.  `memo` is
+        # analog and never spikes, so this cannot manufacture spike activity
+        # the way a bias current into a spiking layer can, and a CONSTANT
+        # contributes no time-varying basis -- it cannot absorb a shift in
+        # timing-spike phase the way tonic drive into mem1/mem2 could.  There
+        # is also no surrogate gradient on this path, so it cannot create the
+        # rate-dependent gradient that made film beta self-reinforcing.
+        #
+        # Created only when enabled, so a config written before this option
+        # existed reconstructs with no such parameter and no missing key.
+        self.readout_gait_bias = bool(readout_gait_bias)
+        if self.readout_gait_bias:
+            self.b_read_gait = nn.Embedding(max_gaits, G * Ho)
+            nn.init.zeros_(self.b_read_gait.weight)
+
+        # ── second-order synaptic filter (snnTorch `Synaptic`) ────
+        # An extra decaying state between the injection and the membrane:
+        #
+        #     syn = alpha * syn + injection
+        #     mem = beta  * mem + syn
+        #
+        # exactly snnTorch's Synaptic ordering (mem integrates the NEW syn).
+        # This is also Loihi's native CUBA neuron, which carries a synaptic
+        # current and a membrane voltage with separate decays -- so the
+        # second-order form is the standard neuromorphic model rather than an
+        # extension of it, and one instantaneous-injection LIF is the less
+        # standard choice.
+        #
+        # WHAT IT BUYS.  A single injection is spread over many timesteps
+        # instead of landing in one, which (a) reduces the size of the output
+        # step at each spike and (b) keeps hidden membranes near threshold for
+        # a WINDOW after a spike rather than a single step, so the surrogate
+        # gradient stays alive on silent steps and firing rates become
+        # learnable upward as well as downward. Both were things film beta was
+        # doing via tonic drive, except the filter decays to zero during
+        # genuine silence, so spike placement still matters.
+        #
+        # NOT a zero-slope start: because mem integrates the NEW syn, the
+        # membrane still moves on the spike step itself. The step is smaller,
+        # by the ratio of the filter's peak response to its initial one (~3.9x
+        # at alpha = beta = 0.9), not zero. Making mem integrate the PREVIOUS
+        # syn would give a true zero-slope start but would no longer match
+        # snnTorch.
+        #
+        # alpha logits are always allocated so the parameter set does not
+        # depend on the mode, matching how beta logits are handled; they
+        # receive no gradient when synaptic="none".
+        self.alpha1_logit = nn.Parameter(
+            init_beta_logit((G, Hg), tau_syn_min, tau_syn_max))
+        self.alpha2_logit = nn.Parameter(
+            init_beta_logit((G, Hg), tau_syn_min, tau_syn_max))
+        self.alphao_logit = nn.Parameter(
+            init_beta_logit((G, Ho), tau_syn_min, tau_syn_max))
+
         # ---------------------------------------------------------------
     @torch.no_grad()
     def clamp_bias_voltage(self):
@@ -1898,7 +1997,9 @@ class TimingGroupedSNN(nn.Module):
         # only so the exported ONNX signature keeps its arity and names.
         since = torch.zeros(batch, self.G, device=device, dtype=dtype)
         # memo is Ho wide, not Hg (see the readout comment in __init__).
-        return (mem_t, since, z(self.Hg), z(self.Hg), z(self.Ho))
+        # syn1/syn2/syno mirror mem1/mem2/memo: same shapes, one per layer.
+        return (mem_t, since, z(self.Hg), z(self.Hg), z(self.Ho),
+                z(self.Hg), z(self.Hg), z(self.Ho))
 
     # ---------------------------------------------------------------
     def _timing(self, x, gait, mem_t):
@@ -1944,7 +2045,8 @@ class TimingGroupedSNN(nn.Module):
         """
         x     : (B, n_neurons) float — CPG spikes this timestep
         gait  : (B,) int64
-        state : (mem_timing, since_upd, mem1, mem2, memo)
+        state : (mem_timing, since_upd, mem1, mem2, memo,
+                 syn1, syn2, syno)
 
         Returns (y, state, aux) where aux = (spk_timing,).
         `aux` exists so the spike-statistics penalty can see the spikes without
@@ -1952,7 +2054,7 @@ class TimingGroupedSNN(nn.Module):
         since spk_timing already feeds `y` it is in the graph regardless.  Kept
         as a 1-tuple so callers iterate over it uniformly.
         """
-        mem_t, since, mem1, mem2, memo = state
+        mem_t, since, mem1, mem2, memo, syn1, syn2, syno = state
         G, Hg = self.G, self.Hg
 
         spk_t, mem_t = self._timing(x, gait, mem_t)          # (B, T)
@@ -1998,6 +2100,22 @@ class TimingGroupedSNN(nn.Module):
         dec2 = torch.sigmoid(self.beta2_logit)
         deco = torch.sigmoid(self.betao_logit)
 
+        # Injection -> membrane, either first order (inject straight into the
+        # membrane) or second order (through a decaying synaptic current).
+        # Second order is snnTorch's `Synaptic`, whose ordering is
+        # syn = alpha*syn + cur  THEN  mem = beta*mem + syn, i.e. the membrane
+        # integrates the NEW syn. Written once here so the three layers cannot
+        # drift apart. Returns (mem, syn); syn is passed through unchanged in
+        # first-order mode so the state slot stays exactly zero.
+        def integrate(mem, syn, cur, dec, alpha_logit, second_order):
+            if not second_order:
+                return dec * mem + cur, syn
+            syn = torch.sigmoid(alpha_logit) * syn + cur
+            return dec * mem + syn, syn
+
+        syn_hidden  = self.synaptic in ("hidden", "all")
+        syn_readout = self.synaptic == "all"
+
         # ---- sub-net layer 1 ---------------------------------------
         # In "current" mode and gated, w1 and b1 are redundant (only their sum
         # enters). In "voltage" mode the bias has moved out of the injection
@@ -2016,11 +2134,20 @@ class TimingGroupedSNN(nn.Module):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
             v1 = self.film1(gait).view(-1, 2, G, Hg)
-            cur1 = cur1 * v1[:, 0] + v1[:, 1]
+            # gamma always; beta only in "gamma_beta". Gamma is multiplicative
+            # so it vanishes wherever the injection is zero, which is what
+            # keeps the layer naturally gated; beta is added on EVERY step
+            # regardless of spikes and is therefore tonic drive. The beta half
+            # of the table stays allocated either way so checkpoint shapes do
+            # not depend on the mode -- it simply receives no gradient in
+            # "gamma_only".
+            cur1 = cur1 * v1[:, 0]
+            if self.film_mode == "gamma_beta":
+                cur1 = cur1 + v1[:, 1]
         if gated:
             cur1 = gate * cur1
-        new1 = dec1 * mem1 + cur1
-        mem1 = new1
+        mem1, syn1 = integrate(mem1, syn1, cur1, dec1,
+                               self.alpha1_logit, syn_hidden)
         th1 = (self.thresh - self.v1 if self.bias_mode == "voltage"
                else self.thresh)
         spk1 = spike_fn(mem1 - th1, self.slope)
@@ -2039,11 +2166,13 @@ class TimingGroupedSNN(nn.Module):
             cur2 = self.ln2(cur2)
         if self.sub_film in ("l2", "both"):
             v2 = self.film2(gait).view(-1, 2, G, Hg)
-            cur2 = cur2 * v2[:, 0] + v2[:, 1]
+            cur2 = cur2 * v2[:, 0]
+            if self.film_mode == "gamma_beta":
+                cur2 = cur2 + v2[:, 1]
         if gated:
             cur2 = gate * cur2
-        new2 = dec2 * mem2 + cur2
-        mem2 = new2
+        mem2, syn2 = integrate(mem2, syn2, cur2, dec2,
+                               self.alpha2_logit, syn_hidden)
         th2 = (self.thresh - self.v2 if self.bias_mode == "voltage"
                else self.thresh)
         spk2 = spike_fn(mem2 - th2, self.slope)
@@ -2060,7 +2189,14 @@ class TimingGroupedSNN(nn.Module):
             curo = curo + self.b_read
         if gated:
             curo = gate * curo
-        memo = deco * memo + curo
+        if self.readout_gait_bias:
+            # AFTER the gate, deliberately: this is a DC offset, not an
+            # injection. Gating it would make the offset itself appear only on
+            # spike steps, which is the opposite of the point -- see the
+            # b_read_gait comment in __init__.
+            curo = curo + self.b_read_gait(gait).view(-1, G, self.Ho)
+        memo, syno = integrate(memo, syno, curo, deco,
+                               self.alphao_logit, syn_readout)
 
         # `since` is passed through untouched. It was the update counter for
         # the removed gate_mode="freeze"; the slot is retained only so the
@@ -2070,7 +2206,8 @@ class TimingGroupedSNN(nn.Module):
 
         y_grp = torch.einsum("bgh,ghc->bgc", memo, self.w_out) + self.b_out
         y     = y_grp.flatten(1).index_select(1, self.out_perm)
-        return y, (mem_t, since, mem1, mem2, memo), (spk_t,)
+        return (y, (mem_t, since, mem1, mem2, memo, syn1, syn2, syno),
+                (spk_t,))
 
     def forward(self, x_seq, gait_seq, state=None, return_aux=False):
         """
@@ -2125,10 +2262,14 @@ class TimingGroupedSNN(nn.Module):
             "timing":  n(self.w_in_gait.weight, self.beta_t_logit,
                          *(w.weight for w in (g("b_t"), g("v_t"))
                            if w is not None)),
-            "sub_l1":  n(self.w1, self.beta1_logit, g("b1"), g("v1")),
-            "sub_l2":  n(self.w2, self.beta2_logit, g("b2"), g("v2")),
+            "sub_l1":  n(self.w1, self.beta1_logit, self.alpha1_logit,
+                         g("b1"), g("v1")),
+            "sub_l2":  n(self.w2, self.beta2_logit, self.alpha2_logit,
+                         g("b2"), g("v2")),
             "readout": n(self.w_read, self.w_out, self.b_out,
-                         self.betao_logit, g("b_read")),
+                         self.betao_logit, self.alphao_logit, g("b_read"),
+                         *( [self.b_read_gait.weight]
+                            if self.readout_gait_bias else [] )),
             "sub_film": n(self.film1.weight, self.film2.weight),
         }
 
@@ -2150,7 +2291,7 @@ class SingleStepONNX(nn.Module):
 
 class SingleStepONNXTiming(nn.Module):
     """
-    As SingleStepONNX but for TimingGroupedSNN's 5-tensor state.
+    As SingleStepONNX but for TimingGroupedSNN's 8-tensor state.
 
     Written as an explicit signature rather than *state: torch.onnx.export
     traces varargs unreliably, and the input names have to line up
@@ -2161,10 +2302,12 @@ class SingleStepONNXTiming(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, spikes, gait, mem_timing, since_upd, mem1, mem2, memo):
-        y, (mt, su, m1, m2, mo), _ = self.model.step(
-            spikes, gait, (mem_timing, since_upd, mem1, mem2, memo))
-        return y, mt, su, m1, m2, mo
+    def forward(self, spikes, gait, mem_timing, since_upd, mem1, mem2, memo,
+                syn1, syn2, syno):
+        y, (mt, su, m1, m2, mo, s1, s2, so), _ = self.model.step(
+            spikes, gait, (mem_timing, since_upd, mem1, mem2, memo,
+                           syn1, syn2, syno))
+        return y, mt, su, m1, m2, mo, s1, s2, so
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2871,9 +3014,11 @@ def grad_blocks(model):
     rules = (
         ("timing",    ("w_in_gait", "b_t", "beta_t_logit")),
         ("input",     ("w_in",)),                    # dense arch only
-        ("sub_l1",    ("w1", "b1", "beta1_logit")),
-        ("sub_l2",    ("w2", "b2", "beta2_logit")),
-        ("readout",   ("w_read", "b_read", "w_out", "b_out", "betao_logit")),
+        ("sub_l1",    ("w1", "b1", "beta1_logit", "alpha1_logit")),
+        ("sub_l2",    ("w2", "b2", "beta2_logit", "alpha2_logit")),
+        # "b_read" also prefix-matches "b_read_gait", which belongs here too.
+        ("readout",   ("w_read", "b_read", "w_out", "b_out", "betao_logit",
+                       "alphao_logit")),
         ("sub_film",  ("film1", "film2")),
         ("layernorm", ("ln1", "ln2")),
     )
@@ -3486,6 +3631,15 @@ def build_model_from_cfg(cfg, device):
             timing_reset     = str(cfg_get(cfg, "timing_reset", "subtract")),
             hidden_reset     = str(cfg_get(cfg, "hidden_reset", "subtract")),
             sub_film         = str(cfg_get(cfg, "sub_film", "both")),
+            # Each fallback is what the code did BEFORE the option existed,
+            # not its current default: film beta WAS applied, there was no
+            # per-gait readout bias (so the parameter is not created and no
+            # key goes missing), and the synapse was first order.
+            film_mode        = str(cfg_get(cfg, "film_mode", "gamma_beta")),
+            readout_gait_bias = bool(cfg_get(cfg, "readout_gait_bias", 0)),
+            synaptic         = str(cfg_get(cfg, "synaptic", "none")),
+            tau_syn_min      = float(cfg_get(cfg, "tau_syn_min", 2.0)),
+            tau_syn_max      = float(cfg_get(cfg, "tau_syn_max", 20.0)),
             # gate_mode replaced the old boolean event_gated. Map the old
             # key when only it is present: True was the "decay" behaviour
             # (membranes leak every step), and absent entirely means ungated.
@@ -3511,6 +3665,7 @@ def build_model_from_cfg(cfg, device):
             hidden_reset    = str(cfg_get(cfg, "hidden_reset", "subtract")),
             sub_ln          = str(cfg_get(cfg, "sub_ln", "both")),
             sub_film        = str(cfg_get(cfg, "sub_film", "both")),
+            film_mode       = str(cfg_get(cfg, "film_mode", "gamma_beta")),
             **common)
 
     return model.to(device), arch
@@ -3933,6 +4088,80 @@ def main():
                          "concentration to the CPG's values for every gait "
                          "and so leaves PHASE as the only axis able to carry "
                          "gait — run it with --spike_stats_lambda 0 first.")
+    ap.add_argument("--film_mode", type=str, default="gamma_only",
+                    choices=["gamma_only", "gamma_beta"],
+                    help="Which halves of the FiLM tables are applied. "
+                         "'gamma_only' (default): multiplicative modulation "
+                         "only. Gamma vanishes wherever the injection is "
+                         "zero, so per-gait conditioning is retained WITHOUT "
+                         "any tonic drive -- this is what makes the "
+                         "sub-networks fully naturally gated (see NATURAL "
+                         "GATING in TimingGroupedSNN's docstring), and it is "
+                         "strictly better than --sub_film none, which would "
+                         "drop per-gait conditioning of layer 1 entirely "
+                         "(w1/w2 have no gait axis, so FiLM is the only "
+                         "per-gait handle there). "
+                         "'gamma_beta': also apply the additive beta, the "
+                         "behaviour before this option existed. Beta is added "
+                         "on every timestep whether or not anything spiked, "
+                         "so it is tonic drive: it smooths the output and "
+                         "keeps hidden membranes near threshold, but it also "
+                         "makes the task loss insensitive to timing-spike "
+                         "phase. The beta half of the table is allocated in "
+                         "both modes, so checkpoint shapes are unaffected; in "
+                         "gamma_only it simply gets no gradient.")
+    ap.add_argument("--readout_gait_bias", type=int, default=1,
+                    help="[timing_grouped] 1 = a learned per-gait constant "
+                         "CURRENT into the readout membrane. Everything else "
+                         "in the sub-networks (w_read, w_out, b_out, b1, b2, "
+                         "b_read) is gait-shared, so with --film_mode "
+                         "gamma_only there is otherwise no per-gait DC "
+                         "anywhere and every gait relaxes toward the same "
+                         "output offset. Gaits that differ in MEAN joint "
+                         "angle rather than waveform shape would then have to "
+                         "buy that offset with spike RATE, which costs spikes, "
+                         "shrinks the gait's downward range, and leaves "
+                         "inter-spike ripple. Injected as a current rather "
+                         "than added to y so it is filtered by the readout's "
+                         "own tau and fades in over a gait switch instead of "
+                         "stepping. Does not reintroduce phase invariance: "
+                         "memo is analog, never spikes, and a constant "
+                         "supplies no time-varying basis. 0 = off, which is "
+                         "also what configs predating this option "
+                         "reconstruct as.")
+    ap.add_argument("--synaptic", type=str, default="none",
+                    choices=["none", "hidden", "all"],
+                    help="Second-order synaptic filter, matching snnTorch's "
+                         "`Synaptic` neuron: syn = alpha*syn + injection, then "
+                         "mem = beta*mem + syn. 'none' (default): first-order, "
+                         "injection goes straight into the membrane. 'hidden': "
+                         "sub-net layers 1 and 2. 'all': those plus the analog "
+                         "readout membrane, which is where the output jolt "
+                         "actually lands. Spreading one injection over many "
+                         "timesteps shrinks the output step at each spike and "
+                         "keeps hidden membranes near threshold for a WINDOW "
+                         "after a spike, so firing rates stay learnable "
+                         "upward -- both things film beta was providing via "
+                         "tonic drive, except the filter decays to zero during "
+                         "real silence, so spike placement still matters. This "
+                         "is Loihi's native CUBA neuron (synaptic current plus "
+                         "membrane voltage, separate decays), so it is the "
+                         "standard neuromorphic model rather than a departure "
+                         "from it. Costs one extra state tensor per layer.")
+    ap.add_argument("--tau_syn_min", type=float, default=2.0,
+                    help="[--synaptic] Tau init floor for the synaptic "
+                         "current.")
+    ap.add_argument("--tau_syn_max", type=float, default=None,
+                    help="[--synaptic] Tau init ceiling for the synaptic "
+                         "current. Default None = period/16 (7.5 steps at the "
+                         "fake CPG's 120, 22 at the real 352), chosen so one "
+                         "spike's effect is spread over a short window "
+                         "relative to the cycle rather than smeared across it "
+                         "-- the filter is meant to smooth the injection, not "
+                         "to become the memory, which is mem1/mem2's job at "
+                         "--tau_max. A GUESS, not a derived value; taus stay "
+                         "learnable so this is only an init range, and it is "
+                         "worth sweeping.")
     ap.add_argument("--sub_ln", type=str, default="l2",
                     choices=["none", "l1", "l2", "both"],
                     help="[timing_grouped] Which sub-network layers get "
@@ -4161,6 +4390,13 @@ def main():
         args.tau_timing_max = float(period) / float(args.n_cpg_neurons)
         print(f"      tau_timing_max : {args.tau_timing_max:6.1f}  (timing "
               f"layer; one inter-burst gap = period/{args.n_cpg_neurons})")
+    if args.tau_syn_max is None:
+        # A short window relative to the cycle: the synaptic filter is meant
+        # to smooth the injection, not to hold memory (that is mem1/mem2 at
+        # tau_max). Learnable, so this is an init range only.
+        args.tau_syn_max = float(period) / 16.0
+        print(f"      tau_syn_max    : {args.tau_syn_max:6.1f}  (synaptic "
+              f"current; period/16 — a guess, worth sweeping)")
     if args.tau_readout_max is None:
         # Corner frequency of a leaky integrator at the gait fundamental.
         # Much shorter than tau_max on purpose: memo RENDERS the current
@@ -4229,8 +4465,12 @@ def main():
             tau_timing_max=args.tau_timing_max,
             tau_readout_max=args.tau_readout_max,
             sub_ln=args.sub_ln, sub_film=args.sub_film,
+            film_mode=args.film_mode,
             timing_reset=args.timing_reset, hidden_reset=args.hidden_reset,
             gate_mode=args.gate_mode, bias_mode=args.bias_mode,
+            readout_gait_bias=bool(args.readout_gait_bias),
+            synaptic=args.synaptic,
+            tau_syn_min=args.tau_syn_min, tau_syn_max=args.tau_syn_max,
             slope=args.slope, timing_slope=args.timing_slope).to(device)
     else:
         # The dense ABLATION. Every option below is shared with
@@ -4248,7 +4488,8 @@ def main():
                          tau_readout_max=args.tau_readout_max,
                          bias_mode=args.bias_mode,
                          hidden_reset=args.hidden_reset,
-                         sub_ln=args.sub_ln, sub_film=args.sub_film).to(device)
+                         sub_ln=args.sub_ln, sub_film=args.sub_film,
+                         film_mode=args.film_mode).to(device)
 
     # ── Compile the single timestep, NOT forward() ────────────────
     # forward() loops over L (= --bptt, 256-512) timesteps in Python.
@@ -4308,6 +4549,12 @@ def main():
         print(f"      timing reset={args.timing_reset}  "
               f"sub_film={args.sub_film}  sub_ln={args.sub_ln}  "
               f"gate_mode={args.gate_mode}  bias_mode={args.bias_mode}")
+        print(f"      film_mode={args.film_mode}  "
+              f"readout_gait_bias={bool(args.readout_gait_bias)}  "
+              f"synaptic={args.synaptic}"
+              + (f" (tau_syn init [{args.tau_syn_min:.0f}, "
+                 f"{args.tau_syn_max:.0f}])" if args.synaptic != "none"
+                 else ""))
         if args.gate_mode == "decay":
             print(f"      explicit gating ON: each sub-network is injected "
                   f"only on its own timing spike, and its spikes are "
@@ -4650,6 +4897,13 @@ def main():
             "spike_objective":  (spike_obj.describe()
                                  if args.arch == "timing_grouped" else None),
             "sub_film":         str(args.sub_film),
+            "film_mode":        str(args.film_mode),
+            "readout_gait_bias": (bool(args.readout_gait_bias)
+                                  if args.arch == "timing_grouped" else None),
+            "synaptic":         (str(args.synaptic)
+                                 if args.arch == "timing_grouped" else None),
+            "tau_syn_min":      float(args.tau_syn_min),
+            "tau_syn_max":      float(args.tau_syn_max),
             # Was read by build_model_from_cfg but never written, so a
             # --hidden_reset zero checkpoint silently reconstructed as
             # "subtract" for EITHER architecture. Pre-existing bug.
