@@ -248,7 +248,7 @@ def fig_reconstruction(model, spikes, gait_tables, device, tgt_range,
     fig.tight_layout()
     fig.subplots_adjust(top=0.921)
     fig.suptitle("Joint angle reconstruction across gaits", y=0.972)
-    _save(fig, out_dir, "fig_reconstruction")
+    _save(fig, out_dir, "reconstruction")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -345,7 +345,7 @@ def fig_transitions(model, spikes, gait_tables, device, tgt_range,
     fig.tight_layout(h_pad=2.0)
     fig.subplots_adjust(top=0.855)
     fig.suptitle("Gait transitions during continuous operation", y=0.952)
-    _save(fig, out_dir, "fig_transitions")
+    _save(fig, out_dir, "transitions")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -478,7 +478,7 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
     if h:
         fig.legend(h, lb, loc="lower center", ncol=len(h),
                    bbox_to_anchor=(0.5, 0.0))
-    _save(fig, out_dir, f"fig_timing_alignment_{gait_names[gait]}")
+    _save(fig, out_dir, f"timing_alignment_{gait_names[gait]}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -502,11 +502,19 @@ def read_metrics(model_dir):
             for k, v in row.items():
                 if k is None:
                     continue
+                # Column names and values are STRIPPED. A metrics.csv written
+                # with padded columns for readability yields keys like
+                # " train     ", which silently missed every lookup and
+                # produced an empty figure.
+                k = k.strip()
+                v = v.strip() if isinstance(v, str) else v
+                # NaN on a bad parse rather than skipping the append, so a
+                # single malformed cell cannot desynchronise column lengths.
                 try:
-                    cols.setdefault(k, []).append(
-                        float(v) if v not in ("", None) else float("nan"))
-                except ValueError:
-                    pass
+                    val = float(v) if v not in ("", None) else float("nan")
+                except (TypeError, ValueError):
+                    val = float("nan")
+                cols.setdefault(k, []).append(val)
     return ({k: np.asarray(v) for k, v in cols.items()} if cols else None), p
 
 
@@ -526,7 +534,8 @@ def fig_training_curves(model_dir, out_dir):
         return
     e = m.get("epoch")
     if e is None or len(e) < 2:
-        print("    (skipping training curves: fewer than two epochs logged)")
+        print(f"    (skipping training curves: fewer than two epochs in {p}; "
+              f"columns found: {sorted(m)})")
         return
 
     series = [("train", "Train", GT_C, "-"),
@@ -541,29 +550,54 @@ def fig_training_curves(model_dir, out_dir):
         fig, ax = plt.subplots(figsize=(9.5, 4.6))
         ax_lr = None
 
+    n_plotted = 0
     for key, label, colour, ls in series:
         if key not in m or not np.isfinite(m[key]).any():
             continue
         ax.plot(e, m[key], color=colour, ls=ls, label=label)
+        n_plotted += 1
+    if not n_plotted:
+        # Fail loudly: matplotlib only warns ("No artists with labels"), which
+        # leaves an empty figure on disk looking like a rendering fault rather
+        # than a column-name mismatch.
+        plt.close(fig)
+        print(f"    (skipping training curves: none of "
+              f"{[k for k, *_ in series]} present in {p}; "
+              f"columns found: {sorted(m)})")
+        return
     ax.set_yscale("log")
     ax.set_ylabel("Masked MSE")
     ax.legend(loc="upper right")
 
-    if "best" in m:
-        bi = np.where(m["best"] > 0.5)[0]
-        if len(bi):
-            k = bi[-1]
-            ax.plot([e[k]], [m["train"][k]], marker="o", ms=7,
-                    mfc="none", mec="k", mew=1.4, zorder=5)
-            ax.annotate("Best", xy=(e[k], m["train"][k]),
-                        xytext=(6, 10), textcoords="offset points",
-                        fontsize=11)
-
     if ax_lr is not None:
-        ax_lr.plot(e, m["lr"], color="#6a6a6a")
+        from matplotlib.ticker import FuncFormatter
+        lr = m["lr"]
+        ax_lr.plot(e, lr, color="#6a6a6a")
         ax_lr.set_ylabel("Learning rate")
         ax_lr.set_xlabel("Epoch")
         ax_lr.set_xlim(e[0], e[-1])
+        # The schedule anneals to eta_min, not to zero, but on a linear axis
+        # spanning 0 to ~4e-3 a final value of 1e-5 is a pixel off the floor
+        # and the default bottom tick reads "0.000" -- which states something
+        # false. Keeping the axis linear preserves the cosine shape, so
+        # instead the floor is lifted above zero (removing the 0.000 tick
+        # entirely) and the true minimum gets its own labelled tick.
+        lo = float(np.nanmin(lr))
+        hi = float(np.nanmax(lr))
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo > 0:
+            from matplotlib.ticker import MaxNLocator
+            ax_lr.set_ylim(lo * 0.45, hi * 1.06)
+            # Round tick values: deriving them from hi/4 gave 0.00399902 and
+            # friends, since hi is the measured maximum rather than the
+            # nominal one.
+            nice = MaxNLocator(nbins=4, steps=[1, 2, 2.5, 5, 10]).tick_values(
+                0.0, hi)
+            ticks = [lo] + [float(t) for t in nice
+                            if lo * 3.0 < t <= hi * 1.001]
+            ax_lr.set_yticks(ticks)
+            ax_lr.yaxis.set_major_formatter(FuncFormatter(
+                lambda v, _: (f"{v:.0e}".replace("e-0", "e-")
+                              if v < 0.2 * hi else f"{v:g}")))
     else:
         ax.set_xlabel("Epoch")
         ax.set_xlim(e[0], e[-1])
@@ -572,7 +606,7 @@ def fig_training_curves(model_dir, out_dir):
     fig.tight_layout()
     fig.subplots_adjust(top=0.915 if ax_lr is not None else 0.885)
     fig.suptitle("Training convergence", y=0.972)
-    _save(fig, out_dir, "fig_training_curves")
+    _save(fig, out_dir, "training_curves")
 
 
 # ═══════════════════════════════════════════════════════════════════
