@@ -2319,17 +2319,24 @@ class SingleStepONNXTiming(nn.Module):
 # the range where a threshold-1.0 LIF actually fires.  Three mechanisms,
 # acting at different times:
 #
-#   calibrate_gains      once, before training  -- never start dead
+#   calibrate_gains      once, before training  -- never start dead OR loud
 #   SpikeObjective       every gradient step    -- shape the spike train
-#   reinit_dead_units    on detection           -- rescue what died anyway
+#   reinit_timing_units  on detection           -- rescue what failed anyway
 #
-# A dead timing unit is not merely a wasted unit: its sub-network's input
-# weights `w1[l]` have gradient exactly proportional to that unit's spike
-# output, so while it is silent w1[l] receives EXACTLY zero gradient and
-# stays at random init, while everything downstream of it trains happily on
-# the constant b1-driven activity.  If the unit revives late, the one matrix
-# that consumes its input has learned nothing and the LR has already decayed.
-# That is why reinit_dead_units re-rolls w1 too, not just the router path.
+# Both extremes are fatal and neither self-corrects.  A dead timing unit is
+# not merely a wasted unit: the `w1` slots it feeds have gradient exactly
+# proportional to its spike output, so while it is silent those slots receive
+# EXACTLY zero gradient and stay at random init while everything downstream
+# trains around them -- and if the unit revives late, the matrix consuming its
+# input has learned nothing and the LR has already decayed.  A SATURATED unit
+# fires on every CPG spike, so its spike train is the OR of the CPG's and
+# carries no phase at all, and it sits far above threshold where spike_fn's
+# surrogate is down 1e2-1e3x, so the gradient reaching it is ~1e-6 and Adam's
+# scale-invariance means raising --spike_stats_lambda cannot compensate.
+#
+# Hence the division of labour: calibration prevents both at init,
+# --spike_free_rate keeps the spike penalty from pruning into silence, and
+# reinit_timing_units repairs per (gait, unit) whatever still fails.
 
 
 @torch.no_grad()
@@ -2618,12 +2625,13 @@ class SpikeObjective:
     name = "base"
 
     def __init__(self, lam=0.0, period=254.0, n_gaits=4,
-                 target_rate=None, target_R=None):
+                 target_rate=None, target_R=None, free_rate=0.0):
         self.lam        = float(lam)
         self.period     = float(period)
         self.n_gaits    = int(n_gaits)
         self.target_rate = target_rate     # CPG spikes per cycle
         self.target_R    = target_R        # CPG circular concentration
+        self.free_rate   = float(free_rate)  # spikes/cycle charged at zero
 
     # -- shared helper ------------------------------------------------
     def _grouped(self, spk, gait, mask):
@@ -2721,47 +2729,69 @@ class CPGMatchSpikeObjective(SpikeObjective):
 
 class MinCountSpikeObjective(SpikeObjective):
     """
-    Spend as few spikes as possible.  Pay a flat cost per spike and let the
-    TASK loss decide where they are worth spending.
+    Spend as few spikes as possible.  Pay a flat cost per spike BEYOND a free
+    allowance and let the TASK loss decide where the rest are worth spending.
 
-    Only meaningful with gated sub-networks, and then it is the whole
-    idea: a gated sub-network's output can only change on a timing spike, so
-    the task loss already forces spikes wherever the waveform must move.
-    Adding a uniform per-spike cost on top means the cheapest solution is to
-    place spikes densely where the target changes fast and sparsely where it
-    creeps -- i.e. an adaptive sampling clock, derived from the data rather
-    than supervised.  Nothing has to be told which phase is "swing".
+    Needs the output to depend on the spike train alone to mean anything --
+    whether by explicit gating or by natural gating, see NATURAL GATING in
+    TimingGroupedSNN's docstring.  Given that, it is the whole idea: the task
+    loss already forces spikes wherever the waveform must move, so a uniform
+    per-spike cost on top makes the cheapest solution place spikes densely
+    where the target changes fast and sparsely where it creeps -- an adaptive
+    sampling clock, derived from the data rather than supervised.  Nothing has
+    to be told which phase is "swing".
 
     LINEAR in the rate, not squared, on purpose: a flat marginal cost per
     spike is the L1-sparsity form and drives genuine sparsity, whereas a
     squared cost pushes hard at high rates and then gives up as the rate
     falls, which is the opposite of what is wanted.
 
-    Reported as DUTY CYCLE (fraction of timesteps with a spike), so `lam`
-    reads directly as "loss cost of a unit spiking every single timestep".
+    FREE ALLOWANCE (`free_rate`, in spikes per CYCLE).  Only the excess above
+    it is charged:
 
-    NO FLOOR TERM, deliberately: the task loss is the floor.  With gating, a
-    silent timing unit starves its sub-network completely -- memo decays,
-    y collapses to b_out -- so silence is heavily punished by the task loss
-    itself.  The risk is the transient: early in training the task gradient
-    through a barely-firing unit is weak, so this penalty can prune a unit to
-    silence before the task loss has learned to need it, and a fully silent
-    unit passes ZERO gradient to w1/w2/w_read/w_out (only b_out still learns),
-    making it unrecoverable.  Mitigations: `--spike_lambda_warmup` ramps lam
-    from 0 so the network learns to use spikes before being charged for them,
-    and `--reinit_dead_after` revives anything that dies anyway.
+        penalty = lam * relu(duty - free_rate/period)
+
+    The point is the relu, not the offset.  With no allowance the marginal
+    cost per spike is the same at 40 spk/cyc and at 1, so the penalty keeps
+    pushing all the way to zero, and a unit that reaches silence is
+    UNRECOVERABLE: a silent timing unit passes exactly zero gradient to the
+    w1 slots it feeds, so the task loss can no longer object.  Observed
+    directly -- a run pruned several sub-networks to an excellent 2-5
+    well-placed spikes per cycle and pruned a handful of others to 0.
+
+    The relu removes the pressure entirely once a unit is at or below the
+    allowance (gradient is exactly zero there), so pruning stops at the
+    allowance instead of continuing to silence.  It adds no upward pressure
+    either; the task loss is still the only floor.
+
+    free_rate=0 reproduces the original behaviour exactly, since duty is
+    non-negative so relu is the identity.
+
+    Note this does NOT address the opposite failure.  A unit that ends up
+    saturated sits far above threshold where spike_fn's surrogate is down
+    1e2-1e3x, so the penalty's gradient there is ~1e-6, and Adam's
+    scale-invariance means raising lam cannot compensate.  Saturation has to
+    be fixed by re-rolling or rescaling the unit, not by this term.
+
+    Other mitigations: `--spike_lambda_warmup` ramps lam from 0 so the network
+    learns to use spikes before being charged for them, and
+    `--reinit_dead_after` revives units that die anyway.
     """
 
     name = "min_count"
 
     def penalty(self, spk, gait, phase, mask):
         rate, present, cnt, oh = self._grouped(spk, gait, mask)
+        # rate is per-TIMESTEP duty; free_rate is per CYCLE, so convert.
+        free_duty = self.free_rate / self.period
+        excess = torch.relu(rate - free_duty)
         denom = present.sum().clamp(min=1.0) * spk.shape[2]
-        return self.lam * (rate * present).sum() / denom
+        return self.lam * (excess * present).sum() / denom
 
     def describe(self):
-        return (f"min_count (lam={self.lam:g}, linear/L1 in duty cycle; "
-                f"the task loss supplies the floor)")
+        return (f"min_count (lam={self.lam:g}, linear/L1 in duty cycle above "
+                f"a free {self.free_rate:g} spk/cyc; the task loss supplies "
+                f"the floor)")
 
 
 SPIKE_OBJECTIVES = {cls.name: cls for cls in (
@@ -2776,47 +2806,72 @@ def make_spike_objective(name, **ctx):
 
 
 @torch.no_grad()
-def reinit_dead_units(model, dead, generator=None, verbose=True):
+def reinit_timing_units(model, dead_pairs, sat_pairs, n_gaits,
+                        generator=None, sat_scale=0.5, verbose=True):
     """
-    Re-roll the parameters feeding and consuming a dead TIMING unit.
+    Rescue timing units that have failed, PER (gait, unit).
 
-    `dead` : list of timing-unit indices to rescue.
+    `dead_pairs` / `sat_pairs` : lists of (gait, unit) index tuples.
 
-    Three things get re-rolled per unit, and the third is the one that
-    matters most:
-      - w_in_gait  : that unit's column of every gait's routing matrix, with
-                     positive mean restored, so it gets net positive drive
-      - b_t        : that unit's per-gait bias, back to zero
-      - w1[l]      : THE SUB-NETWORK'S INPUT WEIGHTS.  d(cur1)/d(w1) is
-                     proportional to the timing spike, so w1[l] received
-                     exactly zero gradient for the whole dead period and is
-                     still at its original random init while the rest of
-                     sub-network l trained around it.  Re-rolling it costs
-                     nothing (it learned nothing) and starting it fresh
-                     alongside a freshly-driven input is strictly better
-                     than leaving stale init.
+    Per-gait is the right granularity because the CPG->timing weights already
+    are: `w_in_gait` is (max_gaits, n_cpg, n_timing), so gait g's column for
+    unit u is an independent slice and fixing it cannot disturb any other
+    gait, any other unit, or anything downstream.  The previous version only
+    acted when a unit was silent for EVERY gait, which missed the common case
+    of one unit failing for one gait.
 
-    Deliberately does NOT touch w2/w_read/w_out for that group: those DID
-    train (on the constant b1-driven activity) and may hold something useful
-    about the group's output range.
+    The two failures get OPPOSITE treatment, because they are not the same
+    illness:
 
-    `w1` is indexed by SUB-NETWORK, not by timing unit, and the two are no
-    longer the same thing. A dead timing unit l starves the (g, k) slots where
-    timing_map[g][k] == l, which may be several sub-networks (timing per_leg
-    with decoder per_joint) or one slot of several in one sub-network (timing
-    per_joint with decoder per_leg). Only those slots are re-rolled: the other
-    K-1 slots of a shared sub-network were driven by live units and did train.
+      DEAD (0 spk/cyc)  Re-roll that (gait, unit) column of w_in_gait with the
+                        positive mean restored, and zero its per-gait bias.  A
+                        silent column carries no information, so its direction
+                        is worthless and there is nothing to preserve.
+
+      SATURATED         SCALE that column down by `sat_scale` instead.  A
+                        saturated unit is firing on every CPG spike, so its
+                        spike train is the OR of the CPG's and carries no
+                        phase -- but that is a MAGNITUDE failure, not a
+                        direction one: whatever phase preference the column
+                        encodes is still in there, just swamped.  Re-rolling
+                        would throw that away to fix a scale problem.  Rate is
+                        monotone in the column's gain, so halving strictly
+                        reduces it; a badly saturated unit may need several
+                        triggers to walk down, which is fine and self-limiting
+                        since it stops as soon as the unit leaves the band.
+
+    Neither case can be left to training.  A silent unit passes exactly zero
+    gradient to the w1 slots it feeds, and a saturated one sits far above
+    threshold where spike_fn's surrogate is down 1e2-1e3x, so the gradient
+    reaching it is ~1e-6 and Adam's scale-invariance means no amount of
+    --spike_stats_lambda compensates.
+
+    `w1` IS re-rolled, but only for units dead in EVERY gait.  The
+    justification is specific to that case: d(cur1)/d(w1) is proportional to
+    the timing spike, so a unit silent in all gaits left its w1 slots at
+    random init for the whole dead period while the rest of the sub-network
+    trained around them.  A unit dead in only some gaits still trained those
+    slots on the gaits where it fired, so re-rolling would destroy working
+    weights.
+
+    `w1` is indexed by SUB-NETWORK, not by timing unit, so the slots re-rolled
+    are the (g, k) pairs where timing_map[g][k] == u -- possibly several
+    sub-networks (per_leg timing with per_joint decoders) or one slot of
+    several in one sub-network (per_joint timing with per_leg decoders).  The
+    other K-1 slots of a shared sub-network were driven by live units and are
+    left alone.
+
+    Deliberately does NOT touch w2/w_read/w_out for any group: those DID
+    train and may hold something useful about the group's output range.
     """
-    if not dead or not hasattr(model, "w_in_gait"):
+    if not (dead_pairs or sat_pairs) or not hasattr(model, "w_in_gait"):
         return
     dev = model.w_in_gait.weight.device
     MG, nn_, T = model.max_gaits, model.n_neurons, model.n_timing
     W = model.w_in_gait.weight.view(MG, nn_, T)
-    K = model.K
-    scale = _W1_INIT / math.sqrt(K)          # same as the constructor's init
-    slots = {}
-    for l in dead:
-        W[:, :, l] = (torch.randn(MG, nn_, generator=generator).to(dev)
+
+    for g, u in dead_pairs:
+        W[g, :, u] = (torch.randn(nn_, generator=generator).to(dev)
                       * _W_IN_INIT + _W_IN_INIT)
         # Per-gait excitability back to neutral, in whichever form is in use.
         # Guarded because "voltage" mode has v_t and no b_t at all, and
@@ -2824,18 +2879,43 @@ def reinit_dead_units(model, dead, generator=None, verbose=True):
         for name in ("b_t", "v_t"):
             emb = getattr(model, name, None)
             if emb is not None:
-                emb.weight[:, l] = 0.0
-        hit = [(g, k) for g, m in enumerate(model.timing_map_list)
-               for k, t in enumerate(m) if t == l]
-        for g, k in hit:
-            model.w1[g, k] = (torch.randn(model.Hg, generator=generator)
-                              .to(dev) * scale)
-        slots[l] = hit
+                emb.weight[g, u] = 0.0
+
+    for g, u in sat_pairs:
+        W[g, :, u] *= sat_scale
+
+    # w1 only for units dead in every gait -- see the docstring.
+    dead_by_unit = {}
+    for g, u in dead_pairs:
+        dead_by_unit.setdefault(u, set()).add(g)
+    everywhere = sorted(u for u, gs in dead_by_unit.items()
+                        if len(gs) >= n_gaits)
+    slots = {}
+    if everywhere:
+        K = model.K
+        scale = _W1_INIT / math.sqrt(K)      # same as the constructor's init
+        for u in everywhere:
+            hit = [(g, k) for g, m in enumerate(model.timing_map_list)
+                   for k, t in enumerate(m) if t == u]
+            for g, k in hit:
+                model.w1[g, k] = (torch.randn(model.Hg, generator=generator)
+                                  .to(dev) * scale)
+            slots[u] = hit
+
     if verbose:
-        print(f"      [reinit] timing unit(s) {dead}: re-rolled w_in_gait "
-              f"column (all gaits), zeroed its per-gait bias, and re-rolled "
-              f"sub-net w1 slot(s) {slots} (which had received zero gradient "
-              f"while dead)")
+        if dead_pairs:
+            print(f"      [reinit] DEAD (gait, unit) {sorted(dead_pairs)}: "
+                  f"re-rolled that gait's w_in_gait column and zeroed its "
+                  f"per-gait bias")
+        if everywhere:
+            print(f"      [reinit] unit(s) {everywhere} were dead for ALL "
+                  f"{n_gaits} gaits, so sub-net w1 slot(s) {slots} were "
+                  f"re-rolled too (they had received zero gradient throughout)")
+        if sat_pairs:
+            print(f"      [reinit] SATURATED (gait, unit) "
+                  f"{sorted(sat_pairs)}: scaled that gait's w_in_gait column "
+                  f"by {sat_scale:g} (magnitude failure, so the column's "
+                  f"direction is kept)")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2844,36 +2924,47 @@ def reinit_dead_units(model, dead, generator=None, verbose=True):
 
 @torch.no_grad()
 def timing_report(model, spikes, phase, period, n_gaits, device,
-                  t0, n_steps=1500, gait_names=None, indent="    "):
+                  t0, n_steps=1500, gait_names=None, indent="    ",
+                  sat_rate=None):
     """
     Per-gait firing statistics for the timing layer.  Returns a list of
     formatted lines (also returned as raw dicts) so the caller can print
     them every N epochs.
 
-    Three numbers per timing neuron:
+    PRINTS spk/cyc per gait, plus warnings for the two failure modes.  Phase
+    and circular concentration R are still COMPUTED and returned in the stats
+    dicts (the config records them, and the cross-gait phase separation line
+    below is derived from them) but are no longer printed -- they made the
+    every-N-epochs block three times longer than the number actually watched.
 
       spk/cyc  Spikes per CPG cycle.  0.00 means the unit is DEAD -- its
-               sub-network then receives a constant-zero input and its
-               joints are frozen at whatever the decaying membranes settle
-               to, and the surrogate gradient through a never-crossing
-               membrane is weak, so it tends not to recover on its own.
-               This is a much sharper failure than a dead unit in a
-               256-wide dense layer, which is why it is checked every few
-               epochs rather than at the end.
-               Very large values (>> spikes/burst of the CPG) mean the unit
-               is saturated and carries no timing information either.
+               sub-network then receives a constant-zero input, its joints
+               freeze at whatever the decaying membranes settle to, and the
+               w1 slots it feeds get exactly zero gradient, so it does not
+               recover on its own.  A much sharper failure than a dead unit
+               in a 256-wide dense layer, which is why it is checked every
+               few epochs rather than at the end.
 
-      phase    Circular MEAN of the cycle phase at which the unit fires,
-               in [0,1).  This is the direct successor to the old routing
-               residual measurement: it says which part of the cycle each
-               sub-network is being told about.
+               `sat_rate` spk/cyc or above is the opposite failure: the unit
+               is firing on essentially every CPG spike, so its spike train
+               approaches the OR of the CPG's, is near-identical for every
+               saturated unit, and carries no phase.  Just as fatal as
+               silence and NOT self-correcting either -- a saturated unit
+               sits far above threshold where the surrogate gradient is down
+               1e2-1e3x, so neither the task loss nor the spike penalty can
+               move it (and Adam's scale-invariance means raising lam does
+               not help).  Pass the CEILING, n_cpg * cpg_rate, less a little
+               tolerance -- NOT _SAT_FRAC of it.  _SAT_FRAC is a calibration
+               cap whose job is to start units well below the ceiling so they
+               do not drift into it; a unit at 0.6 of the ceiling is busy but
+               still carries phase.
 
-      R        Circular concentration in [0,1].  R near 1 means the unit is
-               phase-locked (fires in a tight burst at a consistent point
-               in the cycle) -- what a timing neuron is for.  R near 0
-               means its spikes are smeared around the cycle, so `phase` is
-               meaningless and the unit is not providing a phase reference
-               regardless of its rate.
+      phase    Circular MEAN of the cycle phase at which the unit fires, in
+               [0,1): which part of the cycle each sub-network is told about.
+
+      R        Circular concentration in [0,1].  R near 1 means phase-locked;
+               R near 0 means the spikes are smeared and `phase` is
+               meaningless.
     """
     if not hasattr(model, "timing_only"):
         return [], []
@@ -2907,14 +2998,19 @@ def timing_report(model, spikes, phase, period, n_gaits, device,
         name = (gait_names[g] if gait_names is not None else f"g{g}")
         fmt  = lambda v, w=5, p=2: " ".join(
             ("  nan" if not np.isfinite(x_) else f"{x_:{w}.{p}f}") for x_ in v)
-        lines.append(f"{indent}timing {name:>5s} : "
-                     f"spk/cyc [{fmt(rate)}]  "
-                     f"phase [{fmt(mu)}]  R [{fmt(R)}]")
+        lines.append(f"{indent}timing {name:>5s} : spk/cyc [{fmt(rate)}]")
         dead = [j for j, r in enumerate(rate) if r < 1e-6]
         if dead:
             lines.append(f"{indent}       {'':>5s}   "
                          f"WARNING: timing neuron(s) {dead} DEAD for "
-                         f"{name} — sub-network(s) {dead} get no input.")
+                         f"{name} — sub-network(s) they feed get no input.")
+        if sat_rate:
+            sat = [j for j, r in enumerate(rate) if r >= sat_rate]
+            if sat:
+                lines.append(f"{indent}       {'':>5s}   "
+                             f"WARNING: timing neuron(s) {sat} SATURATED for "
+                             f"{name} (>= {sat_rate:.0f} spk/cyc) — firing on "
+                             f"most CPG spikes, so they carry no phase.")
         stats.append({"gait": name, "rate": [float(v) for v in rate],
                       "phase": [None if not np.isfinite(v) else float(v)
                                 for v in mu],
@@ -3072,7 +3168,7 @@ class MetricsWriter:
 
 def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                  gait_w, out_dir, timing_diag=None, n_gaits=4, period=254.0,
-                 spike_obj=None):
+                 spike_obj=None, sat_rate=None):
     """
     `timing_diag` : optional zero-arg callable returning (lines, stats).
                     Called every args.timing_log_every epochs for the
@@ -3083,6 +3179,10 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
     `spike_obj`   : a SpikeObjective (strategy). Its `penalty` is added to the
                     task loss; NoSpikeObjective disables it. Swapping the
                     objective needs no change here.
+    `sat_rate`    : spk/cyc at or above which a timing unit counts as
+                    saturated, for the reinit trigger. The SAME value passed
+                    to timing_report, so the warning printed and the action
+                    taken cannot disagree. None disables saturation rescue.
     """
     best = float("inf")
     best_path = out_path(out_dir, "best_model.pt")
@@ -3127,9 +3227,12 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                   f"to USE spikes before it is charged for them.")
         print(f"  Judge it on free-run RMSE, not on the spike count.")
 
-    # Consecutive epochs each timing unit has been observed dead, for
-    # reinit_dead_units.  Only advanced on epochs where the diagnostic runs.
-    dead_streak = {}
+    # Consecutive timing reports each (gait, unit) pair has been observed
+    # dead or saturated, for reinit_timing_units.  Keyed per PAIR, not per
+    # unit, because the rescue is per-gait: w_in_gait has a gait axis, so one
+    # gait failing is independently fixable.  Only advanced on epochs where
+    # the diagnostic runs.
+    dead_streak, sat_streak = {}, {}
 
     print(f"\n  {'Epoch':>6}  {'Train':>10}  {'Val':>10}  "
           f"{'Val(post-sw)':>13}  {'LR':>9}  {'|grad|':>8}  {'|upd|':>8}"
@@ -3331,24 +3434,37 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 for ln in lines:
                     print(ln)
 
-                # A unit counts as dead only if it is silent for EVERY gait:
-                # dead-for-one-gait is the rate floor's job, and re-rolling a
-                # unit that works for 15 of 16 gaits would throw away more
-                # than it fixes.
+                # Failures are tracked per (gait, unit), because the fix is:
+                # w_in_gait has a gait axis, so a unit that is fine for five
+                # gaits and dead for the sixth gets that one column repaired
+                # and nothing else touched.
                 if args.reinit_dead_after > 0 and last_timing_stats:
-                    n_u  = len(last_timing_stats[0]["rate"])
-                    dead = [u for u in range(n_u)
-                            if all(st["rate"][u] < 1e-6
-                                   for st in last_timing_stats)]
-                    for u in range(n_u):
-                        dead_streak[u] = (dead_streak.get(u, 0) + 1
-                                          if u in dead else 0)
-                    due = [u for u in dead
-                           if dead_streak[u] >= args.reinit_dead_after]
-                    if due:
-                        reinit_dead_units(model, due)
-                        for u in due:
-                            dead_streak[u] = 0
+                    n_u = len(last_timing_stats[0]["rate"])
+                    pairs = [(gi, u) for gi in range(len(last_timing_stats))
+                             for u in range(n_u)]
+                    is_dead = {p: last_timing_stats[p[0]]["rate"][p[1]] < 1e-6
+                               for p in pairs}
+                    is_sat  = {p: (sat_rate is not None and
+                                   last_timing_stats[p[0]]["rate"][p[1]]
+                                   >= sat_rate)
+                               for p in pairs}
+                    for p in pairs:
+                        dead_streak[p] = (dead_streak.get(p, 0) + 1
+                                          if is_dead[p] else 0)
+                        sat_streak[p]  = (sat_streak.get(p, 0) + 1
+                                          if is_sat[p] else 0)
+                    dead_due = [p for p in pairs
+                                if dead_streak[p] >= args.reinit_dead_after]
+                    sat_due  = [p for p in pairs
+                                if sat_streak[p] >= args.reinit_dead_after]
+                    if dead_due or sat_due:
+                        reinit_timing_units(
+                            model, dead_due, sat_due, n_gaits,
+                            sat_scale=args.sat_scale)
+                        for p in dead_due:
+                            dead_streak[p] = 0
+                        for p in sat_due:
+                            sat_streak[p] = 0
 
     except KeyboardInterrupt:
         # Return normally rather than propagating: main() then falls through
@@ -4021,6 +4137,25 @@ def main():
                          "wins wherever spikes genuinely matter. Raise it if "
                          "the spike rate stays stubbornly high, LOWER it if "
                          "units collapse toward silence. 0 disables.")
+    ap.add_argument("--spike_free_rate", type=float, default=2.0,
+                    help="[--spike_objective min_count] Spikes per cycle, per "
+                         "(gait, timing unit), charged at zero. Only the "
+                         "EXCESS above this is penalised: "
+                         "lam * relu(duty - free_rate/period). The point is "
+                         "the relu. With no allowance the marginal cost per "
+                         "spike is identical at 40 spk/cyc and at 1, so the "
+                         "penalty keeps pushing to zero, and a unit that "
+                         "reaches silence cannot recover -- it passes exactly "
+                         "zero gradient to the w1 slots it feeds, so the task "
+                         "loss can no longer object. Observed: a run pruned "
+                         "several sub-networks to an excellent 2-5 well-placed "
+                         "spikes/cycle and pruned others to 0. With an "
+                         "allowance the gradient is exactly zero at or below "
+                         "it, so pruning stops there. Adds NO upward pressure; "
+                         "the task loss is still the only floor. 0 reproduces "
+                         "the original un-allowanced behaviour exactly. Does "
+                         "not help with saturation, which the penalty cannot "
+                         "reach at all -- see MinCountSpikeObjective.")
     ap.add_argument("--spike_lambda_warmup", type=int, default=10,
                     help="[timing_grouped] Epochs over which the spike "
                          "penalty's lambda ramps linearly from 0. Insurance "
@@ -4032,15 +4167,32 @@ def main():
                          "prune a unit into a state it cannot recover from. "
                          "0 disables the ramp.")
     ap.add_argument("--reinit_dead_after", type=int, default=2,
-                    help="[timing_grouped] Re-roll a timing unit after it has "
-                         "been silent for EVERY gait across this many "
-                         "consecutive timing reports (so the wall-clock "
-                         "trigger scales with --timing_log_every). Re-rolls "
-                         "that unit's w_in_gait column, its bias, AND the "
-                         "sub-network's w1 — that last one is the point, "
-                         "since w1's gradient is proportional to the timing "
-                         "spike and so was exactly zero the whole time it was "
-                         "dead. 0 disables.")
+                    help="[timing_grouped] Rescue a failed (gait, timing unit) "
+                         "pair after this many consecutive timing reports in "
+                         "the same state, so the wall-clock trigger scales "
+                         "with --timing_log_every. PER GAIT, matching "
+                         "w_in_gait's own gait axis: a unit that is fine for "
+                         "five gaits and dead for the sixth gets only that "
+                         "column touched. Dead pairs get the column re-rolled "
+                         "and the per-gait bias zeroed; saturated pairs get "
+                         "the column scaled by --sat_scale instead, since "
+                         "saturation is a magnitude failure and the column's "
+                         "direction is worth keeping. A unit dead for EVERY "
+                         "gait additionally gets its sub-net w1 slots "
+                         "re-rolled, since w1's gradient is proportional to "
+                         "the timing spike and so was exactly zero throughout. "
+                         "Neither failure self-corrects: a silent unit passes "
+                         "zero gradient, and a saturated one sits where the "
+                         "surrogate is down 1e2-1e3x. 0 disables.")
+    ap.add_argument("--sat_scale", type=float, default=0.5,
+                    help="[timing_grouped] Factor applied to a saturated "
+                         "(gait, unit) column of w_in_gait when "
+                         "--reinit_dead_after triggers. Rate is monotone in "
+                         "the column's gain, so this strictly reduces it; a "
+                         "badly saturated unit may take several triggers to "
+                         "walk down, which is self-limiting since it stops as "
+                         "soon as the unit leaves the saturation band. 1.0 "
+                         "leaves saturated units alone.")
     ap.add_argument("--bias_mode", type=str, default="voltage",
                     choices=["current", "voltage", "none"],
                     help="[timing_grouped] How neuron excitability is "
@@ -4611,10 +4763,24 @@ def main():
     # t_eval sits in the val region so the report is about held-out steps.
     if args.arch == "timing_grouped":
         t_diag = max(t_split, t_lo) + 200
+        # Actually saturated means firing on essentially EVERY CPG spike,
+        # i.e. at the ceiling of n_cpg * cpg_rate -- not at _SAT_FRAC of it.
+        # _SAT_FRAC is only a calibration cap, whose whole job is to start
+        # units well BELOW the ceiling so they do not drift into it; a unit
+        # sitting at 0.6 of the ceiling is firing a lot but still carries
+        # phase.
+        #
+        # The 0.95 is tolerance, not a lower target: cpg_rate is measured
+        # over the whole spike train while timing_report measures over ~6
+        # cycles, so a genuinely saturated unit can come out a hair under the
+        # product of the two. Computed once and passed to BOTH timing_report
+        # and run_training, so the number warned about and the number acted
+        # on are the same by construction.
+        sat_rate = 0.95 * float(args.n_cpg_neurons) * float(cpg_rate)
         timing_diag = lambda: timing_report(
             model, spikes, phase, period, len(gait_tables), device,
             t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
-            indent="      ")
+            indent="      ", sat_rate=sat_rate)
     else:
         timing_diag = None
 
@@ -4628,22 +4794,30 @@ def main():
         print("\n      Calibrating timing-layer gains ...")
         # Band derived from the CPG, but scaled to suit the objective.
         # cpg_match wants the CPG's own rate, so calibrate around it.
-        # An EVENT-GATED network with min_count needs far more spikes than the
-        # CPG emits -- a sub-network can only update when its timing neuron
-        # fires, and ~10 spikes per 352-step cycle cannot render a moving
-        # waveform (a zero-order-hold analysis on a gait-shaped waveform puts
-        # the requirement nearer 40-60/cycle for ~1.5 degrees of error).
-        # Starting at the CPG's rate would begin in a starved regime where the
-        # task gradient is weak, exactly when L1 pressure is arriving.  So
-        # start high and let the L1 term prune downward.
-        if args.gate_mode != "none" and args.spike_objective == "min_count":
-            band_lo, band_hi = 2.0 * cpg_rate, 8.0 * cpg_rate
-            print(f"      (gated + min_count: calibrating to "
+        # min_count needs far more spikes than the CPG emits: under natural
+        # gating the sub-networks are driven only on timing spikes, and ~10
+        # spikes per 352-step cycle cannot render a moving waveform (a
+        # zero-order-hold analysis on a gait-shaped waveform puts the
+        # requirement nearer 40-60/cycle for ~1.5 degrees of error).  Starting
+        # at the CPG's rate would begin in a starved regime where the task
+        # gradient is weak, exactly when L1 pressure is arriving.  So start
+        # high and let the L1 term prune downward.
+        #
+        # Conditioned on the objective being ACTIVE (lambda > 0), not on
+        # --gate_mode: natural gating gives the same spike-train dependence
+        # that explicit gating does, so gate_mode is the wrong thing to test.
+        # And with lambda at 0 nothing prunes, so calibrating high would just
+        # leave the layer firing high for the whole run.
+        if args.spike_objective == "min_count" and args.spike_stats_lambda > 0.0:
+            band_lo, band_hi = 2.0 * cpg_rate, 4.0 * cpg_rate
+            print(f"      (min_count: calibrating to "
                   f"{band_lo:.0f}-{band_hi:.0f} spk/cyc, well above the CPG's "
                   f"{cpg_rate:.1f}, so the network starts able to render the "
                   f"waveform and prunes from there)")
         else:
             band_lo, band_hi = 1.5 * cpg_rate, 2.0 * cpg_rate
+            print(f"      (no active min_count: calibrating to "
+                  f"{band_lo:.0f}-{band_hi:.0f} spk/cyc)")
 
         # A timing unit cannot exceed one spike per CPG spike: the BLIF CPG
         # never fires two neurons in the same timestep, so there are exactly
@@ -4654,12 +4828,12 @@ def main():
         # effectively dead.
         #
         # This has to be enforced HERE, not inside calibrate_gains, because the
-        # band above can exceed the ceiling. The gated + min_count branch asks
-        # for 8 * cpg_rate = 80 spk/cyc against a ceiling of 60 for a 6-neuron
-        # CPG, and a band whose top is above the ceiling makes the `too_loud`
-        # test unreachable -- so the bisection drives units TO saturation and
-        # then reports them as in-band. Inert for the ungated branch, whose
-        # band tops out at 2 * cpg_rate.
+        # band above can exceed the ceiling. The min_count branch asks for
+        # 4 * cpg_rate = 40 spk/cyc against a ceiling of 60 and a cap of 36
+        # for a 6-neuron CPG, and a band whose top is above the CEILING makes
+        # the `too_loud` test unreachable -- the bisection would drive units TO
+        # saturation and then report them as in-band. Inert for the other
+        # branch, whose band tops out at 2 * cpg_rate.
         ceiling = float(args.n_cpg_neurons) * float(cpg_rate)
         cap     = _SAT_FRAC * ceiling
         if band_hi > cap:
@@ -4680,7 +4854,8 @@ def main():
         args.spike_objective,
         lam=args.spike_stats_lambda, period=period,
         n_gaits=len(gait_tables),
-        target_rate=cpg_rate, target_R=cpg_R)
+        target_rate=cpg_rate, target_R=cpg_R,
+        free_rate=args.spike_free_rate)
 
     # Defined for both branches so the config can always report them.
     best          = float("nan")
@@ -4706,7 +4881,7 @@ def main():
             model, tr_sampler, va_sampler, opt, sched,
             device, args, gait_w, out_dir, timing_diag=timing_diag,
             n_gaits=len(gait_tables), period=period,
-            spike_obj=spike_obj)
+            spike_obj=spike_obj, sat_rate=sat_rate)
         final_lr = float(opt.param_groups[0]["lr"])
         model.load_state_dict(torch.load(in_path(out_dir, "best_model.pt"),
                                          map_location=device))
@@ -4896,6 +5071,7 @@ def main():
                                  if args.arch == "timing_grouped" else None),
             "spike_objective":  (spike_obj.describe()
                                  if args.arch == "timing_grouped" else None),
+            "spike_free_rate":  float(args.spike_free_rate),
             "sub_film":         str(args.sub_film),
             "film_mode":        str(args.film_mode),
             "readout_gait_bias": (bool(args.readout_gait_bias)
