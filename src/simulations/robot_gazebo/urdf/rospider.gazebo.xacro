@@ -1,4 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  MIGRATED Humble to Jazzy.
+
+  REMOVED: <param name="mimic"> and <param name="multiplier"> from every joint.
+  Jazzy's ros2_control deleted these; mimic is now read ONLY from the <mimic>
+  tag in the URDF joint definition (rospider_description/urdf/gripper.urdf.xacro).
+
+  !! ACTION REQUIRED - the two sources DISAGREED, so behavior will change !!
+
+      joint        | this file said  | gripper.urdf.xacro says
+      l_joint      | r_joint x (-1)  | r_joint x (-1)   agree
+      l_in_joint   | l_joint x (+1)  | r_joint x (-1)   agree, via l_joint
+      l_out_joint  | l_joint x (+1)  | r_joint x (-1)   agree, via l_joint
+      r_in_joint   | r_joint x (+1)  | r_joint x (-1)   CONFLICT
+      r_out_joint  | r_joint x (-1)  | r_joint x (+1)   CONFLICT
+
+  On Humble this file won. On Jazzy the URDF wins, so r_in_joint and
+  r_out_joint will move in the OPPOSITE direction from before. Decide which
+  is correct and edit the <mimic> tags in gripper.urdf.xacro accordingly.
+-->
 <robot name="arm" xmlns:xacro="http://ros.org/wiki/xacro">
   <ros2_control name="GazeboSystem" type="system">
     <hardware>
@@ -58,31 +78,23 @@
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
     </joint>
-    <joint name="l_joint"> <param name="mimic">r_joint</param>
-      <param name="multiplier">-1</param>
-      <state_interface name="position"/>
+    <joint name="l_joint"><state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
     </joint>
-    <joint name="l_in_joint"> <param name="mimic">l_joint</param>
-      <param name="multiplier">1</param>
-      <state_interface name="position"/>
+    <joint name="l_in_joint"><state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
     </joint>
-    <joint name="l_out_joint"> <param name="mimic">l_joint</param>
-      <param name="multiplier">1</param> <state_interface name="position"/>
+    <joint name="l_out_joint"><state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
     </joint>
-    <joint name="r_in_joint"> <param name="mimic">r_joint</param>
-      <param name="multiplier">1</param>
-      <state_interface name="position"/>
+    <joint name="r_in_joint"><state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
     </joint>
-    <joint name="r_out_joint"> <param name="mimic">r_joint</param>
-      <param name="multiplier">-1</param> <state_interface name="position"/>
+    <joint name="r_out_joint"><state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
     </joint>

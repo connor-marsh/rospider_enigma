@@ -69,9 +69,13 @@ def generate_launch_description():
         default_value='false',
         description='Use simulation (Gazebo) clock if true')
 
+    # MIGRATED: robot_gazebo has no 'params/' directory and no 'nav2_params.yaml'.
+    # Repointed at the file that actually exists: config/localization.yaml.
+    # VERIFY: localization.yaml only defines amcl; nav2_map_server expects a
+    # map_server block, so map_server may fall back to defaults.
     declare_params_file_cmd = DeclareLaunchArgument(
         'params_file',
-        default_value=os.path.join(bringup_dir, 'params', 'nav2_params.yaml'),
+        default_value=os.path.join(bringup_dir, 'config', 'localization.yaml'),
         description='Full path to the ROS2 parameters file to use for all launched nodes')
 
     declare_autostart_cmd = DeclareLaunchArgument(

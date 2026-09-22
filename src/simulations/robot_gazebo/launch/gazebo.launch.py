@@ -1,3 +1,19 @@
+# ############################################################################
+# MIGRATED Humble -> Jazzy: THIS FILE IS DEAD. NOTHING BELOW CAN RUN ON JAZZY.
+#
+#   * get_package_share_directory('gazebo_ros')   -> package does not exist on
+#     Jazzy. Gazebo Classic reached end of life in January 2025 and gazebo_ros
+#     was never released for Jazzy.
+#   * gzserver.launch.py / gzclient.launch.py     -> Classic only.
+#   * gazebo_ros / spawn_entity.py                -> Classic only.
+#   * '-file .../rospider_description.urdf'       -> that file does not exist in
+#     rospider_description either (only .xacro sources).
+#
+# Left in place UNCHANGED (apart from line endings) so you can see what it did.
+# DECIDE: delete it, or re-point it at worlds.launch.py, which already does the
+# same job correctly for Harmonic. Nothing else in the tree includes this file.
+# ############################################################################
+
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, ExecuteProcess
 from launch.launch_description_sources import PythonLaunchDescriptionSource

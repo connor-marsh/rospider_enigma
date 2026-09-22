@@ -117,7 +117,10 @@ def generate_launch_description():
         executable="static_transform_publisher",
         name="static_transform_publisher",
         output="log",
-        arguments=["0.0", "0.0", "0.0", "0.0", "0.0", "0.0", "world", "base_footprint"],
+        # MIGRATED: positional args are deprecated; use named flags.
+        arguments=["--x", "0.0", "--y", "0.0", "--z", "0.0",
+                   "--roll", "0.0", "--pitch", "0.0", "--yaw", "0.0",
+                   "--frame-id", "world", "--child-frame-id", "base_footprint"],
     )
 
     # Publish TF
@@ -146,32 +149,32 @@ def generate_launch_description():
         condition=UnlessCondition(use_gazebo),
     )
 
-    joint_state_broadcaster_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=[
-            "joint_state_broadcaster",
-            "--controller-manager",
-            "/controller_manager",
-        ],
-        condition=UnlessCondition(use_gazebo),
-    )
+    # MIGRATED: --param-file is REQUIRED in Jazzy. Controllers now set
+    # use_global_arguments=false, so params loaded only into the
+    # controller_manager node never reach the controller nodes.
+    def _spawner(name):
+        return Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=[
+                name,
+                "-c", "/controller_manager",
+                "--param-file", ros2_controllers_path,
+            ],
+            condition=UnlessCondition(use_gazebo),
+        )
 
-    arm_controller_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["arm_controller", "-c", "/controller_manager"],
-        condition=UnlessCondition(use_gazebo),
-    )
-
-    gripper_controller_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["gripper_controller", "-c", "/controller_manager"],
-        condition=UnlessCondition(use_gazebo),   
-    )
+    joint_state_broadcaster_spawner = _spawner("joint_state_broadcaster")
+    arm_controller_spawner = _spawner("arm_controller")
+    gripper_controller_spawner = _spawner("gripper_controller")
 
     # Warehouse mongodb server
+    # MIGRATED / NEEDS VERIFICATION: warehouse_ros_mongo does not appear to have
+    # a Jazzy release (ROS Index shows Humble as the newest). If `rosdep` cannot
+    # resolve it, switch to warehouse_ros_sqlite:
+    #   warehouse_plugin: "warehouse_ros_sqlite::DatabaseConnection"
+    #   warehouse_host:   "/path/to/warehouse_db.sqlite"   (port unused)
+    # and drop this node entirely (sqlite needs no server process).
     db_config = LaunchConfiguration("db")
     mongodb_server_node = Node(
         package="warehouse_ros_mongo",

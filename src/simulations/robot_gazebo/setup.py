@@ -27,7 +27,7 @@ setup(
         (os.path.join('share', package_name, 'meshes/chair'), glob(os.path.join('meshes/chair', '*.*'))),
         (os.path.join('share', package_name, 'meshes/cupboard'), glob(os.path.join('meshes/cupboard', '*.*'))),
         (os.path.join('share', package_name, 'meshes/sofa'), glob(os.path.join('meshes/sofa', '*.*'))),
-        (os.path.join('share', package_name, 'meshes/table'), glob(os.path.join('meshes/tea_table', '*.*'))),
+        (os.path.join('share', package_name, 'meshes/table'), glob(os.path.join('meshes/table', '*.*'))),
         (os.path.join('share', package_name, 'meshes/tea_table'), glob(os.path.join('meshes/tea_table', '*.*'))),
         (os.path.join('share', package_name, 'meshes/wpr1'), glob(os.path.join('meshes/wpr1', '*.*'))),
         
@@ -37,6 +37,13 @@ setup(
         (os.path.join('share', package_name, 'models/cupboard'), glob(os.path.join('models/cupboard', '*.*'))),
         (os.path.join('share', package_name, 'models/table'), glob(os.path.join('models/table', '*.*'))),
         (os.path.join('share', package_name, 'models/chair'), glob(os.path.join('models/chair', '*.*'))),
+        (os.path.join('share', package_name, 'meshes/kai'), glob(os.path.join('meshes/kai', '*.*'))),
+        (os.path.join('share', package_name, 'meshes/man_1'), glob(os.path.join('meshes/man_1', '*.*'))),
+        (os.path.join('share', package_name, 'meshes/man_2'), glob(os.path.join('meshes/man_2', '*.*'))),
+        (os.path.join('share', package_name, 'meshes/woman'), glob(os.path.join('meshes/woman', '*.*'))),
+        (os.path.join('share', package_name, 'meshes/wpb_home'), glob(os.path.join('meshes/wpb_home', '*.*'))),
+        (os.path.join('share', package_name, 'meshes/wpv3'), glob(os.path.join('meshes/wpv3', '*.*'))),
+        (os.path.join('share', package_name, 'models/balls'), glob(os.path.join('models/balls', '*.*'))),
         
     ],
     install_requires=['setuptools'],
@@ -48,7 +55,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'teleop_key_control = robot_gazebo.teleop_key_control:main',
+            # MIGRATED: robot_gazebo/teleop_key_control.py is MISSING from the source
+            # tree (only a stale .pyc existed). Restore the file or delete this line.
+            # 'teleop_key_control = robot_gazebo.teleop_key_control:main',
         ],
     },
 )

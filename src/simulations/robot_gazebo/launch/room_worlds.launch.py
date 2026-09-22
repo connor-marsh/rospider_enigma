@@ -1,92 +1,71 @@
+# MIGRATED Humble -> Jazzy / Gazebo Harmonic
+# Same changes as worlds.launch.py. See migration report.
+
 import os
+
 from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription,LaunchService
-from launch.actions import DeclareLaunchArgument,OpaqueFunction
-from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
+from launch import LaunchDescription, LaunchService
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
-import xacro
+from launch.substitutions import LaunchConfiguration
 
 
+def launch_setup(context, *args, **kwargs):
+    use_sim_time = LaunchConfiguration('use_sim_time').perform(context)
+    world_name = LaunchConfiguration('world_name').perform(context)
+    nav = LaunchConfiguration('nav').perform(context)
 
-def launch_setup(context):
-    use_sim_time = LaunchConfiguration('use_sim_time', default='true').perform(context)
-    world_name = LaunchConfiguration('world_name', default='world_name').perform(context)
-    nav = LaunchConfiguration('nav', default='false').perform(context)
-
-    nav_arg = DeclareLaunchArgument('nav',default_value=nav)
-    use_sim_time_arg = DeclareLaunchArgument('use_sim_time',default_value=use_sim_time)
-    world_name_arg = DeclareLaunchArgument('world_name',default_value=world_name)
-
-
-    # get the package directory
     robot_gazebo_path = get_package_share_directory('robot_gazebo')
+    world = os.path.join(robot_gazebo_path, 'worlds', 'robocup_home.sdf')
 
-
-    world = os.path.join(robot_gazebo_path,"worlds", "robocup_home.sdf")
-    ign_gz = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                [os.path.join(get_package_share_directory('ros_gz_sim'),
-                'launch', 'ros_gz_sim.launch.py')]),
-                #launch_arguments=[('gz_args', [' -r ' + world]), ('bridge_name', 'gz_bridge')]
-                launch_arguments={
-                    'gz_args': f'-r {world}'
-                }.items()
-    )
-    
-
-    ros_ign_bridge_launch = IncludeLaunchDescription(
+    gz_sim = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(robot_gazebo_path, 'launch/ros_ign_bridge.launch.py')
-            ),
+            os.path.join(get_package_share_directory('ros_gz_sim'),
+                         'launch', 'gz_sim.launch.py')),
+        launch_arguments={'gz_args': f'-r {world}'}.items(),
+    )
+
+    ros_gz_bridge_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(robot_gazebo_path, 'launch', 'ros_ign_bridge.launch.py')),
         launch_arguments={
+            'use_sim_time': use_sim_time,
+            'nav': nav,
+        }.items(),
+    )
+
+    spawn_model_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(robot_gazebo_path, 'launch', 'spawn_model.launch.py')),
+        launch_arguments={
+            'world': world_name,
             'use_sim_time': use_sim_time,
         }.items(),
     )
 
-    spwan_model_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(robot_gazebo_path, 'launch/spawn_model.launch.py')
-            ),
-        launch_arguments={
-            'world_name': world_name,
-            'use_sim_time': use_sim_time,
-        }.items(),
-    )
-
-    # spawn_objects                                                                
     spawn_objects_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(robot_gazebo_path, 'launch/spawn_objects.launch.py')
-            ),
+            os.path.join(robot_gazebo_path, 'launch', 'spawn_objects.launch.py')),
         launch_arguments={
-            'world_name': world_name,
+            'world': world_name,
             'use_sim_time': use_sim_time,
         }.items(),
     )
-    return ([
-        use_sim_time_arg,
-        world_name_arg,
-        nav_arg,
-        ign_gz,
-        spawn_objects_launch,
-        spwan_model_launch,
-        ros_ign_bridge_launch,       
-    ])
-    
+
+    return [gz_sim, spawn_objects_launch, spawn_model_launch, ros_gz_bridge_launch]
 
 
 def generate_launch_description():
     return LaunchDescription([
-        OpaqueFunction(function = launch_setup)
+        DeclareLaunchArgument('use_sim_time', default_value='true'),
+        DeclareLaunchArgument('world_name', default_value='robocup_home'),
+        DeclareLaunchArgument('nav', default_value='false'),
+        OpaqueFunction(function=launch_setup),
     ])
-
 
 
 if __name__ == '__main__':
     ld = generate_launch_description()
-
     ls = LaunchService()
     ls.include_launch_description(ld)
     ls.run()
