@@ -185,19 +185,20 @@ def generate_launch_description():
         condition=IfCondition(db_config),
     )
 
-    # Servo controller launch
-    servo_controller_package_path = get_package_share_directory('servo_controller')
-    servo_controller_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([os.path.join(servo_controller_package_path, 'launch/servo_controller.launch.py')]),
-        condition=IfCondition(use_real)
-    )
+    ## Only exist properly on real robot
+    # # Servo controller launch
+    # servo_controller_package_path = get_package_share_directory('servo_controller')
+    # servo_controller_launch = IncludeLaunchDescription(
+    #     PythonLaunchDescriptionSource([os.path.join(servo_controller_package_path, 'launch/servo_controller.launch.py')]),
+    #     condition=IfCondition(use_real)
+    # )
 
-    # Robot controller launch
-    robot_controller_package_path = get_package_share_directory('ros_robot_controller')
-    robot_controller_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([os.path.join(robot_controller_package_path, 'launch/ros_robot_controller.launch.py')]),
-        condition=IfCondition(use_real)
-    )
+    # # Robot controller launch
+    # robot_controller_package_path = get_package_share_directory('ros_robot_controller')
+    # robot_controller_launch = IncludeLaunchDescription(
+    #     PythonLaunchDescriptionSource([os.path.join(robot_controller_package_path, 'launch/ros_robot_controller.launch.py')]),
+    #     condition=IfCondition(use_real)
+    # )
 
     return LaunchDescription(
         [
@@ -217,7 +218,8 @@ def generate_launch_description():
             arm_controller_spawner,
             gripper_controller_spawner,
             mongodb_server_node,
-            servo_controller_launch,
-            robot_controller_launch,
+            ## Only exist properly on real robot
+            # servo_controller_launch,
+            # robot_controller_launch,
         ]
     )
