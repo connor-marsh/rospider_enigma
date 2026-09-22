@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="robot" xmlns:xacro="http://ros.org/wiki/xacro">
+
+    <xacro:arg name="sim_ign" default="true"/>
+
+    <!-- robot_description -->
+    <!-- <xacro:include filename="$(find jetrover_description)/urdf/jetrover.xacro"/> -->
+    <xacro:include filename="$(find rospider_description)/urdf/rospider.xacro"/>
+
+    <!-- <xacro:if value="$(arg sim_ign)"> -->
+        <!-- <xacro:include filename="$(find robot_gazebo)/urdf/wheel_base.urdf.xacro"/> -->
+    <!-- </xacro:if> -->
+    <!-- ign_joint_control -->
+    <xacro:include filename="$(find robot_gazebo)/urdf/rospider.gazebo.xacro"/>
+    <!-- lidar -->
+    <xacro:include filename="$(find robot_gazebo)/urdf/lidar.gazebo.xacro"/>
+    <!-- camera -->
+    <xacro:include filename="$(find robot_gazebo)/urdf/camera.gazebo.xacro"/>
+
+    <gazebo>
+        <!-- Joint state publisher -->
+        <plugin filename="$(find ign_ros2_control)/../../lib/libign_ros2_control-system.so" 
+                name="ign_ros2_control::IgnitionROS2ControlPlugin">
+          <parameters>$(find robot_gazebo)/config/robot_config.yaml</parameters>
+        </plugin>
+
+        <!-- joint -->
+        <plugin filename="libignition-gazebo-joint-state-publisher-system.so" name="ignition::gazebo::systems::JointStatePublisher">
+            <topic>joint_states</topic>
+        </plugin>
+
+        <!-- sensor-liar -->
+        <plugin filename="ignition-gazebo-sensors-system" name="ignition::gazebo::systems::Sensors">
+            <render_engine>ogre2</render_engine>
+        </plugin>
+
+        <!-- imu -->
+        <plugin filename="ignition-gazebo-imu-system" name="ignition::gazebo::systems::Imu"></plugin>
+
+        <!-- odom -->
+        <plugin
+            filename="ignition-gazebo-odometry-publisher-system"
+            name="ignition::gazebo::systems::OdometryPublisher">
+            <odom_publish_frequency>50</odom_publish_frequency>
+            <odom_topic>/odom</odom_topic>
+            <odom_frame>odom</odom_frame>
+            <robot_base_frame>base_footprint</robot_base_frame>
+            <tf_topic>/odom/tf</tf_topic>
+        </plugin>
+    </gazebo>   
+
+
+
+</robot>

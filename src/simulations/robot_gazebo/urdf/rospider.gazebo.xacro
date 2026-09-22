@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="arm" xmlns:xacro="http://ros.org/wiki/xacro">
+  <ros2_control name="IgnitionSystem" type="system">
+    <hardware>
+      <plugin>ign_ros2_control/IgnitionSystem</plugin>
+    </hardware>
+
+    <joint name="joint1">
+      <command_interface name="position">
+        <param name="min">-3.14159</param> <param name="max">3.14159</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="joint2">
+      <command_interface name="position">
+        <param name="min">-2.09</param>
+        <param name="max">2.09</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="joint3">
+      <command_interface name="position">
+        <param name="min">-2.09</param>
+        <param name="max">2.09</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="joint4">
+      <command_interface name="position">
+        <param name="min">-2.09</param>
+        <param name="max">2.09</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="joint5">
+      <command_interface name="position">
+        <param name="min">-2.09</param>
+        <param name="max">2.09</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="r_joint"> <command_interface name="position">
+        <param name="min">-1.57</param>
+        <param name="max">1.57</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="l_joint"> <param name="mimic">r_joint</param>
+      <param name="multiplier">-1</param>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="l_in_joint"> <param name="mimic">l_joint</param>
+      <param name="multiplier">1</param>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="l_out_joint"> <param name="mimic">l_joint</param>
+      <param name="multiplier">1</param> <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="r_in_joint"> <param name="mimic">r_joint</param>
+      <param name="multiplier">1</param>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="r_out_joint"> <param name="mimic">r_joint</param>
+      <param name="multiplier">-1</param> <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="coxa_LF_joint">
+      <command_interface name="position">
+         <param name="min">-1</param> <param name="max">1.5</param> </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="femur_LF_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.75</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="tibla_LF_joint">
+      <command_interface name="position">
+         <param name="min">-1.35</param> <param name="max">0</param> </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="coxa_LM_joint">
+      <command_interface name="position">
+         <param name="min">-1</param> <param name="max">1.5</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="femur_LM_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.75</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="tibla_LM_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.35</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="coxa_LR_joint">
+      <command_interface name="position">
+         <param name="min">-1</param> <param name="max">1.5</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="femur_LR_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.75</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="tibla_LR_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.375</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="coxa_RF_joint">
+      <command_interface name="position">
+         <param name="min">-1.5</param> <param name="max">1</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="femur_RF_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.75</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="tibla_RF_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.375</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="coxa_RM_joint">
+      <command_interface name="position">
+         <param name="min">-1</param> <param name="max">1.5</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="femur_RM_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.75</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="tibla_RM_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.375</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+    <joint name="coxa_RR_joint">
+      <command_interface name="position">
+         <param name="min">-1</param> <param name="max">1.5</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="femur_RR_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.75</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+    <joint name="tibla_RR_joint">
+      <command_interface name="position">
+         <param name="min">-1.75</param> <param name="max">1.375</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
+
+  </ros2_control>
+
+</robot>
