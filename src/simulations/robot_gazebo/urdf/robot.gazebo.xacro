@@ -18,36 +18,34 @@
     <xacro:include filename="$(find robot_gazebo)/urdf/camera.gazebo.xacro"/>
 
     <gazebo>
-        <!-- Joint state publisher -->
-        <plugin filename="$(find ign_ros2_control)/../../lib/libign_ros2_control-system.so" 
-                name="ign_ros2_control::IgnitionROS2ControlPlugin">
+        <plugin filename="gz_ros2_control-system" 
+                name="gz_ros2_control::GazeboSimROS2ControlPlugin">
           <parameters>$(find robot_gazebo)/config/robot_config.yaml</parameters>
         </plugin>
 
-        <!-- joint -->
-        <plugin filename="libignition-gazebo-joint-state-publisher-system.so" name="ignition::gazebo::systems::JointStatePublisher">
+        <plugin filename="gz-sim-joint-state-publisher-system" 
+                name="gz::sim::systems::JointStatePublisher">
             <topic>joint_states</topic>
         </plugin>
 
-        <!-- sensor-liar -->
-        <plugin filename="ignition-gazebo-sensors-system" name="ignition::gazebo::systems::Sensors">
+        <plugin filename="gz-sim-sensors-system" 
+                name="gz::sim::systems::Sensors">
             <render_engine>ogre2</render_engine>
         </plugin>
 
-        <!-- imu -->
-        <plugin filename="ignition-gazebo-imu-system" name="ignition::gazebo::systems::Imu"></plugin>
+        <plugin filename="gz-sim-imu-system" 
+                name="gz::sim::systems::Imu">
+        </plugin>
 
-        <!-- odom -->
-        <plugin
-            filename="ignition-gazebo-odometry-publisher-system"
-            name="ignition::gazebo::systems::OdometryPublisher">
+        <plugin filename="gz-sim-odometry-publisher-system"
+                name="gz::sim::systems::OdometryPublisher">
             <odom_publish_frequency>50</odom_publish_frequency>
             <odom_topic>/odom</odom_topic>
             <odom_frame>odom</odom_frame>
             <robot_base_frame>base_footprint</robot_base_frame>
             <tf_topic>/odom/tf</tf_topic>
         </plugin>
-    </gazebo>   
+    </gazebo>
 
 
 

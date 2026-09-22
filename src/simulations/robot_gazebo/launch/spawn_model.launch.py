@@ -102,7 +102,7 @@ def launch_setup(context):
 
 
     ignition_spawn_entity = Node(
-        package='ros_ign_gazebo',
+        package='ros_gz_sim',
         executable='create',
         output='screen',
         arguments=['-topic', 'robot_description',

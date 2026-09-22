@@ -24,7 +24,7 @@ def launch_setup(context):
 
 
     # get the package directory
-    pkg_share_dir = get_package_share_directory('holonomic_sim')
+    # pkg_share_dir = get_package_share_directory('holonomic_sim')
     robot_gazebo_path = get_package_share_directory('robot_gazebo')
 
 
@@ -32,9 +32,12 @@ def launch_setup(context):
     world = os.path.join(robot_gazebo_path,"worlds", world_name+".sdf")
     ign_gz = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                [os.path.join(get_package_share_directory('ros_ign_gazebo'),
-                'launch', 'ign_gazebo.launch.py')]),
-                launch_arguments=[('ign_args', [' -r ' + world])])
+                [os.path.join(get_package_share_directory('ros_gz_sim'),
+                'launch', 'ros_gz_sim.launch.py')]),
+                launch_arguments={
+                                    'gz_args': f'-r {world}'
+                                }.items()
+    )
 
     # ros_ign_bridge
     ros_ign_bridge_launch = IncludeLaunchDescription(

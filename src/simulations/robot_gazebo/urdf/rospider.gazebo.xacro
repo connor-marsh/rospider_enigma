@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <robot name="arm" xmlns:xacro="http://ros.org/wiki/xacro">
-  <ros2_control name="IgnitionSystem" type="system">
+  <ros2_control name="GazeboSystem" type="system">
     <hardware>
-      <plugin>ign_ros2_control/IgnitionSystem</plugin>
+      <plugin>gz_ros2_control/GazeboSimSystem</plugin>
     </hardware>
 
     <joint name="joint1">
