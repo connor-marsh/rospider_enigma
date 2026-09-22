@@ -1592,23 +1592,34 @@ class TimingGroupedSNN(nn.Module):
     strict `>`, so a unit with no input cannot cross threshold.
 
     Three things can break that and let a hidden unit fire on a timing-silent
-    step. Two are closed by the settings above:
+    step.  All three are closed by the current defaults:
 
-      bias current      closed by bias_mode="voltage"
-      film beta         OPEN -- FiLM's additive term is applied every step,
-                        gated or not, so a unit with positive beta has tonic
-                        drive. The remaining leak.
-      subtractive reset OPEN -- a unit left above threshold after a spike
-                        keeps firing on subsequent silent steps until the
-                        residual is spent.
+      bias current      closed by bias_mode="voltage" -- a bias CURRENT flows
+                        every step, gate or no gate, so it is tonic drive; a
+                        threshold offset never touches the membrane.
+      film beta         closed by film_mode="gamma_only" -- FiLM's additive
+                        term is applied every step regardless of spikes,
+                        whereas gamma is multiplicative and vanishes wherever
+                        the injection is zero. Gamma alone still carries full
+                        per-gait conditioning, which is why this is preferable
+                        to sub_film="none": w1/w2 have no gait axis, so FiLM
+                        is layer 1's only per-gait handle.
+      subtractive reset closed by hidden_reset="zero" -- under subtraction a
+                        unit left above threshold keeps firing on subsequent
+                        silent steps until the residual is spent.
 
-    Both remaining leaks are deliberate. `hidden_reset="zero"` closes the
-    second and gives similar alignment but slightly worse RMSE, because
-    subtractive reset is what converts injection magnitude into a spike COUNT
-    over the following steps -- a useful expansion that both zero reset and
-    explicit gating throw away. `--sub_film none` closes the first at the cost
-    of per-gait conditioning. In practice most hidden units are naturally
-    gated and alignment does emerge, so the leaks are left in.
+    Each of the three costs something, and the reset is the expensive one:
+    subtractive reset is what converts injection MAGNITUDE into a spike COUNT
+    spread over the following steps, a real expansion of what layer 1 can
+    represent, and it measured slightly better on RMSE.  The trade taken here
+    is RMSE against a loss surface on which alignment is determined rather
+    than lucky: with any of these leaks open the sub-networks receive some
+    drive during timing silence, which makes the task loss partly insensitive
+    to WHEN the timing spikes land, and alignment then comes out
+    seed-dependent even while RMSE stays good.
+
+    `--bias_mode current`, `--film_mode gamma_beta` and
+    `--hidden_reset subtract` each reopen one leak, for A/B.
 
     `check_bias_voltage.py` decides, from a checkpoint alone, exactly which
     units can fire without a timing spike and by which mechanism.
@@ -2074,21 +2085,34 @@ class TimingGroupedSNN(nn.Module):
         #            timing spike anyway, so most hidden units cannot fire
         #            without one and the explicit gate has little left to do.
         #   "decay"  input and sub-net spikes explicitly gated; membranes
-        #            still leak every step. Kept because it forces the
-        #            spike-train-only property rather than relying on it, and
-        #            because it strengthens the gradient into the timing layer
-        #            (see the NOTE below). Not the default: it also destroys
-        #            the magnitude-to-spike-count expansion that subtractive
-        #            reset provides, since a gated unit can emit at most one
-        #            spike per timing spike.
+        #            still leak every step. Kept for A/B: it forces the
+        #            spike-train-only property rather than relying on it. Not
+        #            the default -- it destroys the magnitude-to-spike-count
+        #            expansion that subtractive reset provides (a gated unit
+        #            can emit at most one spike per timing spike), and it
+        #            reshapes the gradient into the timing layer in a way that
+        #            is NOT simply "stronger" (see the NOTE).
         #
-        # NOTE the gate multiplies both `cur` and `spk` on each layer, so
-        # gradient reaching spk_t through those paths is scaled up. Forward is
-        # exact (gate is 0/1, so gate*gate == gate). Left uncorrected: it is a
-        # scale factor, and stronger gradient into the timing layer is wanted.
-        # This is the one real advantage "decay" retains over natural gating,
-        # whose forward pass is otherwise equivalent when no hidden unit can
-        # fire on a timing-silent step.
+        # NOTE on gradients.  Under the fully naturally-gated defaults the two
+        # modes have an IDENTICAL forward pass -- gate is 0/1 and everything it
+        # multiplies is already zero wherever gate is 0 -- but they do NOT
+        # train the same, because `gate` is spk_t and carries its surrogate
+        # gradient, so gating makes spk_t appear multiplicatively five extra
+        # times (cur1, spk1, cur2, spk2, curo).  Treating spk_t as the
+        # continuous variable the surrogate pretends it is, a path with k gate
+        # factors goes as s^(1+k), whose derivative is (1+k)*s^k.  So gating:
+        #
+        #   on a SPIKING step  multiplies the gradient by (1+k), up to 6x --
+        #                      amplifying "this spike was badly placed"
+        #   on a SILENT step   makes it EXACTLY ZERO, because both factors of
+        #                      the product vanish there, whereas ungated
+        #                      d(cur1)/d(spk_t) = w1 at every step
+        #
+        # That second line is the one that matters.  The silent-step term is
+        # the only route by which "this unit should have fired HERE" can reach
+        # the timing layer, and gating removes it outright.  So "decay" biases
+        # spike counts downward twice over, and dead timing units should be
+        # MORE likely under it than under full natural gating, not less.
         gated = self.gate_mode != "none"
         # A sub-network updates when ANY of its K timing units fires, so the
         # gate is the OR over that group's selected spikes. At K=1 amax is a
@@ -2335,7 +2359,7 @@ class SingleStepONNXTiming(nn.Module):
 # scale-invariance means raising --spike_stats_lambda cannot compensate.
 #
 # Hence the division of labour: calibration prevents both at init,
-# --spike_free_rate keeps the spike penalty from pruning into silence, and
+# --min_count_floor keeps the spike penalty from pruning into silence, and
 # reinit_timing_units repairs per (gait, unit) whatever still fails.
 
 
@@ -2625,13 +2649,15 @@ class SpikeObjective:
     name = "base"
 
     def __init__(self, lam=0.0, period=254.0, n_gaits=4,
-                 target_rate=None, target_R=None, free_rate=0.0):
+                 target_rate=None, target_R=None,
+                 min_count_floor=0.0, floor_weight=1.0):
         self.lam        = float(lam)
         self.period     = float(period)
         self.n_gaits    = int(n_gaits)
         self.target_rate = target_rate     # CPG spikes per cycle
         self.target_R    = target_R        # CPG circular concentration
-        self.free_rate   = float(free_rate)  # spikes/cycle charged at zero
+        self.min_count_floor = float(min_count_floor)   # spikes/cycle
+        self.floor_weight    = float(floor_weight)
 
     # -- shared helper ------------------------------------------------
     def _grouped(self, spk, gait, mask):
@@ -2746,52 +2772,73 @@ class MinCountSpikeObjective(SpikeObjective):
     squared cost pushes hard at high rates and then gives up as the rate
     falls, which is the opposite of what is wanted.
 
-    FREE ALLOWANCE (`free_rate`, in spikes per CYCLE).  Only the excess above
-    it is charged:
+    FLOOR (`min_count_floor`, in spikes per CYCLE).  The penalty is a
+    two-sided hinge around it:
 
-        penalty = lam * relu(duty - free_rate/period)
+        penalty = lam * (       relu(duty - floor/period)
+                  + floor_weight * relu(floor/period - duty) )
 
-    The point is the relu, not the offset.  With no allowance the marginal
-    cost per spike is the same at 40 spk/cyc and at 1, so the penalty keeps
-    pushing all the way to zero, and a unit that reaches silence is
-    UNRECOVERABLE: a silent timing unit passes exactly zero gradient to the
-    w1 slots it feeds, so the task loss can no longer object.  Observed
-    directly -- a run pruned several sub-networks to an excellent 2-5
-    well-placed spikes per cycle and pruned a handful of others to 0.
+    ABOVE the floor this is the L1 sparsity term, marginal cost lam per spike.
+    BELOW it the second hinge takes over with the OPPOSITE sign of gradient,
+    so descent increases the rate -- a reward for spiking, which is what stops
+    a unit being pruned into silence.
 
-    The relu removes the pressure entirely once a unit is at or below the
-    allowance (gradient is exactly zero there), so pruning stops at the
-    allowance instead of continuing to silence.  It adds no upward pressure
-    either; the task loss is still the only floor.
+    WHY A HINGE AND NOT A LINEAR FUNCTION.  Writing the term as
+    lam*(duty - floor/period) looks like it should reward spiking below the
+    floor, and it does make the penalty negative there -- but a linear
+    function has a CONSTANT derivative, so subtracting the floor changes the
+    penalty's value and not its gradient.  lam*(duty - floor) and lam*duty are
+    gradient-identical at every rate, i.e. the linear version is exactly the
+    un-floored penalty.  The nonlinearity is the whole mechanism; only a kink
+    at the floor can make the gradient change sign there.
 
-    free_rate=0 reproduces the original behaviour exactly, since duty is
-    non-negative so relu is the identity.
+    WHY THIS IS NEEDED AT ALL.  With no floor the marginal cost per spike is
+    identical at 40 spk/cyc and at 1, so the penalty keeps pushing all the way
+    to zero, and a unit that reaches silence is UNRECOVERABLE through the task
+    loss: it passes exactly zero gradient to the w1 slots it feeds, so the
+    task can no longer object.  Observed directly -- a run pruned several
+    sub-networks to an excellent 2-5 well-placed spikes per cycle and pruned a
+    handful of others to 0.  The floor term does still reach a silent unit,
+    because it acts on the timing membrane through spike_fn's surrogate, which
+    is small but non-zero below threshold (~0.03 at timing_slope=5), rather
+    than through the sub-network like the task loss.
+
+    WHAT IT COSTS.  A two-sided hinge makes the floor an ATTRACTOR, not just a
+    floor: a unit the task would rather run at 1 spk/cyc gets pushed to the
+    floor.  That is a real departure from "spend as few spikes as possible",
+    which is why the floor should be set to the fewest spikes a sub-network
+    can do anything with, not to a comfortable number.  `floor_weight=0`
+    recovers the pure one-sided version (pruning stops at the floor, but
+    nothing pushes back up), and `min_count_floor=0` recovers the original
+    un-floored L1 exactly.
 
     Note this does NOT address the opposite failure.  A unit that ends up
     saturated sits far above threshold where spike_fn's surrogate is down
     1e2-1e3x, so the penalty's gradient there is ~1e-6, and Adam's
-    scale-invariance means raising lam cannot compensate.  Saturation has to
-    be fixed by re-rolling or rescaling the unit, not by this term.
+    scale-invariance means raising lam cannot compensate.  Saturation is
+    handled by `reinit_timing_units`, which scales the offending column down.
 
     Other mitigations: `--spike_lambda_warmup` ramps lam from 0 so the network
     learns to use spikes before being charged for them, and
-    `--reinit_dead_after` revives units that die anyway.
+    `--reinit_dead_after` repairs (gait, unit) pairs that fail anyway.
     """
 
     name = "min_count"
 
     def penalty(self, spk, gait, phase, mask):
         rate, present, cnt, oh = self._grouped(spk, gait, mask)
-        # rate is per-TIMESTEP duty; free_rate is per CYCLE, so convert.
-        free_duty = self.free_rate / self.period
-        excess = torch.relu(rate - free_duty)
+        # rate is per-TIMESTEP duty; the floor is per CYCLE, so convert.
+        floor_duty = self.min_count_floor / self.period
+        over  = torch.relu(rate - floor_duty)
+        under = torch.relu(floor_duty - rate)
+        term  = over + self.floor_weight * under
         denom = present.sum().clamp(min=1.0) * spk.shape[2]
-        return self.lam * (excess * present).sum() / denom
+        return self.lam * (term * present).sum() / denom
 
     def describe(self):
         return (f"min_count (lam={self.lam:g}, linear/L1 in duty cycle above "
-                f"a free {self.free_rate:g} spk/cyc; the task loss supplies "
-                f"the floor)")
+                f"a floor of {self.min_count_floor:g} spk/cyc, "
+                f"floor_weight={self.floor_weight:g})")
 
 
 SPIKE_OBJECTIVES = {cls.name: cls for cls in (
@@ -3908,7 +3955,7 @@ def main():
                          "training benefits from a continuous-activity CPG "
                          "ahead of the real one being retuned to produce this "
                          "directly.")
-    ap.add_argument("--n_cpg_neurons", type=int, default=4,
+    ap.add_argument("--n_cpg_neurons", type=int, default=6,
                     choices=sorted(CPG_W_BY_N),
                     help="CPG size. Selects the coupling matrix from "
                          "CPG_W_BY_N and sets the SNN's input width; nothing "
@@ -4025,24 +4072,29 @@ def main():
                          "whether the period is 352 (real CPG) or 120 "
                          "(--fake_cpg); the old fixed 1200-step window was 10 "
                          "cycles at the latter and unreadably dense.")
-    ap.add_argument("--hidden_reset", type=str, default="subtract",
+    ap.add_argument("--hidden_reset", type=str, default="zero",
                         choices=["zero", "subtract"],
                         help="[timing_grouped] Membrane reset for the hidden "
-                             "layer. 'subtract' (default) leaves the residual "
-                             "mem-thresh, which can still exceed threshold, so "
-                             "a strongly-driven unit re-fires on the SILENT "
-                             "steps after a timing spike. That converts "
-                             "injection MAGNITUDE into a spike COUNT spread "
-                             "over the following steps, which is a real "
-                             "expansion of what layer 1 can represent, and it "
-                             "measured slightly better on RMSE. "
-                             "'zero' matches the CPG (LIFGeneralArray does "
-                             "v[spike]=0) and caps each unit at one spike per "
-                             "timing spike, which closes one of the two "
-                             "natural-gating leaks (see NATURAL GATING in "
-                             "TimingGroupedSNN's docstring) at the cost of "
-                             "that expansion; alignment came out similar, RMSE "
-                             "slightly worse.")
+                             "layer. 'zero' (default) matches the CPG "
+                             "(LIFGeneralArray does v[spike]=0) and caps each "
+                             "unit at one spike per timing spike. Together "
+                             "with --bias_mode voltage and --film_mode "
+                             "gamma_only it closes the last path by which a "
+                             "hidden unit can fire on a timing-silent step, so "
+                             "the sub-networks are FULLY naturally gated — see "
+                             "NATURAL GATING in TimingGroupedSNN's docstring. "
+                             "'subtract' leaves the residual mem-thresh, which "
+                             "can still exceed threshold, so a strongly-driven "
+                             "unit re-fires on the silent steps after a timing "
+                             "spike. That converts injection MAGNITUDE into a "
+                             "spike COUNT spread over the following steps, a "
+                             "real expansion of what layer 1 can represent, "
+                             "and it measured slightly better on RMSE — but it "
+                             "also leaves the task loss partly insensitive to "
+                             "when the timing spikes land, which is what makes "
+                             "alignment seed-dependent. The trade is RMSE "
+                             "against a loss surface where alignment is "
+                             "determined rather than lucky.")
     ap.add_argument("--timing_slope", type=float, default=5.0,
                     help="[timing_grouped] Surrogate-gradient slope for the "
                          "TIMING layer only; --slope still applies to the "
@@ -4137,25 +4189,38 @@ def main():
                          "wins wherever spikes genuinely matter. Raise it if "
                          "the spike rate stays stubbornly high, LOWER it if "
                          "units collapse toward silence. 0 disables.")
-    ap.add_argument("--spike_free_rate", type=float, default=2.0,
+    ap.add_argument("--min_count_floor", type=float, default=2.0,
                     help="[--spike_objective min_count] Spikes per cycle, per "
-                         "(gait, timing unit), charged at zero. Only the "
-                         "EXCESS above this is penalised: "
-                         "lam * relu(duty - free_rate/period). The point is "
-                         "the relu. With no allowance the marginal cost per "
-                         "spike is identical at 40 spk/cyc and at 1, so the "
-                         "penalty keeps pushing to zero, and a unit that "
-                         "reaches silence cannot recover -- it passes exactly "
-                         "zero gradient to the w1 slots it feeds, so the task "
-                         "loss can no longer object. Observed: a run pruned "
-                         "several sub-networks to an excellent 2-5 well-placed "
-                         "spikes/cycle and pruned others to 0. With an "
-                         "allowance the gradient is exactly zero at or below "
-                         "it, so pruning stops there. Adds NO upward pressure; "
-                         "the task loss is still the only floor. 0 reproduces "
-                         "the original un-allowanced behaviour exactly. Does "
-                         "not help with saturation, which the penalty cannot "
-                         "reach at all -- see MinCountSpikeObjective.")
+                         "(gait, timing unit), that the penalty aims at as a "
+                         "lower bound. The penalty is a TWO-SIDED HINGE: "
+                         "lam * (relu(duty - floor/period) + "
+                         "floor_weight * relu(floor/period - duty)). Above "
+                         "the floor it is the usual L1 sparsity cost; below "
+                         "it the gradient reverses sign, so descent pushes "
+                         "the rate back UP. That is what stops a unit being "
+                         "pruned into silence, which is unrecoverable through "
+                         "the task loss (a silent unit passes exactly zero "
+                         "gradient to the w1 slots it feeds). Observed: a run "
+                         "pruned several sub-networks to an excellent 2-5 "
+                         "well-placed spikes/cycle and pruned others to 0. "
+                         "Note a linear term would NOT do this — a constant "
+                         "derivative means subtracting the floor changes the "
+                         "penalty's value but not its gradient, so the linear "
+                         "form is identical to no floor at all; only a kink "
+                         "can flip the sign. Set to the fewest spikes a "
+                         "sub-network can do anything with, not a comfortable "
+                         "number, since the hinge makes the floor an "
+                         "attractor. 0 recovers the original un-floored L1.")
+    ap.add_argument("--min_count_floor_weight", type=float, default=1.0,
+                    help="[--spike_objective min_count] Weight on the "
+                         "BELOW-floor half of the hinge, relative to lam. "
+                         "1.0 (default) is symmetric: equal pressure per "
+                         "spike in both directions. 0.0 makes the floor "
+                         "one-sided — pruning stops there but nothing pushes "
+                         "back up, so units can still drift to silence via "
+                         "the task gradient. Raise above 1.0 if units still "
+                         "die; lower it if the floor is dragging units up "
+                         "that the task would rather run sparser.")
     ap.add_argument("--spike_lambda_warmup", type=int, default=10,
                     help="[timing_grouped] Epochs over which the spike "
                          "penalty's lambda ramps linearly from 0. Insurance "
@@ -4219,11 +4284,20 @@ def main():
                          "TimingGroupedSNN's docstring. "
                          "'decay': input and sub-net spikes explicitly gated, "
                          "membranes still leak every step. Forces the "
-                         "spike-train-only property instead of relying on it, "
-                         "and strengthens the gradient into the timing layer, "
-                         "but caps each hidden unit at one spike per timing "
-                         "spike and so discards the magnitude-to-count "
-                         "expansion that subtractive reset provides.")
+                         "spike-train-only property instead of relying on it. "
+                         "Under the fully naturally-gated defaults its FORWARD "
+                         "pass is identical to 'none', but it does not train "
+                         "the same: `gate` is spk_t and carries its surrogate "
+                         "gradient, so gating amplifies the gradient on "
+                         "SPIKING steps (up to 6x, from five extra "
+                         "multiplicative appearances) and makes it EXACTLY "
+                         "ZERO on silent steps -- removing the only route by "
+                         "which 'this unit should have fired here' reaches the "
+                         "timing layer. So it biases spike counts downward "
+                         "twice over. It also caps each hidden unit at one "
+                         "spike per timing spike, discarding the "
+                         "magnitude-to-count expansion subtractive reset "
+                         "provides.")
     ap.add_argument("--sub_film", type=str, default="both",
                     choices=["none", "l1", "l2", "both"],
                     help="[timing_grouped] Which sub-network layers get "
@@ -4712,10 +4786,24 @@ def main():
                   f"only on its own timing spike, and its spikes are "
                   f"suppressed in between; membranes still decay.")
         elif args.bias_mode == "voltage":
-            print(f"      natural gating: no explicit gate, but voltage-mode "
-                  f"bias means the sub-networks are driven only on timing "
-                  f"spikes. Run check_bias_voltage.py to see which units can "
-                  f"still fire without one (film beta is the remaining path).")
+            leaks = []
+            if args.film_mode != "gamma_only":
+                leaks.append("film beta")
+            if args.hidden_reset != "zero":
+                leaks.append("subtractive reset")
+            if leaks:
+                print(f"      natural gating PARTIAL: voltage-mode bias means "
+                      f"the sub-networks are driven only on timing spikes, but "
+                      f"{' and '.join(leaks)} can still fire a hidden unit "
+                      f"without one. Run check_bias_voltage.py to see which.")
+            else:
+                print(f"      natural gating FULL: no explicit gate, and no "
+                      f"path by which a hidden unit can fire on a "
+                      f"timing-silent step (voltage bias, gamma-only FiLM, "
+                      f"zero reset). gate_mode=decay should now give a "
+                      f"bit-identical FORWARD pass — but not identical "
+                      f"training, since the gate carries spk_t's surrogate "
+                      f"gradient (see the NOTE in step()).")
         if args.spike_objective == "cpg_match":
             print(f"      NOTE --spike_objective cpg_match wants every spike "
                   f"at ONE cycle phase, whereas the sub-networks need spikes "
@@ -4855,7 +4943,8 @@ def main():
         lam=args.spike_stats_lambda, period=period,
         n_gaits=len(gait_tables),
         target_rate=cpg_rate, target_R=cpg_R,
-        free_rate=args.spike_free_rate)
+        min_count_floor=args.min_count_floor,
+        floor_weight=args.min_count_floor_weight)
 
     # Defined for both branches so the config can always report them.
     best          = float("nan")
@@ -5071,7 +5160,8 @@ def main():
                                  if args.arch == "timing_grouped" else None),
             "spike_objective":  (spike_obj.describe()
                                  if args.arch == "timing_grouped" else None),
-            "spike_free_rate":  float(args.spike_free_rate),
+            "min_count_floor":  float(args.min_count_floor),
+            "min_count_floor_weight": float(args.min_count_floor_weight),
             "sub_film":         str(args.sub_film),
             "film_mode":        str(args.film_mode),
             "readout_gait_bias": (bool(args.readout_gait_bias)
