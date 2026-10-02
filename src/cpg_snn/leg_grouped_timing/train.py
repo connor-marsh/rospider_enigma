@@ -892,19 +892,29 @@ def load_gait_tables(names, gaits_dir):
 
 def default_leg_layout(n_cpg_neurons, n_joints):
     """
-    (n_legs, leg_cols) for a known (n_cpg_neurons, n_joints) combination.
+    (n_legs, leg_cols) for a known n_joints.  Keyed on n_joints ALONE:
+    leg_cols is which columns belong to which leg, which is a property of the
+    ROBOT, not of how many CPG neurons happen to be driving it, so the same
+    layout applies whether --n_cpg_neurons is 6 (one per leg) or 18 (one per
+    joint).
 
-    Quadruped (4, 8): column j and column j+4 share a circular phase offset,
-    confirmed numerically against the four quadruped tables — see the module
-    docstring.  Hexapod (6, 18): rows are ordered leg-major, 3 columns per
-    leg (coxa, femur, tibia), legs in LF/LM/LR/RF/RM/RR order.
+    n_joints=8 (quadruped): column j and column j+4 share a circular phase
+    offset, confirmed numerically against the four quadruped tables — see the
+    module docstring.  n_joints=18 (hexapod): rows are ordered leg-major, 3
+    columns per leg (coxa, femur, tibia), legs in LF/LM/LR/RF/RM/RR order.
 
     Raises for anything else rather than guessing — pass --leg_cols for a
     layout this hasn't seen.
     """
-    if n_cpg_neurons == 4 and n_joints == 8:
+    # Keyed off n_joints ALONE, not n_cpg_neurons: leg_cols is robot anatomy
+    # (which columns belong to which leg), and anatomy does not change when
+    # --n_cpg_neurons goes from 6 (one per leg) to 18 (one per joint) -- it is
+    # still the same 6-legged, 18-joint hexapod either way. n_cpg_neurons is
+    # accepted only to keep this function's signature, and the error message
+    # below, informative about what was actually asked for.
+    if n_joints == 8:
         return N_LEGS, [list(c) for c in LEG_COLS]
-    if n_cpg_neurons == 6 and n_joints == 18:
+    if n_joints == 18:
         return HEXAPOD_N_LEGS, [list(c) for c in HEXAPOD_LEG_COLS]
     raise ValueError(
         f"No known leg layout for n_cpg_neurons={n_cpg_neurons}, "
