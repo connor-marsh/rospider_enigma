@@ -97,7 +97,7 @@ What changed vs. the previous (conductance-based CPG + event-window) version
     n_timing spikes, is not wired up.
 
 6.  CPG size is an argument.
-    `--n_cpg_neurons {3,4,6}` selects a coupling matrix from CPG_W_BY_N and
+    `--n_cpg_neurons` selects a coupling matrix from CPG_W_BY_N and
     sizes the SNN input; nothing downstream assumes 4.  from_fb_weight is
     fixed at CPG_FROM_FB_WEIGHT for every N (confirmed to work for both
     N=4 and the ported N=3/N=6), so there is no regime to configure here.
@@ -415,7 +415,30 @@ CPG_W_BY_N = {
         [-486.03391005, -386.7920052 , -412.91478912, -437.7646991 ,     0.0      , -288.47748806],
         [-112.97808475, -510.59115452, -367.63412082, -374.83106147, -393.86103887,     0.0      ],
     ], dtype=np.float64),
+
+    # PLACEHOLDER, --fake_cpg ONLY.  18 gives one CPG neuron per JOINT rather
+    # than per leg, which triples the phase resolution available to the timing
+    # layer: the reachable spike times are the CPG's own spike times, so a
+    # timing unit can start its burst anywhere on a 2-step grid, and with 18
+    # back-to-back bursts the window a unit is confined to shrinks from 1/6 of
+    # a cycle to 1/18.  That is the quantity that limits how closely a timing
+    # unit can sit to its joint's peak velocity without having to cross a
+    # weight-space barrier between bursts.
+    #
+    # Zeros is NOT a working oscillator.  With no inhibitory coupling all 18
+    # neurons would fire in phase, which destroys both the even phase spacing
+    # and the one-spike-per-timestep property the whole model assumes.  It is
+    # safe only because `fake_step_chunk` synthesises its spike train
+    # arithmetically and never reads W (nor any state the warmup leaves), so
+    # under --fake_cpg the matrix is genuinely unused.  Guarded in `run_cpg`
+    # rather than left as a trap.  Replace with a real tuned matrix before
+    # running N=18 against the real oscillator.
+    18: np.zeros((18, 18), dtype=np.float64),
 }
+
+# Sizes whose entry in CPG_W_BY_N is a placeholder rather than a tuned
+# oscillator, and which therefore require --fake_cpg.
+CPG_W_FAKE_ONLY = {18}
 
 
 def cpg_weight_matrix(N):
@@ -586,8 +609,20 @@ def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False):
     fake_cpg=True substitutes fake_step_chunk's back-to-back, no-gap bursts
     for the real oscillator's output -- see that method's docstring.
     """
+    if N in CPG_W_FAKE_ONLY and not fake_cpg:
+        raise ValueError(
+            f"--n_cpg_neurons {N} has only a PLACEHOLDER coupling matrix "
+            f"(zeros) in CPG_W_BY_N, so it requires --fake_cpg 1, whose "
+            f"spike train is synthesised arithmetically and never reads W. "
+            f"With the real oscillator a zero matrix leaves the neurons "
+            f"uncoupled, so they fire in phase -- which breaks both the even "
+            f"phase spacing and the one-spike-per-timestep property the "
+            f"timing layer assumes. Add a tuned matrix for N={N} first.")
     cpg = LIFCPGStepper(N=N, i_app=i_app)
     print(f"  N={N}  i_app={i_app}  from_fb_weight={CPG_FROM_FB_WEIGHT:g}")
+    if N in CPG_W_FAKE_ONLY:
+        print(f"  (N={N} coupling matrix is a --fake_cpg-only placeholder; "
+              f"W is unused)")
     if fake_cpg:
         print(f"  FAKE CPG: back-to-back bursts, no inter-burst gap "
               f"(see fake_step_chunk)")
@@ -3959,7 +3994,17 @@ def main():
                     choices=sorted(CPG_W_BY_N),
                     help="CPG size. Selects the coupling matrix from "
                          "CPG_W_BY_N and sets the SNN's input width; nothing "
-                         "downstream assumes 4.")
+                         "downstream assumes a particular value. 6 is one "
+                         "neuron per leg. 18 is one per JOINT and needs "
+                         "--fake_cpg 1, since its matrix is a zeros "
+                         "placeholder (see CPG_W_BY_N) — it triples the phase "
+                         "resolution the timing layer can reach, because a "
+                         "timing unit can only spike on a timestep where some "
+                         "CPG neuron spikes, so more, narrower bursts shrink "
+                         "the window a unit is confined to from 1/6 of a cycle "
+                         "to 1/18. Note it also lengthens fake_step_chunk's "
+                         "period (n_spikes * N), so every period-derived "
+                         "default moves with it.")
 
     # gait tables
     ap.add_argument("--gaits_dir", type=str, default="../gaits",
