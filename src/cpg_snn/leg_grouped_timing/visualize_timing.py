@@ -184,6 +184,135 @@ def timing_raster(model, spikes, gait_idx, device):
     return model.timing_only(x, gg)[:, 0].cpu().numpy()
 
 
+def _read_metrics_csv(path):
+    """
+    Minimal metrics.csv reader: header row fixes column names, every other
+    row is parsed as float where possible, "" (MetricsWriter's blank for a
+    value not measured this epoch) becomes NaN.
+
+    Plain `csv`, not pandas -- nothing else in this file uses pandas and a
+    second tabular library for one reader is not worth the import.
+    """
+    import csv
+    rows = []
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            parsed = {}
+            for k, v in row.items():
+                if v == "" or v is None:
+                    parsed[k] = float("nan")
+                else:
+                    try:
+                        parsed[k] = float(v)
+                    except ValueError:
+                        parsed[k] = v          # non-numeric column, keep as-is
+            rows.append(parsed)
+    return rows
+
+
+def plot_timing_rate_history(metrics_csv, timing_cols, leg_cols, gait_names,
+                             out_dir, dpi):
+    """
+    How each timing unit's firing rate evolved over training, one gait per
+    line, laid out on the SAME leg grid as plot_alignment: n_legs rows x
+    C columns (3x6 for the hexapod), so a panel's position means the same
+    thing in both figures -- row = leg, column = joint-within-leg.
+
+    The panel at (leg, k) shows the timing unit RESPONSIBLE for that column
+    (`leg_cols[leg][k]`, looked up through `timing_cols` exactly as
+    plot_alignment's `owner` does), not literally "unit number 3*leg+k" --
+    those coincide at --timing_shape per_leg but not at per_joint, and this
+    plot is only informative once it is right about which unit is which.
+
+    Reads metrics.csv rather than taking an array, because the history is
+    only known epoch-by-epoch where the eval landed: MetricsWriter leaves
+    "spk_{gait}_t{u}" blank on every epoch that wasn't a timing_log_every
+    multiple, and this function is what turns those blanks into gaps in the
+    line rather than a crash.  Requires the run to have been trained with the
+    metrics.csv change that adds these columns -- older runs simply won't
+    have them, and this prints a note and returns rather than erroring.
+    """
+    rows = _read_metrics_csv(metrics_csv)
+    if not rows:
+        print(f"  [timing rate history] {metrics_csv} is empty, skipping")
+        return
+    epochs = np.array([r["epoch"] for r in rows])
+
+    cols = set(rows[0].keys())
+    have_any = any(c.startswith("spk_") for c in cols)
+    if not have_any:
+        print(f"  [timing rate history] no spk_<gait>_t<unit> columns in "
+              f"{metrics_csv} -- this run predates that logging, or wasn't "
+              f"--arch timing_grouped. Skipping.")
+        return
+
+    n_legs = len(leg_cols)
+    C      = len(leg_cols[0])
+    owner  = {c: t for t, tc in enumerate(timing_cols) for c in tc}
+    tnames = joint_type_names(C)
+
+    fig, axes = plt.subplots(n_legs, C, figsize=(4.2 * C, 2.6 * n_legs),
+                             squeeze=False, sharex=True)
+
+    missing_cols = set()
+    for leg in range(n_legs):
+        for k in range(C):
+            ax  = axes[leg, k]
+            col = leg_cols[leg][k]
+            u   = owner.get(col)
+            if u is None:
+                ax.set_visible(False)
+                continue
+            for gi, gname in enumerate(gait_names):
+                key = f"spk_{gname}_t{u}"
+                if key not in cols:
+                    missing_cols.add(key)
+                    continue
+                y = np.array([r.get(key, float("nan")) for r in rows])
+                ok = np.isfinite(y)
+                if not ok.any():
+                    continue
+                ax.plot(epochs[ok], y[ok], color=TIMING_PALETTE[gi % len(TIMING_PALETTE)],
+                        marker=".", ms=3, lw=1.1, label=gname)
+            ax.set_title(f"leg {leg} · {tnames[k]} (col {col}) ← T{u}",
+                        fontsize=8)
+            ax.grid(alpha=0.2)
+            if leg == n_legs - 1:
+                ax.set_xlabel("epoch", fontsize=7)
+            if k == 0:
+                ax.set_ylabel("spk/cycle", fontsize=7)
+            ax.tick_params(labelsize=6)
+
+    # One legend for the whole figure rather than one per panel -- the gait
+    # set and its colours are the same in every panel, so n_legs*C copies of
+    # it would be pure repetition.
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if not handles:
+        # Panel (0,0) may have been the one skipped as not-yet-firing; pull
+        # the legend from whichever panel actually has lines.
+        for ax in axes.ravel():
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                break
+    if handles:
+        fig.legend(handles, labels, loc="upper center",
+                  ncol=min(len(labels), 8), fontsize=8,
+                  bbox_to_anchor=(0.5, 1.02))
+
+    if missing_cols:
+        print(f"  [timing rate history] {len(missing_cols)} expected "
+              f"column(s) not found in metrics.csv (e.g. "
+              f"{sorted(missing_cols)[:3]}) -- gait list may have changed "
+              f"mid-run; those lines are simply absent.")
+
+    fig.suptitle("Timing-layer spk/cycle over training, by gait  "
+                 "(rows = legs, cols = joints within a leg)",
+                 fontsize=10, fontweight="bold", y=1.0)
+    plt.tight_layout(rect=(0, 0, 1, 0.96))
+    _savefig(fig, out_dir, "timing_rate_history.png", dpi)
+
+
 @torch.no_grad()
 def predict_and_membranes(model, spikes, gait_idx, device, warm, tgt_range,
                           keep_membranes=True, max_mem_steps=1500):
@@ -1124,6 +1253,13 @@ def run_visualization(model_dir, out_dir=None, args=None):
                                out_dir, args.dpi)
         routing = plot_routing(model, all_names, device, period,
                                out_dir, args.dpi)
+        metrics_csv = model_dir / "metrics.csv"
+        if metrics_csv.exists():
+            plot_timing_rate_history(metrics_csv, timing_cols, leg_cols,
+                                     plotted, out_dir, args.dpi)
+        else:
+            print(f"  [timing rate history] {metrics_csv} not found, "
+                  f"skipping")
     plot_taus(model, period, cfg, out_dir, args.dpi)
 
     # ── 4b. reconstruction + transitions ────────────────────────

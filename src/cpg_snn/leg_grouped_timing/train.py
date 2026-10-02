@@ -3492,6 +3492,36 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                       f"{vsw:>13.6f}  {opt.param_groups[0]['lr']:>9.2e}"
                       f"  {tr_gnorm:>8.3f}  {upd:>8.3f}  {epoch_s:>6.1f}{flag}")
 
+            # Run the timing diagnostic BEFORE metrics.write, not after, so
+            # this epoch's spike rates can land in THIS epoch's row rather
+            # than the next eval epoch's. Printing is deferred to the usual
+            # spot below so stdout order is unchanged; only the data is
+            # gathered early. This also matters for MetricsWriter itself: its
+            # columns are fixed from the FIRST row written, and epoch == 1
+            # always runs this diagnostic, so the rate columns are guaranteed
+            # to exist from the start rather than depending on when the first
+            # eval happens to land.
+            run_timing_diag = (timing_diag is not None and
+                               (epoch % args.timing_log_every == 0
+                                or epoch == 1))
+            timing_lines = None
+            if run_timing_diag:
+                timing_lines, last_timing_stats = timing_diag()
+
+            # Flattened spk/cyc per (gait, timing unit), one column each, so
+            # metrics.csv carries the same number this epoch's printed timing
+            # report does. Column name uses the gait's NAME (e.g. "tripod"),
+            # not its index, so it survives --gaits reordering across runs.
+            # Blank on non-eval epochs (MetricsWriter.write renders None as
+            # ""), which is also how a reader should distinguish "not
+            # measured this epoch" from "measured at zero".
+            spike_rate_cols = {}
+            if last_timing_stats:
+                for st in last_timing_stats:
+                    for u, r in enumerate(st["rate"]):
+                        spike_rate_cols[f"spk_{st['gait']}_t{u}"] = (
+                            r if run_timing_diag else None)
+
             metrics.write({
                 "epoch": epoch, "train": tr_loss, "val": va_loss,
                 "val_post_switch": vsw, "lr": opt.param_groups[0]["lr"],
@@ -3500,6 +3530,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 "best": int(flag.strip() == "*"),
                 **{f"grad_{b}": gblk[b] for b in sorted(blocks)},
                 **{f"upd_{b}": ublk[b] for b in sorted(blocks)},
+                **spike_rate_cols,
             })
 
             # Per-block breakdown, on the diagnostic cadence so the main
@@ -3519,11 +3550,11 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                           f"{ublk[b]/math.sqrt(max(npar,1)):>11.2e}")
 
             # Timing layer: cheap (timing units only, batch 1) but it prints
-            # n_gaits lines, so it runs on its own slower cadence.
-            if timing_diag is not None and (
-                    epoch % args.timing_log_every == 0 or epoch == 1):
-                lines, last_timing_stats = timing_diag()
-                for ln in lines:
+            # n_gaits lines, so it runs on its own slower cadence. The actual
+            # call happened earlier (before metrics.write, see above); this
+            # is just the print plus the reinit logic that depends on it.
+            if run_timing_diag:
+                for ln in timing_lines:
                     print(ln)
 
                 # Failures are tracked per (gait, unit), because the fix is:
