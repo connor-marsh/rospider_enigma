@@ -393,6 +393,54 @@ def git_info():
 # now point at the coupling matrix or i_app rather than this weight.
 CPG_FROM_FB_WEIGHT = -1_000_000.0
 
+# ── tunable CPG parameters: name -> (default, help) ──────────────────
+# ONE source of truth, read by three places that previously each carried
+# their own copy of these literals: argparse (which builds --cpg_<name> for
+# every entry), LIFCPGStepper's construction in run_cpg, and the config dump.
+# They were hardcoded in the dump as bare numbers duplicated from
+# LIFCPGStepper's signature, so the config silently lied about any value that
+# differed -- and visualize_timing.replay_cpg reads the dump to reproduce the
+# exact oscillator, so a lie there means figures drawn against the wrong CPG.
+#
+# from_fb_weight is deliberately NOT here: it is fixed at CPG_FROM_FB_WEIGHT
+# for every N (see the note above), so there is nothing for a caller to get
+# wrong by omission.
+#
+# The two that shape the burst, and which are the reason this is configurable
+# at all:
+#   vth_fb       spikes per burst. The feedback neuron integrates
+#                to_fb_weight per main spike with no leak, so it terminates
+#                the burst after vth_fb/to_fb_weight of them. LOWER to get
+#                shorter bursts.
+#   refrac_main  steps between spikes WITHIN a burst (ISI = refrac_main + 1).
+#                RAISE to spread a burst out in time.
+# Both change the fake-CPG period, which is
+# (vth_fb/to_fb_weight) * (refrac_main+1) * N -- and every period-derived
+# default moves with it. run_cpg prints the resulting structure.
+CPG_PARAMS = {
+    "vth_main":     (100.0, "Main-neuron spike threshold."),
+    "du_main":      (0.1,   "Main-neuron current decay."),
+    "dv_main":      (0.3,   "Main-neuron voltage decay."),
+    "refrac_main":  (1,     "Main-neuron refractory period, in steps. Sets "
+                            "the inter-spike interval WITHIN a burst: "
+                            "ISI = refrac_main + 1. Raise to spread bursts "
+                            "out in time."),
+    "vth_fb":       (100.0, "Feedback-neuron threshold. Sets SPIKES PER "
+                            "BURST: the feedback neuron integrates "
+                            "to_fb_weight per main spike with no leak, so it "
+                            "terminates the burst after vth_fb/to_fb_weight "
+                            "spikes. Lower for shorter bursts."),
+    "du_fb":        (1.0,   "Feedback-neuron current decay."),
+    "dv_fb":        (0.0,   "Feedback-neuron voltage decay. 0 = pure "
+                            "integrator, which is what makes the burst "
+                            "length exactly vth_fb/to_fb_weight."),
+    "refrac_fb":    (1,     "Feedback-neuron refractory period, in steps."),
+    "to_fb_weight": (10.0,  "Main->feedback weight. Together with vth_fb "
+                            "this sets spikes per burst; prefer changing "
+                            "vth_fb and leaving this alone, so the ratio "
+                            "stays easy to read."),
+}
+
 CPG_W_BY_N = {
     3: np.asarray([
         [    0.0      , -523.65135942, -593.28982051],
@@ -595,12 +643,18 @@ class LIFCPGStepper:
         self.t = 0
 
 
-def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False):
+def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False,
+            cpg_params=None):
     """Warm up, then collect the spike train used for training.
 
     `N` is deliberately positional-with-no-default: it selects the coupling
     matrix, and a wrong value changes the oscillator rather than raising, so
     the caller is made to say it.
+
+    `cpg_params` is a dict over CPG_PARAMS' keys; None takes every default
+    from that table. The caller passes the same dict that goes into the
+    config, so the oscillator that ran and the one the config describes
+    cannot differ.
 
     from_fb_weight is not a parameter here: it is fixed at
     CPG_FROM_FB_WEIGHT (see LIFCPGStepper) for every N, so there is nothing
@@ -609,6 +663,12 @@ def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False):
     fake_cpg=True substitutes fake_step_chunk's back-to-back, no-gap bursts
     for the real oscillator's output -- see that method's docstring.
     """
+    cpg_params = ({k: v[0] for k, v in CPG_PARAMS.items()}
+                  if cpg_params is None else dict(cpg_params))
+    unknown = set(cpg_params) - set(CPG_PARAMS)
+    if unknown:
+        raise ValueError(f"unknown cpg_params key(s) {sorted(unknown)}; "
+                         f"expected a subset of {sorted(CPG_PARAMS)}")
     if N in CPG_W_FAKE_ONLY and not fake_cpg:
         raise ValueError(
             f"--n_cpg_neurons {N} has only a PLACEHOLDER coupling matrix "
@@ -618,11 +678,40 @@ def run_cpg(N, tmax=120_000, warmup=2_000, i_app=8.0, fake_cpg=False):
             f"uncoupled, so they fire in phase -- which breaks both the even "
             f"phase spacing and the one-spike-per-timestep property the "
             f"timing layer assumes. Add a tuned matrix for N={N} first.")
-    cpg = LIFCPGStepper(N=N, i_app=i_app)
+    cpg = LIFCPGStepper(N=N, i_app=i_app, **cpg_params)
     print(f"  N={N}  i_app={i_app}  from_fb_weight={CPG_FROM_FB_WEIGHT:g}")
     if N in CPG_W_FAKE_ONLY:
         print(f"  (N={N} coupling matrix is a --fake_cpg-only placeholder; "
               f"W is unused)")
+
+    # Burst structure implied by the parameters, printed because these are
+    # the quantities the rest of the pipeline is tuned against and they are
+    # not obvious from the raw thresholds. EXACT under --fake_cpg, where
+    # fake_step_chunk computes the pattern from this same arithmetic; under
+    # the real oscillator treat it as the intended design point, since the
+    # coupling and i_app also influence where bursts actually land (that is
+    # what analyse_cpg measures).
+    spb     = cpg_params["vth_fb"] / cpg_params["to_fb_weight"]
+    isi     = int(cpg_params["refrac_main"]) + 1
+    n_slots = int(spb) * isi
+    print(f"  burst: {int(spb)} spk/burst (vth_fb/to_fb_weight), "
+          f"ISI {isi} step(s) (refrac_main+1), width {n_slots} steps "
+          f"-> {'exact' if fake_cpg else 'nominal'} period {n_slots * N} "
+          f"steps, cpg_rate {int(spb)} spk/cyc/neuron, "
+          f"ceiling {int(spb) * N} spk/cyc")
+    if abs(spb - round(spb)) > 1e-9:
+        print(f"  WARNING vth_fb/to_fb_weight = {spb:.4f} is not an integer. "
+              f"The feedback neuron fires only on crossing vth_fb, so the "
+              f"burst length floors to {int(spb)} and the remainder is "
+              f"carried into the next burst -- pick a vth_fb that is a "
+              f"multiple of to_fb_weight ({cpg_params['to_fb_weight']:g}) "
+              f"to keep bursts uniform.")
+    if int(spb) < 1:
+        raise ValueError(
+            f"vth_fb ({cpg_params['vth_fb']:g}) is below to_fb_weight "
+            f"({cpg_params['to_fb_weight']:g}), so the feedback neuron fires "
+            f"before any main spike is counted and the burst length is zero. "
+            f"Raise vth_fb or lower to_fb_weight.")
     if fake_cpg:
         print(f"  FAKE CPG: back-to-back bursts, no inter-burst gap "
               f"(see fake_step_chunk)")
@@ -1192,6 +1281,26 @@ def spike_fn(x, slope=25.0):
 #                scale-invariant with b1 init at zero.
 _W_IN_INIT = 0.5
 _W1_INIT   = 0.5
+
+# Calibration target bands, as FRACTIONS OF THE PERIOD (total timesteps per
+# cycle), NOT of the spike-count ceiling (n_cpg * cpg_rate).
+#
+# Period, not ceiling, because what decides whether a timing unit can render
+# its waveform is how much of the cycle, IN TIME, carries input -- and
+# ceiling alone cannot see that: --cpg_refrac_main lengthens the period
+# without changing the ceiling, spreading the same spike count over more
+# wall-clock steps, which is a real sparsification that a ceiling-fraction
+# target would not reflect at all. See the main() calibration block for the
+# full reasoning and the saturation cap, which stays on the ceiling since
+# that one IS a hard count limit regardless of period.
+#
+# period == 2 * ceiling at the current default (--cpg_refrac_main 1, so ISI
+# 2), so these are exactly half of what they were when they targeted ceiling
+# directly, reproducing the original absolute spk/cyc numbers (15, 20, 20,
+# 40) at that default. A different --cpg_refrac_main changes the
+# period/ceiling ratio, and these fractions follow the period on purpose.
+_BAND_FRAC_PLAIN     = (0.125, 1.0 / 6.0)       # 15-20 spk/cyc at n_cpg=6, ISI=2
+_BAND_FRAC_MIN_COUNT = (1.0 / 6.0, 1.0 / 3.0)   # 20-40 spk/cyc at n_cpg=6, ISI=2
 
 # Highest fraction of the phase-blind ceiling that gain calibration is allowed
 # to target.  The ceiling is n_cpg * cpg_rate spikes per cycle -- one timing
@@ -2610,7 +2719,7 @@ def calibrate_gains(model, spikes, n_gaits, device, period,
         #
         # Threshold is _SAT_FRAC, the same constant the band cap uses, NOT
         # something looser like 0.9. Measured: min-over-gaits calibration on
-        # the ungated band [1.5, 2.0] x cpg_rate left a (gait, unit) pair at
+        # the plain band (25-33% of the ceiling) left a (gait, unit) pair at
         # 51.5 of a 60 ceiling -- 86%, thoroughly phase-blind, and a 0.9
         # threshold would have said nothing about it.
         ceiling = float(n_cpg) * float(cpg_rate_hint) if cpg_rate_hint else None
@@ -4047,6 +4156,16 @@ def main():
                          "period (n_spikes * N), so every period-derived "
                          "default moves with it.")
 
+    # Tunable CPG parameters, generated from CPG_PARAMS so the flag list,
+    # LIFCPGStepper's construction and the config dump cannot drift apart.
+    # The two worth reaching for are --cpg_vth_fb (spikes per burst) and
+    # --cpg_refrac_main (inter-spike interval within a burst); run_cpg prints
+    # the resulting burst structure and period.
+    for _name, (_default, _help) in CPG_PARAMS.items():
+        ap.add_argument(f"--cpg_{_name}", type=type(_default),
+                        default=_default,
+                        help=f"[CPG] {_help} Default {_default!r}.")
+
     # gait tables
     ap.add_argument("--gaits_dir", type=str, default="../gaits",
                     help="Folder of {name}.csv gait tables, resolved as "
@@ -4669,8 +4788,15 @@ def main():
 
     # ── 1. CPG ──────────────────────────────────────────────────
     print("\n[1/6] Bursting-LIF CPG ...")
+    # Resolved once from CPG_PARAMS' key set, then used for BOTH the
+    # oscillator and the config dump, so the two cannot describe different
+    # CPGs. visualize_timing.replay_cpg reads the dump to reproduce the exact
+    # oscillator a run was trained against, so that mattering is not
+    # hypothetical.
+    cpg_params = {name: getattr(args, f"cpg_{name}") for name in CPG_PARAMS}
     spikes = run_cpg(N=args.n_cpg_neurons, tmax=args.tmax, warmup=args.warmup,
-                     i_app=args.i_app, fake_cpg=bool(args.fake_cpg))
+                     i_app=args.i_app, fake_cpg=bool(args.fake_cpg),
+                     cpg_params=cpg_params)
 
     print("\n[2/6] Burst structure & phase ...")
     onsets, period, neuron_offsets, burst_thresholds = analyse_cpg(spikes, out_dir)
@@ -4966,16 +5092,49 @@ def main():
     calib = {}
     if args.arch == "timing_grouped" and args.calibrate_gains:
         print("\n      Calibrating timing-layer gains ...")
-        # Band derived from the CPG, but scaled to suit the objective.
-        # cpg_match wants the CPG's own rate, so calibrate around it.
-        # min_count needs far more spikes than the CPG emits: under natural
-        # gating the sub-networks are driven only on timing spikes, and ~10
-        # spikes per 352-step cycle cannot render a moving waveform (a
-        # zero-order-hold analysis on a gait-shaped waveform puts the
-        # requirement nearer 40-60/cycle for ~1.5 degrees of error).  Starting
-        # at the CPG's rate would begin in a starved regime where the task
-        # gradient is weak, exactly when L1 pressure is arriving.  So start
-        # high and let the L1 term prune downward.
+        # ── the band, as a FRACTION OF THE PERIOD ─────────────────
+        # Two different denominators are in play here, and they answer two
+        # different questions:
+        #
+        #   true_ceiling = n_cpg * cpg_rate   -- spike-COUNT ceiling. A timing
+        #       unit cannot exceed one spike per CPG spike (the BLIF CPG never
+        #       fires two neurons in the same timestep), so this is the exact
+        #       number of opportunities per period, independent of how spread
+        #       out those opportunities are in time. This is the TRUE,
+        #       un-exceedable physical limit, and it is what the saturation
+        #       cap below is measured against.
+        #
+        #   period -- total TIMESTEPS per cycle. This is the band-targeting
+        #       denominator. true_ceiling alone cannot tell the difference
+        #       between a burst's spikes landing close together or spread far
+        #       apart in time: --cpg_refrac_main raises the inter-spike
+        #       interval within a burst, which lengthens the period while
+        #       leaving true_ceiling untouched. A unit calibrated to a fixed
+        #       FRACTION OF true_ceiling would then end up with the same
+        #       spike count smeared over more wall-clock steps -- sparser
+        #       input to the sub-network without the calibration band ever
+        #       reflecting that. Fraction of PERIOD is the number that
+        #       actually tracks "how much of the cycle, in time, carries
+        #       input", which is the thing that determines whether the
+        #       sub-network can render the waveform.
+        #
+        # period == 2 * true_ceiling at the current default (--cpg_refrac_main
+        # 1, ISI 2), so the fractions below are exactly half of the old
+        # per-true_ceiling ones, reproducing the old absolute spk/cyc numbers
+        # (0.125*2*60=15, 1/6*2*60=20, 1/6*2*60=20, 1/3*2*60=40) at that
+        # default. They stop being exactly that ratio if refrac_main changes
+        # the period/true_ceiling relationship -- which is intentional, since
+        # a longer period is exactly the case this is meant to respond to.
+        true_ceiling = float(args.n_cpg_neurons) * float(cpg_rate)
+
+        # min_count needs far more spikes than the CPG emits per neuron: under
+        # natural gating the sub-networks are driven only on timing spikes,
+        # and too few cannot render a moving waveform (a zero-order-hold
+        # analysis on a gait-shaped waveform puts the requirement around two
+        # thirds of the true ceiling for ~1.5 degrees of error). Starting low
+        # would begin in a starved regime where the task gradient is weak,
+        # exactly when L1 pressure is arriving. So start high and let the L1
+        # term prune downward.
         #
         # Conditioned on the objective being ACTIVE (lambda > 0), not on
         # --gate_mode: natural gating gives the same spike-train dependence
@@ -4983,39 +5142,37 @@ def main():
         # And with lambda at 0 nothing prunes, so calibrating high would just
         # leave the layer firing high for the whole run.
         if args.spike_objective == "min_count" and args.spike_stats_lambda > 0.0:
-            band_lo, band_hi = 2.0 * cpg_rate, 4.0 * cpg_rate
-            print(f"      (min_count: calibrating to "
-                  f"{band_lo:.0f}-{band_hi:.0f} spk/cyc, well above the CPG's "
-                  f"{cpg_rate:.1f}, so the network starts able to render the "
-                  f"waveform and prunes from there)")
+            f_lo, f_hi = _BAND_FRAC_MIN_COUNT
+            label = "min_count"
         else:
-            band_lo, band_hi = 1.5 * cpg_rate, 2.0 * cpg_rate
-            print(f"      (no active min_count: calibrating to "
-                  f"{band_lo:.0f}-{band_hi:.0f} spk/cyc)")
+            f_lo, f_hi = _BAND_FRAC_PLAIN
+            label = "no active min_count"
+        band_lo, band_hi = f_lo * period, f_hi * period
+        print(f"      ({label}: calibrating to {band_lo:.0f}-{band_hi:.0f} "
+              f"spk/cyc = {100*f_lo:.0f}-{100*f_hi:.0f}% of the "
+              f"{period:.0f}-step period "
+              f"[true ceiling {true_ceiling:.0f} spk/cyc = n_cpg "
+              f"{args.n_cpg_neurons} x cpg_rate {cpg_rate:.1f}])")
 
-        # A timing unit cannot exceed one spike per CPG spike: the BLIF CPG
-        # never fires two neurons in the same timestep, so there are exactly
-        # n_cpg * cpg_rate opportunities per cycle, and at calibration time
-        # b_t is zero and the reset is to zero, so nothing fires between them.
-        # AT that ceiling a unit's spike train is the OR of the CPG's and
-        # identical for every such unit -- zero phase information, sub-network
-        # effectively dead.
+        # The cap, unlike the band above, stays on true_ceiling, NOT period:
+        # it exists to stop calibration targeting something physically
+        # unreachable, and what is physically unreachable is set by the
+        # spike-count ceiling regardless of how long the period is. Keeping
+        # it on true_ceiling is also what keeps it a real safety net rather
+        # than a no-op: band_hi above now scales with the period, so at a
+        # large --cpg_refrac_main it can exceed true_ceiling by a wide
+        # margin, and that is exactly when this needs to bite.
         #
-        # This has to be enforced HERE, not inside calibrate_gains, because the
-        # band above can exceed the ceiling. The min_count branch asks for
-        # 4 * cpg_rate = 40 spk/cyc against a ceiling of 60 and a cap of 36
-        # for a 6-neuron CPG, and a band whose top is above the CEILING makes
-        # the `too_loud` test unreachable -- the bisection would drive units TO
-        # saturation and then report them as in-band. Inert for the other
-        # branch, whose band tops out at 2 * cpg_rate.
-        ceiling = float(args.n_cpg_neurons) * float(cpg_rate)
-        cap     = _SAT_FRAC * ceiling
+        # This has to be enforced HERE, not inside calibrate_gains, because a
+        # band whose top is above the CEILING makes calibrate_gains'
+        # `too_loud` test unreachable -- the bisection would drive units TO
+        # saturation and then report them as in-band.
+        cap = _SAT_FRAC * true_ceiling
         if band_hi > cap:
             print(f"      NOTE band top {band_hi:.0f} exceeds "
-                  f"{_SAT_FRAC:g} x the {ceiling:.0f} spk/cyc ceiling "
-                  f"(n_cpg {args.n_cpg_neurons} x cpg_rate {cpg_rate:.1f}); "
-                  f"capping to {cap:.0f} so calibration cannot target a "
-                  f"phase-blind unit.")
+                  f"{_SAT_FRAC:g} x the {true_ceiling:.0f} spk/cyc true "
+                  f"ceiling; capping to {cap:.0f} so calibration cannot "
+                  f"target a phase-blind unit.")
             band_hi = cap
             band_lo = min(band_lo, 0.5 * band_hi)
         calib = calibrate_gains(
@@ -5154,11 +5311,13 @@ def main():
         "phase_zero":       float(args.phase_zero),
         "cpg_period_steps": float(period),
         "cpg": {
-            "i_app": args.i_app, "vth_main": 100.0, "du_main": 0.1,
-            "dv_main": 0.3, "refrac_main": 1, "vth_fb": 100.0,
-            "du_fb": 1.0, "dv_fb": 0.0, "refrac_fb": 1,
+            # Every tunable parameter comes from the SAME dict that built the
+            # oscillator -- see cpg_params above. Previously these were bare
+            # literals duplicated from LIFCPGStepper's signature, so the
+            # config described defaults rather than what actually ran.
+            **cpg_params,
+            "i_app": args.i_app,
             "from_fb_weight": CPG_FROM_FB_WEIGHT,
-            "to_fb_weight": 10.0,
             "N": int(args.n_cpg_neurons),
             "W": cpg_weight_matrix(args.n_cpg_neurons).tolist(),
             "warmup": args.warmup,
