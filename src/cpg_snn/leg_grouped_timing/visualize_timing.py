@@ -46,8 +46,17 @@ Outputs (into --out_dir)
                                   neuron's phase histogram behind it.
     alignment_summary.png         |residual| heatmap, timing neuron vs leg, per
                                   gait, plus rate and concentration R.
-    routing_matrices.png          Learned per-gait CPG->timing weights, i.e.
-                                  what replaced the old fixed permutation.
+    routing_matrices.png          Measured per-gait CPG->timing routing.
+                                  --drive_source timing only.
+    drive_gates.png               Per-gait CPG-channel selection (drive =
+                                  |s_gate|*||u||), the counterpart figure
+                                  for --drive_source cpg. Exactly one of
+                                  these two is produced.
+    timing_rate_history.png       Per-timing-unit spk/cycle over training,
+                                  one gait per line. --drive_source timing.
+    drive_fanin_history.png       Channels carrying 90% of each
+                                  sub-network's drive, over training.
+                                  --drive_source cpg counterpart.
     tau_distributions.png         Learned time constants vs their init range
                                   and vs the CPG period.
     membranes_<gait>.png          Sub-network membrane traces (sampled units).
@@ -212,7 +221,9 @@ def _read_metrics_csv(path):
 
 
 def plot_timing_rate_history(metrics_csv, timing_cols, leg_cols, gait_names,
-                             out_dir, dpi):
+                             out_dir, dpi, prefix="spk", unit="t",
+                             ylabel="spk/cycle", fname=None, what="T",
+                             title=None, label="timing rate history"):
     """
     How each timing unit's firing rate evolved over training, one gait per
     line, laid out on the SAME leg grid as plot_alignment: n_legs rows x
@@ -233,18 +244,18 @@ def plot_timing_rate_history(metrics_csv, timing_cols, leg_cols, gait_names,
     metrics.csv change that adds these columns -- older runs simply won't
     have them, and this prints a note and returns rather than erroring.
     """
+    fname = fname or "timing_rate_history.png"
     rows = _read_metrics_csv(metrics_csv)
     if not rows:
-        print(f"  [timing rate history] {metrics_csv} is empty, skipping")
+        print(f"  [{label}] {metrics_csv} is empty, skipping")
         return
     epochs = np.array([r["epoch"] for r in rows])
 
     cols = set(rows[0].keys())
-    have_any = any(c.startswith("spk_") for c in cols)
-    if not have_any:
-        print(f"  [timing rate history] no spk_<gait>_t<unit> columns in "
-              f"{metrics_csv} -- this run predates that logging, or wasn't "
-              f"--arch timing_grouped. Skipping.")
+    if not any(c.startswith(f"{prefix}_") for c in cols):
+        print(f"  [{label}] no {prefix}_<gait>_{unit}<unit> columns in "
+              f"{metrics_csv} -- this run predates that logging, or was "
+              f"trained in the other --drive_source mode. Skipping.")
         return
 
     n_legs = len(leg_cols)
@@ -265,7 +276,7 @@ def plot_timing_rate_history(metrics_csv, timing_cols, leg_cols, gait_names,
                 ax.set_visible(False)
                 continue
             for gi, gname in enumerate(gait_names):
-                key = f"spk_{gname}_t{u}"
+                key = f"{prefix}_{gname}_{unit}{u}"
                 if key not in cols:
                     missing_cols.add(key)
                     continue
@@ -275,13 +286,13 @@ def plot_timing_rate_history(metrics_csv, timing_cols, leg_cols, gait_names,
                     continue
                 ax.plot(epochs[ok], y[ok], color=TIMING_PALETTE[gi % len(TIMING_PALETTE)],
                         marker=".", ms=3, lw=1.1, label=gname)
-            ax.set_title(f"leg {leg} · {tnames[k]} (col {col}) ← T{u}",
+            ax.set_title(f"leg {leg} · {tnames[k]} (col {col}) ← {what}{u}",
                         fontsize=8)
             ax.grid(alpha=0.2)
             if leg == n_legs - 1:
                 ax.set_xlabel("epoch", fontsize=7)
             if k == 0:
-                ax.set_ylabel("spk/cycle", fontsize=7)
+                ax.set_ylabel(ylabel, fontsize=7)
             ax.tick_params(labelsize=6)
 
     # One legend for the whole figure rather than one per panel -- the gait
@@ -301,16 +312,44 @@ def plot_timing_rate_history(metrics_csv, timing_cols, leg_cols, gait_names,
                   bbox_to_anchor=(0.5, 1.02))
 
     if missing_cols:
-        print(f"  [timing rate history] {len(missing_cols)} expected "
+        print(f"  [{label}] {len(missing_cols)} expected "
               f"column(s) not found in metrics.csv (e.g. "
               f"{sorted(missing_cols)[:3]}) -- gait list may have changed "
               f"mid-run; those lines are simply absent.")
 
-    fig.suptitle("Timing-layer spk/cycle over training, by gait  "
-                 "(rows = legs, cols = joints within a leg)",
+    fig.suptitle(title or ("Timing-layer spk/cycle over training, by gait  "
+                           "(rows = legs, cols = joints within a leg)"),
                  fontsize=10, fontweight="bold", y=1.0)
     plt.tight_layout(rect=(0, 0, 1, 0.96))
-    _savefig(fig, out_dir, "timing_rate_history.png", dpi)
+    _savefig(fig, out_dir, fname, dpi)
+
+
+def plot_drive_fanin_history(metrics_csv, group_cols, leg_cols, gait_names,
+                             out_dir, dpi):
+    """
+    The --drive_source cpg counterpart of plot_timing_rate_history: how many
+    CPG channels carry 90% of each sub-network's drive, over training, one
+    gait per line.
+
+    Same grid and the same reader, parameterised -- the only real differences
+    are the metrics.csv prefix (fanin_ rather than spk_) and the owner map.
+    The panel at (leg, k) is the SUB-NETWORK that emits that column, so the
+    lookup goes through `group_cols`, not `timing_cols`: under cpg drive
+    there are no timing units, and it is the sub-network's own channel
+    selection being plotted.
+
+    This is the curve --drive_lambda is supposed to bend. Falling = selection
+    concentrating onto fewer phases. Flat near n_cpg = the sub-network is
+    still listening to everything, so either the L1 weight is too small or
+    the task genuinely needs broad phase coverage there.
+    """
+    plot_timing_rate_history(
+        metrics_csv, group_cols, leg_cols, gait_names, out_dir, dpi,
+        prefix="fanin", unit="g", ylabel="channels for 90% of drive",
+        fname="drive_fanin_history.png", what="g",
+        title=("CPG channels carrying 90% of each sub-network's drive, over "
+               "training, by gait  (rows = legs, cols = joints within a leg)"),
+        label="drive fanin history")
 
 
 @torch.no_grad()
@@ -707,6 +746,131 @@ def plot_alignment_summary(summary, gait_names, G, out_dir, dpi):
 
 
 @torch.no_grad()
+def plot_drive_gates(model, gait_names, leg_cols, out_dir, dpi):
+    """
+    Per-gait CPG-channel selection, for --drive_source cpg.  The counterpart
+    of plot_routing, and the central figure for that mode.
+
+    Reads the parameters directly, which is legitimate here in a way the old
+    routing weight heatmap was not: s_gate and u sit BEFORE the sum over
+    channels, so their product IS that channel's contribution to the drive --
+    there is no threshold or membrane between them and their effect to make
+    the number misleading.  (plot_routing has to probe precisely because a
+    timing unit sits in the way.)
+
+    The quantity plotted is `drive_strength`, |s_gate| * ||u[g,c,:]||_1, not
+    |s_gate| alone: the two are multiplicatively redundant, so s_gate by
+    itself carries only part of the scale.
+
+    One panel per gait, rows = sub-network, columns = CPG channel.  Channel
+    index is essentially cycle phase (channel c bursts at ~c/n_cpg), so phase
+    runs along x.  Values are normalised across each ROW, so a row reads as
+    "what fraction of this joint's drive comes from each phase".  The panel
+    title carries the mean effective fan-in, because a flat-but-dim panel and
+    a concentrated one are otherwise hard to distinguish by eye -- the colour
+    scale is data-driven, so both fill it.  Absolute
+    magnitude is deliberately discarded: `u` can absorb overall scale, so
+    only the relative split is meaningful.
+
+    Reading it, given that CPG channel c bursts at cycle phase ~c/n_cpg:
+      - a column concentrated on few rows => that joint samples at a few
+        phases and is silent elsewhere. This is what --drive_lambda drives
+        toward, and because CPG channels are phase-localised it is a
+        TEMPORAL claim, not merely a structural one.
+      - the annotated argmax per column is the dominant phase for that
+        joint; comparing it to the joint's peak-velocity phase is the
+        alignment measurement, and unlike the timing-layer version the
+        reference phases here are fixed and known rather than themselves
+        measured.
+      - columns DIFFERING across gaits => the per-gait selection is being
+        used. Identical everywhere => gaits are not differentiating.
+      - several joints sharing a dominant channel is EXPECTED: that is what
+        a tripod is.
+    """
+    if getattr(model, "uses_timing", True):
+        return None
+    # drive_strength (= |s_gate| * ||u[g,c,:]||_1), not |s_gate| alone: the
+    # two enter the forward pass only as a product and u's row norm varies
+    # per (g,c). Reading |s_gate| made every sub-network look dominated by
+    # channel 0, because s_gate inits to all-ones and argmax returns index 0
+    # on an exact tie. Shared with train.py's drive_report so the figure and
+    # the printed numbers are the same quantity.
+    G, C = model.G, model.n_neurons
+    ng = len(gait_names)
+    S = model.drive_strength().detach().cpu().numpy()[:ng]   # (ng, G, C)
+
+    # Normalise every panel first, then share one colour scale across them
+    # set from the data. A fixed vmax=1.0 would wash the whole figure out:
+    # a sub-network split evenly between two channels tops out at 0.5, so
+    # nothing ever reaches 1 and the interesting structure sits in the
+    # bottom half of the colormap.
+    Mn = []
+    for gi in range(ng):
+        # (G, C): rows = sub-network, cols = CPG channel. Channel index is
+        # essentially cycle PHASE (channel c bursts at ~c/n_cpg), and phase
+        # belongs on the x axis.
+        M = S[gi]
+        row = M.sum(axis=1, keepdims=True)
+        Mn.append(M / np.where(row > 0, row, 1.0))     # share per sub-network
+    vmax = max(float(m.max()) for m in Mn) or 1.0
+
+    # Effective fan-in, computed before plotting so it can go in the title.
+    # Without it a flat-but-dim panel and a concentrated one are hard to
+    # tell apart by eye, since the colour scale is data-driven either way.
+    pr = [float((m.sum(axis=1) ** 2 / np.maximum((m ** 2).sum(axis=1), 1e-12))
+                .mean()) for m in Mn]
+
+    fig, axes = plt.subplots(1, ng, figsize=(2.9 * ng, 2.6 + 0.28 * G),
+                             squeeze=False)
+    axes = axes[0]
+    argmax_tbl, im = {}, None
+    for gi, gname in enumerate(gait_names):
+        M  = Mn[gi]
+        ax = axes[gi]
+        im = ax.imshow(M, cmap="viridis", vmin=0.0, vmax=vmax, aspect="auto")
+        ax.set_xticks(range(C))
+        ax.set_xticklabels([f"{i}" for i in range(C)], fontsize=6)
+        ax.set_yticks(range(G))
+        ax.set_yticklabels([f"g{j}" for j in range(G)], fontsize=6)
+        ax.set_title(f"{gname}  (mean fan-in {pr[gi]:.1f} of {C})", fontsize=8)
+        ax.set_xlabel("CPG channel ~ phase", fontsize=7)
+        if M.sum() > 0:
+            dom = M.argmax(axis=1)
+            argmax_tbl[gname] = [int(d) for d in dom]
+            for j, d in enumerate(dom):
+                # White, not red: the dominant cell is the BRIGHTEST one, so
+                # a dark-palette marker on it is invisible.
+                ax.text(d, j, "x", ha="center", va="center",
+                        color="w", fontsize=5, fontweight="bold")
+        if gi == 0:
+            ax.set_ylabel("sub-network", fontsize=7)
+    if im is not None:
+        fig.colorbar(im, ax=axes.tolist(), fraction=0.02,
+                     label="share of this sub-network's drive")
+    fig.suptitle("Per-gait CPG channel selection "
+                 "(|s_gate|*||u||, normalised per sub-network)   "
+                 "x = dominant channel",
+                 fontsize=10, fontweight="bold")
+    _savefig(fig, out_dir, "drive_gates.png", dpi)
+
+    # Effective fan-in per (gait, sub-network): how many channels carry most
+    # of the drive. The number --drive_lambda is meant to reduce, so it is worth
+    # printing rather than leaving to be eyeballed off the heatmap.
+    eff = []
+    for gi in range(ng):
+        M = S[gi]                                       # (G, C)
+        tot = M.sum(axis=1, keepdims=True)
+        frac = M / np.where(tot > 0, tot, 1.0)
+        srt = -np.sort(-frac, axis=1)
+        k90 = (np.cumsum(srt, axis=1) < 0.90).sum(axis=1) + 1
+        eff.append(k90)
+        print(f"    {gait_names[gi]:>8}: channels carrying 90% of drive, per "
+              f"sub-network: min {int(k90.min())} median "
+              f"{int(np.median(k90))} max {int(k90.max())} (of {C})")
+    return {"dominant_channel": argmax_tbl,
+            "channels_for_90pct_drive": [[int(v) for v in e] for e in eff]}
+
+
 def plot_routing(model, gait_names, device, period, out_dir, dpi,
                  n_probe_cycles=4):
     """
@@ -733,6 +897,15 @@ def plot_routing(model, gait_names, device, period, out_dir, dpi,
       - several timing units sharing one driver is EXPECTED, not a bug:
         that is what a tripod is (3 legs at one phase, 3 at the opposite).
     """
+    # Under drive_source="cpg" there is no router to probe: timing_only
+    # returns the CPG train unchanged, so this would plot an identity
+    # diagonal, identical in every gait, which looks like a result and is
+    # not one. plot_drive_gates is the figure for that mode.
+    if not getattr(model, "uses_timing", True):
+        print("  [routing] drive_source=cpg: no CPG->timing router to probe, "
+              "skipping (see drive_gates.png instead)")
+        return None
+
     n_cpg, n_t = model.n_neurons, model.n_timing
     ng = len(gait_names)
     P  = int(period)
@@ -1247,19 +1420,30 @@ def run_visualization(model_dir, out_dir=None, args=None):
 
     # ── 4. cross-gait figures ───────────────────────────────────
     print("\n[4/5] Cross-gait figures ...")
-    routing = None
+    routing = drive_gates = None
     if arch == "timing_grouped" and summary:
         plot_alignment_summary(summary, plotted, model.n_timing,
                                out_dir, args.dpi)
         routing = plot_routing(model, all_names, device, period,
                                out_dir, args.dpi)
+        # Mutually exclusive with plot_routing: each returns None in the
+        # other's mode, so exactly one of the two figures is produced.
+        drive_gates = plot_drive_gates(model, plotted, leg_cols,
+                                       out_dir, args.dpi)
         metrics_csv = model_dir / "metrics.csv"
         if metrics_csv.exists():
-            plot_timing_rate_history(metrics_csv, timing_cols, leg_cols,
-                                     plotted, out_dir, args.dpi)
+            # Which per-unit history exists depends on the drive mode, and
+            # each plotter no-ops with a printed note if its columns are
+            # absent -- so calling both is safe and covers a config that
+            # does not record drive_source.
+            if getattr(model, "uses_timing", True):
+                plot_timing_rate_history(metrics_csv, timing_cols, leg_cols,
+                                         plotted, out_dir, args.dpi)
+            else:
+                plot_drive_fanin_history(metrics_csv, group_cols, leg_cols,
+                                         plotted, out_dir, args.dpi)
         else:
-            print(f"  [timing rate history] {metrics_csv} not found, "
-                  f"skipping")
+            print(f"  [unit history] {metrics_csv} not found, skipping")
     plot_taus(model, period, cfg, out_dir, args.dpi)
 
     # ── 4b. reconstruction + transitions ────────────────────────
@@ -1325,6 +1509,9 @@ def run_visualization(model_dir, out_dir=None, args=None):
         "window": {"t_lo": int(t_lo), "t_hi": int(t_hi)},
         "alignment": summary,
         "learned_routing_argmax": routing,
+        # Populated only under drive_source="cpg"; None otherwise, exactly as
+        # learned_routing_argmax is None in that mode.
+        "drive_gates": drive_gates,
         "residual_note": ("residual = timing-neuron circular mean phase minus "
                           "the phase of the first Fourier component of that "
                           "leg's first gait-table column; a consistent "

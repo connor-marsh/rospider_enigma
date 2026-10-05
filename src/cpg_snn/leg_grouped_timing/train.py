@@ -1821,6 +1821,7 @@ class TimingGroupedSNN(nn.Module):
                  timing_reset="zero", hidden_reset="subtract", gate_mode="none",
                  bias_mode="voltage", readout_gait_bias=True,
                  synaptic="none", tau_syn_min=2.0, tau_syn_max=20.0,
+                 drive_source="timing",
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
         if n_gaits > max_gaits:
@@ -1841,6 +1842,16 @@ class TimingGroupedSNN(nn.Module):
         if synaptic not in ("none", "hidden", "all"):
             raise ValueError(f"synaptic must be none|hidden|all, got "
                              f"{synaptic!r}")
+        if drive_source not in ("timing", "cpg"):
+            raise ValueError(f"drive_source must be timing|cpg, got "
+                             f"{drive_source!r}")
+        if drive_source == "cpg" and gate_mode != "none":
+            raise ValueError(
+                "drive_source='cpg' requires gate_mode='none'. There is no "
+                "timing unit to gate on: the gate would have to mean 'did any "
+                "channel I am driven by fire', which with back-to-back CPG "
+                "bursts is true on nearly every spiking timestep, making it a "
+                "no-op dressed as a mode.")
 
         group_cols = (build_group_cols(n_timing, n_joints=n_joints)
                       if group_cols is None else
@@ -1886,7 +1897,13 @@ class TimingGroupedSNN(nn.Module):
         self.Ho         = Ho
         self.C          = C
         self.K          = K           # timing units feeding each sub-network
-        self.n_timing   = T           # NOT G: the two are independent now
+        # NOT G: the two are independent. Under drive_source="cpg" the drive
+        # channels the sub-networks actually see are the CPG's own, so
+        # n_timing is n_neurons there -- every diagnostic keys off this
+        # (timing_report's lane count, metrics.csv's spk_ columns,
+        # visualize_timing's consistency check), and timing_only returns the
+        # CPG train in that mode, so they have to agree.
+        self.n_timing   = T if drive_source == "timing" else int(n_neurons)
         self.timing_map_list = [list(m) for m in timing_map]
         self.register_buffer(
             "timing_map",
@@ -1909,6 +1926,8 @@ class TimingGroupedSNN(nn.Module):
         self.sub_film   = sub_film
         self.film_mode  = film_mode
         self.synaptic   = synaptic
+        self.drive_source = drive_source
+        self.uses_timing  = (drive_source == "timing")
         self.timing_reset = timing_reset
         self.hidden_reset = hidden_reset
         if gate_mode not in ("none", "decay"):
@@ -1953,8 +1972,15 @@ class TimingGroupedSNN(nn.Module):
         # FURTHER from threshold, so a unit born net-negative cannot be
         # rescued by calibration at all.  Sign is fixed here; magnitude is
         # calibration's job.
-        self.w_in_gait = nn.Embedding(max_gaits, self.n_neurons * T)
-        nn.init.normal_(self.w_in_gait.weight, mean=_W_IN_INIT, std=_W_IN_INIT)
+        # Whole timing layer skipped under drive_source="cpg" -- no
+        # w_in_gait, no b_t/v_t, no beta_t_logit. Guarded rather than created
+        # and ignored so the state_dict says which architecture ran, and so
+        # calibrate_gains / reinit_timing_units (both of which key off
+        # hasattr(model, "w_in_gait")) correctly become no-ops.
+        if self.uses_timing:
+            self.w_in_gait = nn.Embedding(max_gaits, self.n_neurons * T)
+            nn.init.normal_(self.w_in_gait.weight,
+                            mean=_W_IN_INIT, std=_W_IN_INIT)
 
         # Per-gait excitability.  See BIAS MODES in the class docstring.
         #   "current": an additive current, i.e. tonic drive on every step it
@@ -1964,14 +1990,15 @@ class TimingGroupedSNN(nn.Module):
         #   "voltage": a per-gait threshold offset instead. Never touches the
         #              membrane, so it cannot manufacture a spike on a step
         #              where no input arrived.
-        if bias_mode == "current":
-            self.b_t = nn.Embedding(max_gaits, T)
-            nn.init.zeros_(self.b_t.weight)
-        elif bias_mode == "voltage":
-            self.v_t = nn.Embedding(max_gaits, T)
-            nn.init.zeros_(self.v_t.weight)
-        self.beta_t_logit = nn.Parameter(
-            init_beta_logit((T,), tau_timing_min, tau_timing_max))
+        if self.uses_timing:
+            if bias_mode == "current":
+                self.b_t = nn.Embedding(max_gaits, T)
+                nn.init.zeros_(self.b_t.weight)
+            elif bias_mode == "voltage":
+                self.v_t = nn.Embedding(max_gaits, T)
+                nn.init.zeros_(self.v_t.weight)
+            self.beta_t_logit = nn.Parameter(
+                init_beta_logit((T,), tau_timing_min, tau_timing_max))
 
         # ── sub-network layer 1: K binary spikes -> Hg units ──────
         # Fixed init scale, deliberately NOT calibrated.  A dead timing
@@ -1992,8 +2019,79 @@ class TimingGroupedSNN(nn.Module):
         # K=1 was tuned around, and layer 1 is not calibrated. At K=1 the
         # factor is exactly 1.0, so this is bit-identical to the old
         # (G, Hg) init for a matched-shape run.
-        self.w1 = nn.Parameter(
-            torch.randn(G, K, Hg) * (_W1_INIT / math.sqrt(K)))
+        # Created only in drive_source="timing"; the "cpg" path replaces it
+        # with s_gate/u below. Conditional so the state_dict carries exactly
+        # the tensors a mode uses, and so a config predating drive_source --
+        # which falls back to "timing" -- reconstructs with w1 as before.
+        if self.uses_timing:
+            self.w1 = nn.Parameter(
+                torch.randn(G, K, Hg) * (_W1_INIT / math.sqrt(K)))
+        else:
+            # ── drive_source="cpg": skip the timing layer ─────────
+            # The sub-networks are driven straight off the CPG's own spike
+            # channels, so their phase basis is the CPG's fixed, evenly tiled
+            # one rather than a learned (and barrier-bound) set of timing
+            # phases. The per-gait selection that `w_in_gait` used to provide
+            # moves here, factorised into two tensors:
+            #
+            #   s_gate (max_gaits, G*C) -> (gait, g, c)
+            #       HOW MUCH channel c drives sub-network g, in this gait.
+            #       Multiplies the channel BEFORE the sum over channels, so
+            #       setting an entry to 0 removes that channel's contribution
+            #       to that sub-network in that gait exactly, and touches
+            #       nothing else -- not the other channels' contributions, and
+            #       not the same channel's drive to other sub-networks.
+            #       This is the object the L1 term acts on and the one worth
+            #       plotting: "which CPG phase drives which joint, per gait".
+            #
+            #   u (G, C, Hg)
+            #       WHERE channel c writes when it does drive sub-network g --
+            #       which hidden units, with which signs. Gait-SHARED.
+            #
+            # cur1[b,g,h] = sum_c  x[b,c] * s_gate[gait,g,c] * u[g,c,h]
+            #
+            # The factorisation costs exactly one thing: for a fixed (g, c)
+            # the gait x hidden weight matrix is rank 1 rather than full rank,
+            # i.e. a gait can SCALE the hidden-space direction a channel
+            # writes along but not ROTATE it. That is the right constraint --
+            # u defines the sub-network's phase basis and a gait's job is to
+            # choose which phases to use, not to rewire the basis -- and
+            # FiLM's gamma, which is per (gait, g, Hg) and applies after the
+            # sum over channels, still gives a per-hidden-unit reshape on top.
+            # Full per-gait w1 would be max_gaits*G*C*Hg; this is
+            # max_gaits*G*C + G*C*Hg, ~7.5x smaller at the hexapod sizes.
+            C = self.n_neurons
+            self.s_gate = nn.Embedding(max_gaits, G * C)
+            nn.init.ones_(self.s_gate.weight)     # every channel on; L1 prunes
+
+            # Dense, at _W1_INIT, with NO 1/sqrt(C) fan-in correction.
+            #
+            # The usual variance-preserving 1/sqrt(fan_in) is wrong here,
+            # because it assumes the inputs co-fire and sum. They never do:
+            # the CPG's bursts are back-to-back and non-overlapping, so the
+            # channel vector is one-hot-or-zero and a hidden unit receives a
+            # SINGLE weight u[g,c*,h] on each spiking timestep, never a sum.
+            # The scale that matters is therefore the per-weight magnitude,
+            # and dividing by sqrt(18) would under-drive layer 1 by 4.2x.
+            #
+            # Dense rather than sparse, also because of the one-hot structure:
+            # a dense init does NOT blur phases together. Hidden unit h is
+            # driven by u[g,c,h] during channel c's burst and by nothing in
+            # between, so it is driven at each phase in turn with a random
+            # per-channel magnitude, and its preferred phase is simply
+            # argmax_c u[g,c,h] -- uniformly random across h. The population
+            # tiles phase for free, which is what lets the readout reweight
+            # phase smoothly, and it tiles at least as evenly as a
+            # few-channel init does.
+            #
+            # A sparse init would also break a large slice of the layer: a
+            # unit can only ever fire if it has some POSITIVE incoming
+            # weight, and at a fan-in of 2 with random signs that fails for
+            # 25% of units, measured at 32% of 128. Those units never cross
+            # threshold, so their outgoing w2 weights get almost no gradient
+            # -- the same dead-unit trap as in the timing layer, built in at
+            # init. Dense over 18 weights makes it 2^-18.
+            self.u = nn.Parameter(torch.randn(G, C, Hg) * _W1_INIT)
 
         # ── sub-network layer 2: block diagonal (G, Hg, Hg) ───────
         self.w2 = nn.Parameter(torch.randn(G, Hg, Hg) / math.sqrt(Hg))
@@ -2117,6 +2215,86 @@ class TimingGroupedSNN(nn.Module):
             init_beta_logit((G, Ho), tau_syn_min, tau_syn_max))
 
         # ---------------------------------------------------------------
+    def drive_strength(self):
+        """
+        (n_gaits, G, C) tensor of how strongly CPG channel c drives
+        sub-network g in each gait:  |s_gate[gait,g,c]| * ||u[g,c,:]||_1.
+
+        This, and NOT |s_gate| on its own, is the drive. s_gate and u enter
+        the forward pass only as the product s_gate[g,c] * u[g,c,h], and u's
+        row norm varies per (g,c), so |s_gate| alone says nothing about how
+        much current channel c actually delivers.
+
+        Shared by `drive_penalty` and `drive_report` so the number penalised and
+        the number reported are the same quantity by construction.
+
+        Only the first n_gaits rows: the rest are never indexed, and
+        including them would both dilute the mean and push rows toward zero
+        that nothing reads.
+        """
+        unorm = self.u.abs().sum(dim=2)                         # (G, C)
+        S = self.s_gate.weight[:self.n_gaits].abs().view(
+            self.n_gaits, self.G, self.n_neurons)               # (n_gaits,G,C)
+        return S * unorm.unsqueeze(0)
+
+    def drive_penalty(self, kind="pr"):
+        """
+        Sparsity pressure on the drive, for drive_source="cpg".  Per
+        (gait, sub-network), over that row's C channel drives.
+
+        kind="pr" (default) -- PARTICIPATION RATIO, (sum d)^2 / sum d^2.
+            Literally "effective number of channels this sub-network uses":
+            1 when one channel carries everything, C when all are equal.
+            The same quantity drive_report prints as fanin, so the loss term
+            and the reported metric are the same thing.
+
+            SCALE-INVARIANT, which is the point. Plain L1 on the drive is
+            not, and the network escaped it: it shrank every channel's drive
+            together and compensated by lowering the hidden thresholds
+            (v1 is learnable, and th1 = thresh - v1), so the penalty fell
+            while nothing was selected. Observed as a maximum channel share
+            of 0.08 with fanin ~15.8, i.e. a uniform 18-way split at tiny
+            magnitude. A scale-invariant term has nothing to escape to:
+            halving every drive leaves it exactly unchanged.
+
+            Plain L1 also could not select even setting scale aside. Its
+            per-channel gradient is ||u[g,c,:]||_1, and over 128 dense
+            entries that concentrates to ~7% spread, so every channel was
+            shrunk at near-identical rate. Uniform shrinkage, not selection.
+
+            CAVEAT, worth knowing before turning the weight up: PR is
+            rich-get-richer. Its gradient pushes above-average channels up
+            and below-average ones down, so it AMPLIFIES whichever channel
+            is already ahead. Exactly-uniform is a stationary point (PR's
+            maximum, so unstable; u's ~7% init spread breaks it). If this
+            term dominates the task gradient, the winning channel is decided
+            by initialisation rather than by the data -- which is the same
+            failure mode as the timing layer's phase barrier. Start the
+            weight small, and lean on --spike_lambda_warmup's reasoning:
+            let the task find which channels matter before paying to
+            concentrate.
+
+        kind="l1" -- the original group-L1, mean of |s_gate|*||u||_1. Kept
+            for A/B only; see above for why it does not work.
+
+        Returns a 0-d tensor; exactly zero when there is no s_gate.
+        """
+        if self.uses_timing:
+            return torch.zeros((), device=self.w2.device, dtype=self.w2.dtype)
+        d = self.drive_strength()                       # (n_gaits, G, C)
+        if kind == "l1":
+            return d.mean()
+        if kind != "pr":
+            raise ValueError(f"drive penalty kind must be pr|l1, got {kind!r}")
+        s1 = d.sum(dim=2)
+        s2 = d.pow(2).sum(dim=2).clamp(min=1e-12)
+        # Mean over (gait, sub-network) so the weight does not need
+        # rescaling with n_gaits or G. Divided by C so the term is in [1/C, 1]
+        # rather than [1, C]: that keeps the weight's meaning stable if
+        # --n_cpg_neurons changes.
+        return (s1.pow(2) / s2).mean() / float(self.n_neurons)
+
+    # ---------------------------------------------------------------
     @torch.no_grad()
     def clamp_bias_voltage(self):
         """
@@ -2150,7 +2328,12 @@ class TimingGroupedSNN(nn.Module):
         if self.bias_mode != "voltage":
             return
         lo, hi = -self.thresh, self.thresh - _V_EPS
-        for p in (self.v_t.weight, self.v1, self.v2):
+        # v_t exists only when there IS a timing layer (drive_source="timing").
+        v_t = getattr(self, "v_t", None)
+        tensors = [self.v1, self.v2]
+        if v_t is not None:
+            tensors.append(v_t.weight)
+        for p in tensors:
             p.data.clamp_(lo, hi)
 
     # ---------------------------------------------------------------
@@ -2222,13 +2405,25 @@ class TimingGroupedSNN(nn.Module):
         mem_t, since, mem1, mem2, memo, syn1, syn2, syno = state
         G, Hg = self.G, self.Hg
 
-        spk_t, mem_t = self._timing(x, gait, mem_t)          # (B, T)
-
-        # ---- timing -> sub-network routing -------------------------
-        # timing_map is (G, K), so this gathers each sub-network's own K
-        # timing spikes. At K=1 with a matched-shape map this is exactly
-        # spk_t.unsqueeze(-1), i.e. the old behaviour.
-        spk_sel = spk_t[:, self.timing_map]                  # (B, G, K)
+        if self.uses_timing:
+            spk_t, mem_t = self._timing(x, gait, mem_t)      # (B, T)
+            # ---- timing -> sub-network routing ---------------------
+            # timing_map is (G, K), so this gathers each sub-network's own K
+            # timing spikes. At K=1 with a matched-shape map this is exactly
+            # spk_t.unsqueeze(-1), i.e. the old behaviour.
+            spk_sel = spk_t[:, self.timing_map]              # (B, G, K)
+        else:
+            # drive_source="cpg": the CPG's own channels ARE the drive, so
+            # there is no timing layer to run. mem_t is passed through
+            # untouched -- it stays all-zero and exists only to hold the
+            # exported state/ONNX signature fixed across modes, exactly as
+            # `since` does. spk_t is the CPG spike vector itself, which is an
+            # input and carries no gradient to any parameter; it is reported
+            # in aux so the diagnostics still have something to measure, and
+            # main() forces the spike objective to "none" in this mode so
+            # nothing tries to charge an un-learnable spike train.
+            spk_t   = x
+            spk_sel = None
 
         # ---- event gate -------------------------------------------
         # gate_mode:
@@ -2307,7 +2502,17 @@ class TimingGroupedSNN(nn.Module):
         # w1[g,k] unless all K units fire together. The gate below is then a
         # no-op on spiking steps (gate=1 wherever any spk_sel is 1).
         b1 = self.b1 if self.bias_mode == "current" else 0.0
-        cur1 = torch.einsum("bgk,gkh->bgh", spk_sel, self.w1) + b1
+        if self.uses_timing:
+            cur1 = torch.einsum("bgk,gkh->bgh", spk_sel, self.w1) + b1
+        else:
+            # Gate each CPG channel per (gait, sub-network), THEN expand onto
+            # the hidden units. Gating before the sum over channels is what
+            # makes s_gate[gait,g,c]=0 remove channel c's contribution to
+            # sub-network g in that gait exactly, leaving every other
+            # channel's contribution and every other sub-network untouched.
+            s_g    = self.s_gate(gait).view(-1, G, self.n_neurons)  # (B,G,C)
+            scaled = x.unsqueeze(1) * s_g                           # (B,G,C)
+            cur1   = torch.einsum("bgc,gch->bgh", scaled, self.u) + b1
         if self.sub_ln in ("l1", "both"):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
@@ -2418,6 +2623,13 @@ class TimingGroupedSNN(nn.Module):
         sub-networks saw -- and costs nothing next to the sub-networks it
         skips.
         """
+        if not self.uses_timing:
+            # drive_source="cpg": the spikes driving the sub-networks ARE the
+            # CPG's, so return them unchanged. Keeps timing_report and
+            # measure_rates working (they then describe the CPG's own fixed
+            # rates, which is a useful sanity check and constant over
+            # training) instead of crashing on a layer that does not exist.
+            return x_seq
         B = x_seq.shape[1]
         if mem_t is None:
             # n_timing, NOT G: this is the timing layer's own membrane, and
@@ -2436,11 +2648,18 @@ class TimingGroupedSNN(nn.Module):
         n = lambda *ps: int(sum(p.numel() for p in ps
                                  if p is not None))
         g = lambda name: getattr(self, name, None)
+        # Under drive_source="cpg" there is no timing layer, and w1 is
+        # replaced by s_gate (per-gait channel selection) + u (channel->hidden
+        # expansion). s_gate is counted under "timing" because it is the thing
+        # that took over the timing layer's per-gait routing job, which keeps
+        # the block totals comparable across the two modes.
         return {
-            "timing":  n(self.w_in_gait.weight, self.beta_t_logit,
-                         *(w.weight for w in (g("b_t"), g("v_t"))
-                           if w is not None)),
-            "sub_l1":  n(self.w1, self.beta1_logit, self.alpha1_logit,
+            "timing":  (n(self.w_in_gait.weight, self.beta_t_logit,
+                          *(w.weight for w in (g("b_t"), g("v_t"))
+                            if w is not None))
+                        if self.uses_timing else n(self.s_gate.weight)),
+            "sub_l1":  n(self.w1 if self.uses_timing else self.u,
+                         self.beta1_logit, self.alpha1_logit,
                          g("b1"), g("v1")),
             "sub_l2":  n(self.w2, self.beta2_logit, self.alpha2_logit,
                          g("b2"), g("v2")),
@@ -3124,6 +3343,81 @@ def reinit_timing_units(model, dead_pairs, sat_pairs, n_gaits,
 # ═══════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
+@torch.no_grad()
+def drive_report(model, n_gaits, gait_names=None, indent="    "):
+    """
+    The --drive_source cpg counterpart of `timing_report`, with the same
+    (lines, stats) contract so run_training can call either.
+
+    Reports DRIVE SELECTION rather than spike rates. Under cpg drive the
+    spikes reaching the sub-networks are the CPG's own, whose rate is fixed
+    by --cpg_vth_fb and identical every epoch, so reporting rates would print
+    a constant. What actually moves during training is which CPG channels
+    each sub-network is listening to, which lives in `s_gate`.
+
+    Needs no CPG replay at all -- it reads the parameters directly. That is
+    sound here in a way it is not for the timing layer: s_gate and u sit
+    BEFORE the sum over channels, so their product IS that channel's
+    contribution, with no threshold or membrane in between to make the
+    number misleading.
+
+    The quantity is `drive_strength`, |s_gate| * ||u[g,c,:]||_1, not
+    |s_gate| alone -- see drive_penalty for why the latter is both unmeasurable
+    (u carries half the scale) and untrainable (its gradient is uniform).
+
+    Two numbers per (gait, sub-network):
+
+      dom      The channel supplying the largest share of that
+               sub-network's drive. Since CPG channel c bursts at cycle
+               phase ~c/n_cpg, this is the sub-network's dominant input
+               PHASE, and comparing it to the joint's peak-velocity phase is
+               the alignment measurement. Watch for it settling: a dominant
+               channel that stops moving means selection has converged.
+
+      fanin90  How many channels carry 90% of the drive. This is the number
+               --drive_lambda is meant to reduce, and the one worth watching
+               epoch to epoch. Because CPG channels are phase-localised,
+               driving it down is a TEMPORAL claim -- "this joint samples at
+               a few phases and is silent elsewhere" -- not merely a
+               structural one.
+    """
+    # drive_strength, not |s_gate|: the drive is the PRODUCT
+    # |s_gate[gait,g,c]| * ||u[g,c,:]||_1, and u's row norm varies per
+    # (g,c). Reporting |s_gate| alone made every sub-network appear to be
+    # dominated by channel 0, because s_gate is initialised to all-ones and
+    # argmax returns index 0 on an exact tie.
+    S = model.drive_strength().detach().float().cpu()        # (n_gaits, G, C)
+    C = model.n_neurons
+
+    # Share per sub-network. Overall magnitude is deliberately discarded;
+    # only the relative split across channels is meaningful.
+    share = S / S.sum(dim=2, keepdim=True).clamp(min=1e-12)
+    dom      = share.argmax(dim=2)                       # (n_gaits, G)
+    domshare = share.max(dim=2).values
+    srt      = share.sort(dim=2, descending=True).values
+    # +1 because the count of entries strictly under the 90% mark is the
+    # number of channels BEFORE the one that crosses it.
+    k90 = (srt.cumsum(dim=2) < 0.90).sum(dim=2) + 1      # (n_gaits, G)
+
+    names = gait_names or [f"g{i}" for i in range(n_gaits)]
+    fmt_i = lambda v: " ".join(f"{int(x):>2d}" for x in v)
+    lines, stats = [], []
+    for gi in range(n_gaits):
+        nm = names[gi] if gi < len(names) else f"g{gi}"
+        k  = k90[gi]
+        lines.append(
+            f"{indent}drive {nm:>5s} : dom ch [{fmt_i(dom[gi])}]  "
+            f"fanin90 mean {float(k.float().mean()):.1f} "
+            f"(min {int(k.min())} max {int(k.max())} of {C})")
+        stats.append({
+            "gait":              nm,
+            "dominant_channel":  [int(v) for v in dom[gi]],
+            "dominant_share":    [float(v) for v in domshare[gi]],
+            "fanin90":           [int(v) for v in k],
+        })
+    return lines, stats
+
+
 def timing_report(model, spikes, phase, period, n_gaits, device,
                   t0, n_steps=1500, gait_names=None, indent="    ",
                   sat_rate=None):
@@ -3309,9 +3603,12 @@ def grad_blocks(model):
     scale-invariant in the gradient).
     """
     rules = (
-        ("timing",    ("w_in_gait", "b_t", "beta_t_logit")),
+        # "s_gate" under timing: it took over the timing layer's per-gait
+        # routing job when drive_source="cpg", so grouping it there keeps the
+        # per-block gradient/update diagnostics comparable across modes.
+        ("timing",    ("w_in_gait", "b_t", "beta_t_logit", "s_gate")),
         ("input",     ("w_in",)),                    # dense arch only
-        ("sub_l1",    ("w1", "b1", "beta1_logit", "alpha1_logit")),
+        ("sub_l1",    ("w1", "b1", "beta1_logit", "alpha1_logit", "u")),
         ("sub_l2",    ("w2", "b2", "beta2_logit", "alpha2_logit")),
         # "b_read" also prefix-matches "b_read_gait", which belongs here too.
         ("readout",   ("w_read", "b_read", "w_out", "b_out", "betao_logit",
@@ -3498,6 +3795,19 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                     loss = loss + pen
                     ftot += float(pen.detach())
 
+                # L1 on the per-gait channel selection, for
+                # --drive_source cpg. Separate from the spike objective
+                # because it penalises WEIGHTS, not spikes: there is no
+                # learnable spike train in that mode. Folded into the same
+                # `floor` metric so one column tracks whichever sparsity
+                # pressure is active.
+                if (args.drive_lambda > 0.0
+                        and hasattr(model, "drive_penalty")):
+                    dpen = args.drive_lambda * model.drive_penalty(
+                        args.drive_penalty)
+                    loss = loss + dpen
+                    ftot += float(dpen.detach())
+
                 opt.zero_grad()
                 loss.backward()
                 # Returns the total norm BEFORE clipping — free to read,
@@ -3617,19 +3927,32 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             if run_timing_diag:
                 timing_lines, last_timing_stats = timing_diag()
 
-            # Flattened spk/cyc per (gait, timing unit), one column each, so
-            # metrics.csv carries the same number this epoch's printed timing
-            # report does. Column name uses the gait's NAME (e.g. "tripod"),
-            # not its index, so it survives --gaits reordering across runs.
-            # Blank on non-eval epochs (MetricsWriter.write renders None as
-            # ""), which is also how a reader should distinguish "not
-            # measured this epoch" from "measured at zero".
+            # One column per (gait, unit) for whichever per-unit series the
+            # diagnostic produced, so metrics.csv carries the same numbers
+            # this epoch's printed report does:
+            #
+            #   timing_report -> "rate"    -> spk_<gait>_t<timing unit>
+            #   drive_report  -> "fanin90" -> fanin_<gait>_g<sub-network>
+            #
+            # Driven off which key is present rather than off a mode flag, so
+            # the two reports stay interchangeable here. Column names use the
+            # gait's NAME (e.g. "tripod") not its index, so they survive
+            # --gaits reordering across runs. Blank on non-eval epochs
+            # (MetricsWriter.write renders None as ""), which is how a reader
+            # distinguishes "not measured this epoch" from "measured at zero".
+            # dominant_channel is deliberately NOT logged per epoch -- it
+            # would double the column count and it lands in the config's
+            # timing_layer_stats at the end anyway.
             spike_rate_cols = {}
             if last_timing_stats:
-                for st in last_timing_stats:
-                    for u, r in enumerate(st["rate"]):
-                        spike_rate_cols[f"spk_{st['gait']}_t{u}"] = (
-                            r if run_timing_diag else None)
+                for key, prefix, unit in (("rate", "spk", "t"),
+                                          ("fanin90", "fanin", "g")):
+                    if key not in last_timing_stats[0]:
+                        continue
+                    for st in last_timing_stats:
+                        for u, r in enumerate(st[key]):
+                            spike_rate_cols[f"{prefix}_{st['gait']}_{unit}{u}"] = (
+                                r if run_timing_diag else None)
 
             metrics.write({
                 "epoch": epoch, "train": tr_loss, "val": va_loss,
@@ -3670,7 +3993,14 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 # w_in_gait has a gait axis, so a unit that is fine for five
                 # gaits and dead for the sixth gets that one column repaired
                 # and nothing else touched.
-                if args.reinit_dead_after > 0 and last_timing_stats:
+                # "rate" in the guard, not just a non-empty stats list:
+                # drive_report produces no rates (there is no timing layer to
+                # be dead or saturated), so this whole rescue is inapplicable
+                # under --drive_source cpg and would KeyError on st["rate"].
+                # reinit_timing_units would itself no-op via its w_in_gait
+                # check, but the detection below runs first.
+                if (args.reinit_dead_after > 0 and last_timing_stats
+                        and "rate" in last_timing_stats[0]):
                     n_u = len(last_timing_stats[0]["rate"])
                     pairs = [(gi, u) for gi in range(len(last_timing_stats))
                              for u in range(n_u)]
@@ -3986,6 +4316,9 @@ def build_model_from_cfg(cfg, device):
             film_mode        = str(cfg_get(cfg, "film_mode", "gamma_beta")),
             readout_gait_bias = bool(cfg_get(cfg, "readout_gait_bias", 0)),
             synaptic         = str(cfg_get(cfg, "synaptic", "none")),
+            # "timing" is what the model did before drive_source existed, so
+            # an older config reconstructs with w_in_gait/w1 as it had them.
+            drive_source     = str(cfg_get(cfg, "drive_source", "timing")),
             tau_syn_min      = float(cfg_get(cfg, "tau_syn_min", 2.0)),
             tau_syn_max      = float(cfg_get(cfg, "tau_syn_max", 20.0)),
             # gate_mode replaced the old boolean event_gated. Map the old
@@ -4560,6 +4893,59 @@ def main():
                          "supplies no time-varying basis. 0 = off, which is "
                          "also what configs predating this option "
                          "reconstruct as.")
+    ap.add_argument("--drive_source", type=str, default="timing",
+                    choices=["timing", "cpg"],
+                    help="[timing_grouped] What drives the sub-networks. "
+                         "'timing' (default): the learned timing layer, as "
+                         "before. 'cpg': skip the timing layer entirely and "
+                         "drive each sub-network straight off the CPG's own "
+                         "spike channels. The motivation is that the CPG "
+                         "already provides a fixed, evenly tiled phase basis, "
+                         "whereas the timing layer has to LEARN its phases "
+                         "and cannot move them freely: a timing unit's phase "
+                         "is set by which CPG channel drives it, and swapping "
+                         "channels needs a two-step weight move whose "
+                         "intermediate state fires at both phases at once, "
+                         "which gradient descent will not traverse. Driving "
+                         "off the CPG makes the phase basis stationary and "
+                         "moves selection into w1, where a 128-unit hidden "
+                         "population plus a LINEAR readout can reweight "
+                         "phase smoothly. Per-gait selection is preserved by "
+                         "s_gate (see TimingGroupedSNN), and --drive_lambda "
+                         "sparsifies it. Requires --gate_mode none, and "
+                         "forces --spike_objective none since there is no "
+                         "learnable spike train to charge for.")
+    ap.add_argument("--drive_lambda", type=float, default=0.0,
+                    help="[--drive_source cpg] Weight on the drive sparsity "
+                         "term selected by --drive_penalty. The analogue of "
+                         "--spike_stats_lambda for this mode: because CPG "
+                         "channels are PHASE-LOCALISED (each bursts in its "
+                         "own window), concentrating a sub-network's drive "
+                         "onto few channels is a temporal statement, not just "
+                         "a structural one. Note the 'pr' term is "
+                         "rich-get-richer, so a weight large enough to "
+                         "dominate the task gradient will let INITIALISATION "
+                         "pick the winning channel -- start small. 0 = off. "
+                         "(Was --drive_l1; renamed because the default term "
+                         "is no longer an L1.)")
+    ap.add_argument("--drive_penalty", type=str, default="pr",
+                    choices=["pr", "l1"],
+                    help="[--drive_source cpg] Which sparsity term. "
+                         "'pr' (default): participation ratio, the effective "
+                         "NUMBER of channels each sub-network uses, which is "
+                         "the same quantity drive_report prints as fanin. "
+                         "SCALE-INVARIANT, which is the whole point. "
+                         "'l1': the original group-L1 on drive magnitude, "
+                         "kept for A/B. l1 does not work: it is not "
+                         "scale-invariant, so the network satisfies it by "
+                         "shrinking every channel's drive together and "
+                         "lowering the hidden thresholds to compensate (v1 is "
+                         "learnable), which was measured as a 0.08 maximum "
+                         "channel share at fanin ~15.8 -- a uniform 18-way "
+                         "split at tiny magnitude. It also cannot select even "
+                         "ignoring scale, since its per-channel gradient is "
+                         "||u[g,c,:]||_1 and that varies only ~7% across "
+                         "channels.")
     ap.add_argument("--synaptic", type=str, default="none",
                     choices=["none", "hidden", "all"],
                     help="Second-order synaptic filter, matching snnTorch's "
@@ -4909,6 +5295,7 @@ def main():
             readout_gait_bias=bool(args.readout_gait_bias),
             synaptic=args.synaptic,
             tau_syn_min=args.tau_syn_min, tau_syn_max=args.tau_syn_max,
+            drive_source=args.drive_source,
             slope=args.slope, timing_slope=args.timing_slope).to(device)
     else:
         # The dense ABLATION. Every option below is shared with
@@ -4987,6 +5374,10 @@ def main():
         print(f"      timing reset={args.timing_reset}  "
               f"sub_film={args.sub_film}  sub_ln={args.sub_ln}  "
               f"gate_mode={args.gate_mode}  bias_mode={args.bias_mode}")
+        print(f"      drive_source={args.drive_source}"
+              + (f"  drive_lambda={args.drive_lambda:g} "
+                 f"({args.drive_penalty})"
+                 if args.drive_source == "cpg" else ""))
         print(f"      film_mode={args.film_mode}  "
               f"readout_gait_bias={bool(args.readout_gait_bias)}  "
               f"synaptic={args.synaptic}"
@@ -5041,7 +5432,7 @@ def main():
     print(f"      FiLM table : {n_film:,} params for max_gaits="
           f"{args.max_gaits}, of which {len(gait_tables)} row(s) in use; "
           f"unused rows are identity modulation and get no gradient")
-    if args.arch == "timing_grouped":
+    if args.arch == "timing_grouped" and args.drive_source == "timing":
         n_route = model.w_in_gait.weight.numel()
         print(f"      routing: {n_route:,} params, a FREE per-gait "
               f"({args.n_cpg_neurons} x {args.n_timing}) matrix per gait row, "
@@ -5049,6 +5440,13 @@ def main():
         print(f"               (the shared-router alternative produced "
               f"near-identical timing phases across gaits and was reverted — "
               f"see the TimingGroupedSNN docstring)")
+    elif args.arch == "timing_grouped" and args.drive_source == "cpg":
+        n_sgate = model.s_gate.weight.numel()
+        n_u     = model.u.numel()
+        print(f"      drive: s_gate {n_sgate:,} params (per-gait "
+              f"{args.n_cpg_neurons} x {model.G} channel selection) + "
+              f"u {n_u:,} params (gait-shared {args.n_cpg_neurons} x "
+              f"{model.G} x {args.hidden} expansion)")
     print(f"      tau range [{args.tau_min:.0f}, {args.tau_max:.0f}] steps "
           f"vs CPG period {period:.0f}")
     if args.tau_max < period:
@@ -5077,10 +5475,18 @@ def main():
         # and run_training, so the number warned about and the number acted
         # on are the same by construction.
         sat_rate = 0.95 * float(args.n_cpg_neurons) * float(cpg_rate)
-        timing_diag = lambda: timing_report(
-            model, spikes, phase, period, len(gait_tables), device,
-            t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
-            indent="      ", sat_rate=sat_rate)
+        if args.drive_source == "cpg":
+            # No timing layer to measure, and the CPG's own rates are
+            # constant every epoch. Report drive SELECTION instead -- same
+            # (lines, stats) contract, so run_training is unchanged.
+            timing_diag = lambda: drive_report(
+                model, len(gait_tables), gait_names=gait_names,
+                indent="      ")
+        else:
+            timing_diag = lambda: timing_report(
+                model, spikes, phase, period, len(gait_tables), device,
+                t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
+                indent="      ", sat_rate=sat_rate)
     else:
         timing_diag = None
 
@@ -5090,7 +5496,11 @@ def main():
     # a real spike train) and before the optimiser is built (it mutates
     # parameters in place).
     calib = {}
-    if args.arch == "timing_grouped" and args.calibrate_gains:
+    # Calibration tunes w_in_gait, which only exists when there IS a timing
+    # layer. Under --drive_source cpg the drive is the CPG's own spike train,
+    # whose rate is fixed by --cpg_vth_fb and is not a free parameter.
+    if (args.arch == "timing_grouped" and args.calibrate_gains
+            and args.drive_source == "timing"):
         print("\n      Calibrating timing-layer gains ...")
         # ── the band, as a FRACTION OF THE PERIOD ─────────────────
         # Two different denominators are in play here, and they answer two
@@ -5181,6 +5591,17 @@ def main():
             cpg_rate_hint=cpg_rate)
 
     # ── Spike objective (strategy) ──────────────────────────────
+    # Forced off under --drive_source cpg: the "spikes" reaching the
+    # sub-networks are then the CPG's own, which are an INPUT, so penalising
+    # them adds a constant to the loss with exactly zero gradient -- it would
+    # inflate the reported floor while changing nothing. --drive_lambda is the
+    # sparsity pressure in that mode.
+    if args.drive_source == "cpg" and args.spike_objective != "none":
+        print(f"      NOTE --drive_source cpg: forcing --spike_objective "
+              f"none (was {args.spike_objective!r}). The CPG's spikes are an "
+              f"input, not a learnable train, so a spike penalty on them has "
+              f"zero gradient. Use --drive_lambda instead.")
+        args.spike_objective = "none"
     spike_obj = make_spike_objective(
         args.spike_objective,
         lam=args.spike_stats_lambda, period=period,
@@ -5413,6 +5834,10 @@ def main():
                                   if args.arch == "timing_grouped" else None),
             "synaptic":         (str(args.synaptic)
                                  if args.arch == "timing_grouped" else None),
+            "drive_source":     (str(args.drive_source)
+                                 if args.arch == "timing_grouped" else None),
+            "drive_lambda":     float(args.drive_lambda),
+            "drive_penalty":    str(args.drive_penalty),
             "tau_syn_min":      float(args.tau_syn_min),
             "tau_syn_max":      float(args.tau_syn_max),
             # Was read by build_model_from_cfg but never written, so a
