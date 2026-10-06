@@ -2058,10 +2058,23 @@ class TimingGroupedSNN(nn.Module):
             # choose which phases to use, not to rewire the basis -- and
             # FiLM's gamma, which is per (gait, g, Hg) and applies after the
             # sum over channels, still gives a per-hidden-unit reshape on top.
-            # Full per-gait w1 would be max_gaits*G*C*Hg; this is
-            # max_gaits*G*C + G*C*Hg, ~7.5x smaller at the hexapod sizes.
-            C = self.n_neurons
-            self.s_gate = nn.Embedding(max_gaits, G * C)
+            # Full per-gait w1 would be max_gaits*G*n_ch*Hg; this is
+            # max_gaits*G*n_ch + G*n_ch*Hg, ~7.5x smaller at hexapod sizes.
+            #
+            # n_ch, NOT C. `C` is the OUTPUT-COLUMN count (len(group_cols[0]))
+            # and is used further down to size w_out and b_out. Assigning
+            # self.n_neurons to `C` here shadowed it, so in this branch
+            # w_out became (G, Ho, n_cpg) and b_out (G, n_cpg) instead of
+            # (G, Ho, C) and (G, C). That silently broke the output routing:
+            # y_grp came out (B, G, n_cpg), and
+            # `y_grp.flatten(1).index_select(1, out_perm)` with n_joints
+            # indices then selected the FIRST n_joints entries of a
+            # G*n_cpg-wide row -- i.e. sub-network 0's columns only. Every
+            # joint was driven by sub-network 0 and the other 17 never
+            # reached the loss. Any checkpoint whose parameter count matches
+            # the (G, Ho, n_cpg) shapes was trained that way.
+            n_ch = self.n_neurons
+            self.s_gate = nn.Embedding(max_gaits, G * n_ch)
             nn.init.ones_(self.s_gate.weight)     # every channel on; L1 prunes
 
             # Dense, at _W1_INIT, with NO 1/sqrt(C) fan-in correction.
@@ -2091,7 +2104,7 @@ class TimingGroupedSNN(nn.Module):
             # threshold, so their outgoing w2 weights get almost no gradient
             # -- the same dead-unit trap as in the timing layer, built in at
             # init. Dense over 18 weights makes it 2^-18.
-            self.u = nn.Parameter(torch.randn(G, C, Hg) * _W1_INIT)
+            self.u = nn.Parameter(torch.randn(G, n_ch, Hg) * _W1_INIT)
 
         # ── sub-network layer 2: block diagonal (G, Hg, Hg) ───────
         self.w2 = nn.Parameter(torch.randn(G, Hg, Hg) / math.sqrt(Hg))
@@ -2106,6 +2119,16 @@ class TimingGroupedSNN(nn.Module):
         # differ, projecting down to C BEFORE the membrane would leave only C
         # distinct (projection, tau) pairs for the whole group.  Ho == Hg (the
         # original) is the other extreme and was ~40% of the model's params.
+        # C must still be the OUTPUT-COLUMN count here. Re-asserted because
+        # a branch above once rebound it to n_neurons, which silently routed
+        # every joint through sub-network 0 (see the n_ch note). A wrong C
+        # here does not raise anywhere -- it produces a model that trains to
+        # a low loss with 17 of 18 sub-networks disconnected -- so it is
+        # checked rather than trusted.
+        assert C == len(group_cols[0]), (
+            f"C was rebound: expected len(group_cols[0])="
+            f"{len(group_cols[0])}, got {C}. w_out/b_out would be sized "
+            f"wrong and out_perm would select only sub-network 0.")
         self.w_read = nn.Parameter(torch.randn(G, Hg, Ho) / math.sqrt(Hg))
         self.w_out  = nn.Parameter(torch.randn(G, Ho, C) / math.sqrt(Ho))
         self.b_out  = nn.Parameter(torch.zeros(G, C))
