@@ -361,23 +361,80 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
     swing. The CPG raster, the timing raster and every leg row share one x
     axis with burst onsets marked, so a timing spike can be traced upward to
     the CPG burst that caused it and downward to the joint motion it drives.
+
+    Under --drive_source cpg_lif the timing raster has one lane per
+    SUB-NETWORK: its C drive-LIF units collapsed into one effective timing
+    neuron, every active channel drawn, alpha by spike share and colour by
+    channel -- the same rule, via the same functions, as the diagnostic
+    timing-alignment plot in visualize_timing.py. Each joint's rug shows its
+    sub-network's lane.
     """
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
-    from visualize_timing import predict_and_membranes, timing_raster
+    # drive_channels and unit_train are imported rather than re-implemented
+    # so this figure selects and shades channels by EXACTLY the rule the
+    # diagnostic timing-alignment plot uses.
+    from visualize_timing import (predict_and_membranes, timing_raster,
+                                  drive_channels, unit_train)
 
-    if not getattr(model, "use_timing", True) or \
-            not hasattr(model, "timing_map_list"):
+    # Skip only architectures with no timing structure at all. The old guard
+    # tested `use_timing`, which no model defines (the attribute is
+    # `uses_timing`), so it never fired -- harmless for the timing layer but
+    # it would have silently admitted anything.
+    if not hasattr(model, "timing_map_list"):
         print("    (skipping timing alignment: this model has no timing layer)")
         return
+    uses_timing = bool(getattr(model, "uses_timing", True))
+    is_lif = bool(getattr(model, "drive_lif", False))
 
     warm = int(round(warm_cycles * period))
     n = int(round(n_cycles * period))
     pred, _ = predict_and_membranes(model, spikes[:warm + n], gait, device,
                                     warm, tgt_range, keep_membranes=False)
     pred = pred[-n:]
-    tspk_all = timing_raster(model, spikes[:warm + n], gait, device)[-n:]
     cpg = spikes[warm:warm + n]
+
+    # What the second raster and the rugs show depends on the drive mode.
+    #
+    #   timing    the timing layer's own spikes, one lane per timing unit.
+    #
+    #   cpg_lif   the DRIVE LIF's spikes, (n, G, C): one unit per
+    #             (sub-network, channel). Using timing_raster here would be
+    #             wrong -- under the cpg modes timing_only returns the CPG
+    #             train unchanged, so the second raster was a verbatim copy
+    #             of the first and each rug indexed CPG channel g_own, i.e.
+    #             one channel per joint chosen by index coincidence. The
+    #             C units of a sub-network are mutually exclusive (one
+    #             channel each, zero reset, CPG channels never coincide), so
+    #             a lane collapses them into ONE effective timing neuron per
+    #             sub-network: every active channel drawn, alpha by spike
+    #             share, colour by channel. Shares are counted over the
+    #             plotted window only, matching visualize_timing.
+    #
+    #   cpg       no spiking drive layer; the raw CPG channels are the
+    #             drive, selected by the 90% rule on |s_gate|*||u|| because
+    #             a continuous drive is never exactly zero.
+    sel = None
+    if uses_timing:
+        tspk_all = timing_raster(model, spikes[:warm + n], gait, device)[-n:]
+    else:
+        G_sub = int(model.G)
+        if is_lif:
+            xs = torch.as_tensor(spikes[:warm + n], dtype=torch.float32,
+                                 device=device).unsqueeze(1)
+            gs_ = torch.full((warm + n, 1), int(gait), dtype=torch.long,
+                             device=device)
+            with torch.no_grad():
+                tr = model.drive_spikes_only(xs, gs_)        # (L,1,G,C)
+            tspk_all = tr[:, 0].cpu().numpy()[-n:]           # (n,G,C)
+            weight = tspk_all.sum(axis=0)                    # spike counts
+            frac = None                                      # every active ch
+        else:
+            tspk_all = cpg                                   # (n,C)
+            weight = (model.drive_strength().detach().cpu().numpy()[gait])
+            frac = 0.90
+        share = weight / np.maximum(weight.sum(axis=1, keepdims=True), 1e-12)
+        sel = [drive_channels(share[g], frac=frac) for g in range(G_sub)]
     n_cpg = cpg.shape[1]
     jnames = joint_type_names(len(leg_cols[0]))
     owner = {c: g for g, cols in enumerate(model.group_cols) for c in cols}
@@ -427,14 +484,28 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
     ax_cpg.grid(False)
     guides(ax_cpg)
 
-    T = T_all
-    for j in range(T):
-        idx = np.where(tspk_all[:, j] > 0)[0]
-        ax_tim.scatter(idx / period, np.full(len(idx), j), marker="|",
-                       s=110, lw=1.6, color=tcol[j])
+    if sel is None:
+        T = T_all
+        for j in range(T):
+            idx = np.where(tspk_all[:, j] > 0)[0]
+            ax_tim.scatter(idx / period, np.full(len(idx), j), marker="|",
+                           s=110, lw=1.6, color=tcol[j])
+        lane_name = "T"
+    else:
+        # One lane per SUB-NETWORK, filled by the same rule as the rugs
+        # below, so lane g reads as exactly the rug beneath its joints.
+        T = len(sel)
+        for j in range(T):
+            for ch, a in zip(*sel[j]):
+                idx = np.where(unit_train(tspk_all, j, int(ch)) > 0)[0]
+                ax_tim.scatter(idx / period, np.full(len(idx), j),
+                               marker="|", s=110, lw=1.6, alpha=float(a),
+                               color=TIMING_COLORS[int(ch)
+                                                   % len(TIMING_COLORS)])
+        lane_name = "g"
     ax_tim.set_ylim(-0.7, T - 0.3)
     ax_tim.set_yticks(range(T))
-    ax_tim.set_yticklabels([f"T{i}" if i in (0, T - 1) else ""
+    ax_tim.set_yticklabels([f"{lane_name}{i}" if i in (0, T - 1) else ""
                             for i in range(T)])
     ax_tim.set_ylabel("Timing")
     ax_tim.grid(False)
@@ -456,9 +527,20 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
             g_own = owner.get(c)
             if g_own is None or g_own >= T:
                 continue
-            idx = np.where(tspk_all[:, g_own] > 0)[0]
-            ax.vlines(idx / period, -9 - 5 * k, -3 - 5 * k,
-                      color=tcol[g_own], lw=1.3, alpha=0.95)
+            if sel is None:
+                idx = np.where(tspk_all[:, g_own] > 0)[0]
+                ax.vlines(idx / period, -9 - 5 * k, -3 - 5 * k,
+                          color=tcol[g_own], lw=1.3, alpha=0.95)
+            else:
+                # Every channel feeding this joint's sub-network, alpha by
+                # share, colour by channel -- identical to its raster lane.
+                for ch, a in zip(*sel[g_own]):
+                    idx = np.where(unit_train(tspk_all, g_own, int(ch))
+                                   > 0)[0]
+                    ax.vlines(idx / period, -9 - 5 * k, -3 - 5 * k,
+                              color=TIMING_COLORS[int(ch)
+                                                  % len(TIMING_COLORS)],
+                              lw=1.3, alpha=0.95 * float(a))
         ax.set_ylim(-9 - 5 * len(cols), 108)
         ax.set_yticks([0, 50, 100])
         # Short label: "(% range)" on two lines was tall enough to collide

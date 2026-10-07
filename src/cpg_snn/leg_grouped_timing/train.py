@@ -1310,6 +1310,57 @@ _BAND_FRAC_MIN_COUNT = (1.0 / 6.0, 1.0 / 3.0)   # 20-40 spk/cyc at n_cpg=6, ISI=
 # so the calibration band is capped here rather than at 1.0.
 _SAT_FRAC = 0.6
 
+# Drive-LIF membrane tau for --drive_source cpg_lif, in BURST WIDTHS.
+# Not learnable and not an argument, because both constraints pin it:
+#
+#   it must forget a whole cycle of silence -- a unit sees exactly one
+#   burst per cycle, and leftover potential from the previous cycle would
+#   make its firing depend on history rather than on this burst;
+#   it must NOT forget within a burst, or a low gain could never integrate
+#   several of its channel's spikes, which is what gives sub-burst
+#   placement.
+#
+# Bursts are back-to-back so burst_width = period / n_cpg, and at
+# tau = 2 * burst_width the residual after a full cycle is
+# exp(-period/tau) = exp(-n_cpg/2) -- 1.2e-4 at n_cpg 18 -- while retention
+# across one inter-spike interval stays ~0.9. The gain needed to fire on
+# spike 1..5 of a 5-spike burst is then 1.00 / 0.52 / 0.37 / 0.29 / 0.24,
+# a usable dynamic range. Note the residual depends only on n_cpg, not on
+# burst width, so this holds for any --cpg_vth_fb.
+_TAU_DRIVE_BURSTS = 2.0
+
+# Relative spread on s_gate's initialisation under --drive_source cpg_lif.
+#
+# s_gate is otherwise initialised to exactly 1.0, and under cpg_lif the
+# penalised drive is |s_gate| ALONE -- so the drive starts EXACTLY uniform.
+# Uniform is the participation ratio's MAXIMUM, hence a stationary point:
+# dPR/ds is exactly 0.0 there, not small, so the penalty exerts no force at
+# all and every channel stays active however large --drive_lambda is.
+# Measured: max|dPR/ds| = 0.0e+00 at exact ones, 3.4e-2 at a 1% spread.
+#
+# This did not bite under drive_source="cpg" because the drive there is
+# |s_gate| * ||u[g,c,:]||_1 and u's row norms carry ~9% spread at init,
+# which broke the tie by accident. Removing u from the drive -- the point of
+# cpg_lif -- removed that accident too, so the spread has to be deliberate.
+#
+# CENTRED ABOVE 1, with a SMALL spread:
+#
+#   mean 1.1  Exactly 1.0 sits ON a discontinuity -- spike_fn uses a strict
+#             >, so a unit at s=1.0 leaves its membrane at exactly thresh on
+#             the first spike, does not fire, and fires on spikes 2 and 4
+#             (2/5), while s=1.01 fires on every spike (5/5). Centring at
+#             1.1 starts every unit cleanly at 5/5: genuinely "all on", with
+#             the penalty pruning down from a well-defined state.
+#   std  0.01 Enough to make the drive non-uniform, so the participation
+#             ratio has a gradient from step 1 (3.4e-2 at a 1% spread). Kept
+#             small on purpose: PR is rich-get-richer, so a WIDE init hands
+#             it a random leader to amplify. Measured on a toy where the
+#             task preferred two channels, a N(0.8, 0.4) init let the
+#             init's strongest channel win 90% of the time against 52% for
+#             a tight one -- i.e. a wide init manufactures seed-dependence.
+_S_GATE_INIT_MEAN   = 1.1
+_S_GATE_INIT_SPREAD = 0.01
+
 # Smallest gap kept between a voltage-mode bias and `thresh`, so the
 # effective threshold `thresh - v` stays strictly positive.  See
 # TimingGroupedSNN.clamp_bias_voltage.
@@ -1803,12 +1854,18 @@ class TimingGroupedSNN(nn.Module):
     # unconditionally, like the alpha logits and like the vestigial
     # since_upd, so neither the state arity nor the exported ONNX signature
     # depends on --synaptic. They stay exactly zero when synaptic="none".
+    # mem_drive is the drive LIF's membrane, (B, G, C). Allocated
+    # unconditionally like syn*/since_upd so neither the state arity nor the
+    # exported ONNX signature depends on --drive_source; it stays exactly
+    # zero except under cpg_lif.
     state_names_in  = ("mem_timing_in", "since_upd_in",
                        "mem1_in",  "mem2_in",  "memo_in",
-                       "syn1_in",  "syn2_in",  "syno_in")
+                       "syn1_in",  "syn2_in",  "syno_in",
+                       "mem_drive_in")
     state_names_out = ("mem_timing_out", "since_upd_out",
                        "mem1_out", "mem2_out", "memo_out",
-                       "syn1_out", "syn2_out", "syno_out")
+                       "syn1_out", "syn2_out", "syno_out",
+                       "mem_drive_out")
 
     def __init__(self, hidden_per_group=128, n_gaits=4, max_gaits=16,
                  n_neurons=4, n_timing=N_LEGS, group_cols=None,
@@ -1821,7 +1878,7 @@ class TimingGroupedSNN(nn.Module):
                  timing_reset="zero", hidden_reset="subtract", gate_mode="none",
                  bias_mode="voltage", readout_gait_bias=True,
                  synaptic="none", tau_syn_min=2.0, tau_syn_max=20.0,
-                 drive_source="timing",
+                 drive_source="timing", tau_drive=None,
                  slope=25.0, timing_slope=None, thresh=1.0):
         super().__init__()
         if n_gaits > max_gaits:
@@ -1842,10 +1899,10 @@ class TimingGroupedSNN(nn.Module):
         if synaptic not in ("none", "hidden", "all"):
             raise ValueError(f"synaptic must be none|hidden|all, got "
                              f"{synaptic!r}")
-        if drive_source not in ("timing", "cpg"):
-            raise ValueError(f"drive_source must be timing|cpg, got "
+        if drive_source not in ("timing", "cpg", "cpg_lif"):
+            raise ValueError(f"drive_source must be timing|cpg|cpg_lif, got "
                              f"{drive_source!r}")
-        if drive_source == "cpg" and gate_mode != "none":
+        if drive_source in ("cpg", "cpg_lif") and gate_mode != "none":
             raise ValueError(
                 "drive_source='cpg' requires gate_mode='none'. There is no "
                 "timing unit to gate on: the gate would have to mean 'did any "
@@ -1928,6 +1985,10 @@ class TimingGroupedSNN(nn.Module):
         self.synaptic   = synaptic
         self.drive_source = drive_source
         self.uses_timing  = (drive_source == "timing")
+        # "cpg_lif" shares every parameter with "cpg" and adds a per-(g, c)
+        # LIF between the gain and the expansion, so most branches test this
+        # rather than the exact string.
+        self.drive_lif    = (drive_source == "cpg_lif")
         self.timing_reset = timing_reset
         self.hidden_reset = hidden_reset
         if gate_mode not in ("none", "decay"):
@@ -2075,7 +2136,18 @@ class TimingGroupedSNN(nn.Module):
             # the (G, Ho, n_cpg) shapes was trained that way.
             n_ch = self.n_neurons
             self.s_gate = nn.Embedding(max_gaits, G * n_ch)
-            nn.init.ones_(self.s_gate.weight)     # every channel on; L1 prunes
+            nn.init.ones_(self.s_gate.weight)     # every channel on
+            if self.drive_lif:
+                # See _S_GATE_INIT_MEAN / _SPREAD. Not applied in the "cpg"
+                # path: there the drive is |s|*||u|| and u's row norms
+                # already break the tie, and changing that init would alter
+                # existing comparisons.
+                with torch.no_grad():
+                    self.s_gate.weight.fill_(_S_GATE_INIT_MEAN)
+                    self.s_gate.weight.add_(
+                        torch.randn_like(self.s_gate.weight)
+                        * _S_GATE_INIT_SPREAD)
+                    self.s_gate.weight.clamp_(min=1e-3)
 
             # Dense, at _W1_INIT, with NO 1/sqrt(C) fan-in correction.
             #
@@ -2105,6 +2177,55 @@ class TimingGroupedSNN(nn.Module):
             # -- the same dead-unit trap as in the timing layer, built in at
             # init. Dense over 18 weights makes it 2^-18.
             self.u = nn.Parameter(torch.randn(G, n_ch, Hg) * _W1_INIT)
+
+            if self.drive_lif:
+                # ── drive_source="cpg_lif" ────────────────────────
+                # A LIF between the gain and the expansion: one unit per
+                # (sub-network, channel), each seeing EXACTLY ONE channel
+                # (s_gate is diagonal), so unit (g,c) can only thin or delay
+                # channel c's burst, never move to another phase.
+                #
+                # WHY. In the linear "cpg" path s_gate and u are
+                # multiplicatively redundant, so halving s and doubling u is
+                # bit-identically free and a penalty on s alone is
+                # meaningless. A threshold breaks that: halving s DROPS
+                # spikes, and u can rescale what survives but cannot
+                # resurrect a lost one. So the penalty can act on s_gate
+                # alone, which is the well-conditioned choice -- spike count
+                # is a STAIRCASE in s (flat over ~94% of its range, so its
+                # true gradient is zero almost everywhere), whereas |s| is
+                # smooth with gradient 1.
+                #
+                # FIXED THRESHOLD, no v. A learnable threshold reopens the
+                # escape completely: at v=0.5 a halved s recovers its
+                # original spike rate exactly. This layer gates, it does not
+                # compute, so self.thresh is used as-is.
+                #
+                # RESET TO ZERO, not subtract. Zero reset is what makes at
+                # most one of a sub-network's C units fire per timestep (its
+                # membrane only rises when its own channel fires, and CPG
+                # channels never coincide), which is what lets the C units
+                # be collapsed to ONE effective timing neuron per
+                # sub-network for reporting. Subtractive reset lets residual
+                # fire a step later, inside another channel's window, and
+                # breaks that.
+                # FIXED decay, a buffer not a Parameter. See
+                # _TAU_DRIVE_BURSTS: both ends are pinned by the burst
+                # structure, so there is nothing for training to choose and
+                # a learnable tau would only add a way to drift into
+                # forgetting-within-a-burst or remembering-across-cycles.
+                if tau_drive is None:
+                    raise ValueError(
+                        "drive_source='cpg_lif' needs tau_drive. main() "
+                        "passes _TAU_DRIVE_BURSTS * period / n_cpg_neurons; "
+                        "it is not defaulted here because the constructor "
+                        "does not know the CPG period.")
+                self.tau_drive = float(tau_drive)
+                self.register_buffer(
+                    "drive_decay",
+                    torch.tensor(math.exp(-1.0 / max(self.tau_drive, 1e-6)),
+                                 dtype=torch.float32),
+                    persistent=False)
 
         # ── sub-network layer 2: block diagonal (G, Hg, Hg) ───────
         self.w2 = nn.Parameter(torch.randn(G, Hg, Hg) / math.sqrt(Hg))
@@ -2241,24 +2362,68 @@ class TimingGroupedSNN(nn.Module):
     def drive_strength(self):
         """
         (n_gaits, G, C) tensor of how strongly CPG channel c drives
-        sub-network g in each gait:  |s_gate[gait,g,c]| * ||u[g,c,:]||_1.
+        sub-network g in each gait.  WHAT that means depends on the mode,
+        and the difference is the whole point of cpg_lif:
 
-        This, and NOT |s_gate| on its own, is the drive. s_gate and u enter
-        the forward pass only as the product s_gate[g,c] * u[g,c,h], and u's
-        row norm varies per (g,c), so |s_gate| alone says nothing about how
-        much current channel c actually delivers.
+          drive_source="cpg"      |s_gate[gait,g,c]| * ||u[g,c,:]||_1
+              s_gate and u are multiplicatively redundant here -- they enter
+              the forward pass only as a product and u's row norm varies per
+              (g,c) -- so |s_gate| alone says nothing about how much current
+              channel c delivers, and a penalty on it is escapable by
+              rescaling u. The product is the only well-defined drive.
 
-        Shared by `drive_penalty` and `drive_report` so the number penalised and
-        the number reported are the same quantity by construction.
+          drive_source="cpg_lif"  |s_gate[gait,g,c]|
+              A fixed-threshold LIF now sits between s_gate and u, so u
+              receives BINARY SPIKES. Halving s_gate drops spikes and u
+              cannot resurrect them, which makes |s_gate| meaningful on its
+              own and the penalty un-escapable. u's magnitude is then just
+              output scaling and does not belong in the drive at all.
+
+        Shared by `drive_penalty` and the reporters so the number penalised
+        and the number reported are the same quantity by construction.
 
         Only the first n_gaits rows: the rest are never indexed, and
         including them would both dilute the mean and push rows toward zero
         that nothing reads.
         """
-        unorm = self.u.abs().sum(dim=2)                         # (G, C)
         S = self.s_gate.weight[:self.n_gaits].abs().view(
             self.n_gaits, self.G, self.n_neurons)               # (n_gaits,G,C)
+        if self.drive_lif:
+            return S
+        unorm = self.u.abs().sum(dim=2)                         # (G, C)
         return S * unorm.unsqueeze(0)
+
+    @torch.no_grad()
+    def drive_spikes_only(self, x_seq, gait_seq, mem_d=None):
+        """
+        Replay just the drive LIF layer: (L, B, G, C) binary spikes.
+
+        The cpg_lif counterpart of `timing_only` -- it runs the 324 gate
+        units and nothing downstream, so it is cheap and is the exact spike
+        train the sub-networks saw. Returns None in the other modes, where
+        there is no such layer.
+
+        These spikes are the reportable quantity that replaces fanin90:
+        because the threshold is fixed and the reset is to zero, "channel c
+        delivers nothing to sub-network g" is the exact, integer statement
+        "unit (g,c) emitted zero spikes", with no cutoff to choose.
+        """
+        if not self.drive_lif:
+            return None
+        B = x_seq.shape[1]
+        dev, dt = x_seq.device, x_seq.dtype
+        if mem_d is None:
+            mem_d = torch.zeros(B, self.G, self.n_neurons,
+                                device=dev, dtype=dt)
+        dec = self.drive_decay
+        out = []
+        for t in range(x_seq.shape[0]):
+            s_g = self.s_gate(gait_seq[t]).view(-1, self.G, self.n_neurons)
+            mem_d = dec * mem_d + x_seq[t].unsqueeze(1) * s_g
+            spk = (mem_d > self.thresh).to(dt)
+            mem_d = mem_d * (1.0 - spk)
+            out.append(spk)
+        return torch.stack(out)
 
     def drive_penalty(self, kind="pr"):
         """
@@ -2293,7 +2458,7 @@ class TimingGroupedSNN(nn.Module):
             term dominates the task gradient, the winning channel is decided
             by initialisation rather than by the data -- which is the same
             failure mode as the timing layer's phase barrier. Start the
-            weight small, and lean on --spike_lambda_warmup's reasoning:
+            weight small, and rely on --lambda_warmup's ramp:
             let the task find which channels matter before paying to
             concentrate.
 
@@ -2370,7 +2535,7 @@ class TimingGroupedSNN(nn.Module):
         # memo is Ho wide, not Hg (see the readout comment in __init__).
         # syn1/syn2/syno mirror mem1/mem2/memo: same shapes, one per layer.
         return (mem_t, since, z(self.Hg), z(self.Hg), z(self.Ho),
-                z(self.Hg), z(self.Hg), z(self.Ho))
+                z(self.Hg), z(self.Hg), z(self.Ho), z(self.n_neurons))
 
     # ---------------------------------------------------------------
     def _timing(self, x, gait, mem_t):
@@ -2417,7 +2582,7 @@ class TimingGroupedSNN(nn.Module):
         x     : (B, n_neurons) float — CPG spikes this timestep
         gait  : (B,) int64
         state : (mem_timing, since_upd, mem1, mem2, memo,
-                 syn1, syn2, syno)
+                 syn1, syn2, syno, mem_drive)
 
         Returns (y, state, aux) where aux = (spk_timing,).
         `aux` exists so the spike-statistics penalty can see the spikes without
@@ -2425,7 +2590,8 @@ class TimingGroupedSNN(nn.Module):
         since spk_timing already feeds `y` it is in the graph regardless.  Kept
         as a 1-tuple so callers iterate over it uniformly.
         """
-        mem_t, since, mem1, mem2, memo, syn1, syn2, syno = state
+        (mem_t, since, mem1, mem2, memo,
+         syn1, syn2, syno, mem_d) = state
         G, Hg = self.G, self.Hg
 
         if self.uses_timing:
@@ -2535,7 +2701,18 @@ class TimingGroupedSNN(nn.Module):
             # channel's contribution and every other sub-network untouched.
             s_g    = self.s_gate(gait).view(-1, G, self.n_neurons)  # (B,G,C)
             scaled = x.unsqueeze(1) * s_g                           # (B,G,C)
-            cur1   = torch.einsum("bgc,gch->bgh", scaled, self.u) + b1
+            if self.drive_lif:
+                # One LIF per (g, c), fixed threshold, reset to zero. Its
+                # OUTPUT -- a binary spike train, not an analog gain -- is
+                # what reaches u, which is what makes a penalty on s_gate
+                # un-escapable (see the drive-LIF note in __init__).
+                mem_d = self.drive_decay * mem_d + scaled
+                spk_d = spike_fn(mem_d - self.thresh, self.slope)
+                mem_d = mem_d * (1.0 - spk_d)            # zero reset, always
+                drive = spk_d
+            else:
+                drive = scaled
+            cur1   = torch.einsum("bgc,gch->bgh", drive, self.u) + b1
         if self.sub_ln in ("l1", "both"):
             cur1 = self.ln1(cur1)
         if self.sub_film in ("l1", "both"):
@@ -2612,7 +2789,8 @@ class TimingGroupedSNN(nn.Module):
 
         y_grp = torch.einsum("bgh,ghc->bgc", memo, self.w_out) + self.b_out
         y     = y_grp.flatten(1).index_select(1, self.out_perm)
-        return (y, (mem_t, since, mem1, mem2, memo, syn1, syn2, syno),
+        return (y, (mem_t, since, mem1, mem2, memo,
+                    syn1, syn2, syno, mem_d),
                 (spk_t,))
 
     def forward(self, x_seq, gait_seq, state=None, return_aux=False):
@@ -2711,7 +2889,7 @@ class SingleStepONNX(nn.Module):
 
 class SingleStepONNXTiming(nn.Module):
     """
-    As SingleStepONNX but for TimingGroupedSNN's 8-tensor state.
+    As SingleStepONNX but for TimingGroupedSNN's 9-tensor state.
 
     Written as an explicit signature rather than *state: torch.onnx.export
     traces varargs unreliably, and the input names have to line up
@@ -2723,11 +2901,11 @@ class SingleStepONNXTiming(nn.Module):
         self.model = model
 
     def forward(self, spikes, gait, mem_timing, since_upd, mem1, mem2, memo,
-                syn1, syn2, syno):
-        y, (mt, su, m1, m2, mo, s1, s2, so), _ = self.model.step(
+                syn1, syn2, syno, mem_drive):
+        y, (mt, su, m1, m2, mo, s1, s2, so, md), _ = self.model.step(
             spikes, gait, (mem_timing, since_upd, mem1, mem2, memo,
-                           syn1, syn2, syno))
-        return y, mt, su, m1, m2, mo, s1, s2, so
+                           syn1, syn2, syno, mem_drive))
+        return y, mt, su, m1, m2, mo, s1, s2, so, md
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3214,7 +3392,7 @@ class MinCountSpikeObjective(SpikeObjective):
     scale-invariance means raising lam cannot compensate.  Saturation is
     handled by `reinit_timing_units`, which scales the offending column down.
 
-    Other mitigations: `--spike_lambda_warmup` ramps lam from 0 so the network
+    Other mitigations: `--lambda_warmup` ramps lam from 0 so the network
     learns to use spikes before being charged for them, and
     `--reinit_dead_after` repairs (gait, unit) pairs that fail anyway.
     """
@@ -3437,6 +3615,101 @@ def drive_report(model, n_gaits, gait_names=None, indent="    "):
             "dominant_channel":  [int(v) for v in dom[gi]],
             "dominant_share":    [float(v) for v in domshare[gi]],
             "fanin90":           [int(v) for v in k],
+        })
+    return lines, stats
+
+
+@torch.no_grad()
+def drive_spike_report(model, spikes, n_gaits, device, period,
+                       t0=0, n_steps=None, gait_names=None, indent="    "):
+    """
+    The --drive_source cpg_lif reporter: same (lines, stats) contract as
+    timing_report and drive_report, so run_training can call any of them.
+
+    Reports SPIKE COUNTS, which is why cpg_lif is worth the extra layer.
+    With a fixed threshold there is no scale ambiguity and no cutoff to
+    pick, so "channel c delivers nothing" is the exact integer statement
+    "unit (g,c) emitted zero spikes" -- replacing fanin90, which needed an
+    arbitrary 90% threshold and could not distinguish a genuinely dead
+    channel from one sitting at 1e-5.
+
+    Per (gait, sub-network):
+
+      spk/cyc   The COLLAPSED count: spikes per cycle of the OR over that
+                sub-network's C units. Valid as a single number because the
+                units are mutually exclusive -- each sees one channel, its
+                membrane only rises when that channel fires, CPG channels
+                never coincide, and the reset is to zero -- so the OR is a
+                well-defined spike train and this is literally how many
+                input events the sub-network receives per cycle. This is the
+                successor to the old timing layer's spk/cyc and is directly
+                comparable to it.
+
+      active    How many of the C channels emitted ANY spike. Exact, integer.
+
+      dom ch    Which channel contributed the most spikes, i.e. that
+                sub-network's dominant input phase.
+    """
+    L = int(n_steps if n_steps is not None else 6 * period)
+    sl = slice(int(t0), int(t0) + L)
+    x = torch.as_tensor(spikes[sl], dtype=torch.float32, device=device)
+    x = x.unsqueeze(1)                                      # (L, 1, C)
+    G, C = model.G, model.n_neurons
+    names = gait_names or [f"g{i}" for i in range(n_gaits)]
+    n_cyc = max(L / float(period), 1e-9)
+
+    # fanin90 of the GAIN, |s_gate| -- the quantity the penalty acts on.
+    # Reported alongside the spike counts because the two answer different
+    # questions on different timescales. `active` is exact but COARSE: a
+    # channel only goes silent once its gain falls below ~0.24, a ~78% drop
+    # from the 1.1 init, so a gain the penalty has already halved still
+    # counts as fully active and `active` sits at C for most of training.
+    # fanin90 is continuous, so it moves as soon as the penalty starts
+    # concentrating the gains -- it is the early-warning signal, and
+    # `active` is the eventual outcome.
+    Sg = model.drive_strength().detach().float().cpu()[:n_gaits]  # (ng,G,C)
+    sh = Sg / Sg.sum(dim=2, keepdim=True).clamp(min=1e-12)
+    srt = sh.sort(dim=2, descending=True).values
+    k90 = (srt.cumsum(dim=2) < 0.90).sum(dim=2) + 1                 # (ng,G)
+
+    lines, stats = [], []
+    for gi in range(n_gaits):
+        gt = torch.full((L, 1), gi, dtype=torch.long, device=device)
+        spk = model.drive_spikes_only(x, gt)                # (L,1,G,C)
+        if spk is None:
+            return [f"{indent}(drive_spikes_only unavailable)"], []
+        per_ch = spk[:, 0].sum(dim=0).cpu().numpy()         # (G, C) counts
+        # Collapsed train: at most one unit per sub-network fires per step,
+        # so summing over C and summing the OR agree -- asserted rather
+        # than assumed, since the whole collapse rests on it.
+        both = spk[:, 0].sum(dim=2)                         # (L, G)
+        if float(both.max()) > 1.0 + 1e-6:
+            raise AssertionError(
+                f"two drive units of one sub-network fired on the same "
+                f"timestep (max {float(both.max())}). Mutual exclusivity is "
+                f"what makes the collapsed spk/cyc meaningful; it requires "
+                f"zero reset and non-overlapping CPG channels.")
+        coll = per_ch.sum(axis=1) / n_cyc                   # (G,) spk/cyc
+        active = (per_ch > 0).sum(axis=1)                   # (G,)
+        dom = per_ch.argmax(axis=1)
+        nm = names[gi] if gi < len(names) else f"g{gi}"
+        fi = lambda v: " ".join(f"{int(z):>2d}" for z in v)
+        ff = lambda v: " ".join(f"{z:>5.1f}" for z in v)
+        f90 = k90[gi].numpy()
+        lines.append(f"{indent}drive {nm:>5s} : spk/cyc [{ff(coll)}]")
+        lines.append(f"{indent}      {'':>5s}   active  [{fi(active)}] of {C}"
+                     f"   dom ch [{fi(dom)}]")
+        lines.append(f"{indent}      {'':>5s}   fanin90 [{fi(f90)}] of {C}"
+                     f"   (of |s_gate|; mean {f90.mean():.1f})")
+        stats.append({
+            "gait":     nm,
+            "spk_cyc":  [float(v) for v in coll],
+            "n_active": [int(v) for v in active],
+            # Same key drive_report uses, so metrics.csv gets the same
+            # fanin_<gait>_g<N> columns and plot_drive_fanin_history needs
+            # no change to plot it.
+            "fanin90":  [int(v) for v in f90],
+            "dom_ch":   [int(v) for v in dom],
         })
     return lines, stats
 
@@ -3742,11 +4015,20 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                  and hasattr(model, "n_timing"))
     if use_stats:
         print(f"\n  Spike objective: {spike_obj.describe()}")
-        if args.spike_lambda_warmup > 0:
+        if args.lambda_warmup > 0:
             print(f"  lambda ramps linearly from 0 over the first "
-                  f"{args.spike_lambda_warmup} epoch(s), so the network learns "
+                  f"{args.lambda_warmup} epoch(s), so the network learns "
                   f"to USE spikes before it is charged for them.")
         print(f"  Judge it on free-run RMSE, not on the spike count.")
+    # Announced separately: under --drive_source cpg / cpg_lif the spike
+    # objective is forced off, so the block above never prints, yet the same
+    # ramp IS applied to the drive penalty.
+    if args.drive_lambda > 0.0 and args.lambda_warmup > 0:
+        print(f"\n  Drive penalty ({args.drive_penalty}, lambda "
+              f"{args.drive_lambda:g}) ramps linearly from 0 over the first "
+              f"{args.lambda_warmup} epoch(s), so the task can show which "
+              f"channels matter before the rich-get-richer penalty starts "
+              f"amplifying whichever one leads.")
 
     # Consecutive timing reports each (gait, unit) pair has been observed
     # dead or saturated, for reinit_timing_units.  Keyed per PAIR, not per
@@ -3785,8 +4067,11 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             # learned to need the spikes can prune a unit into unrecoverable
             # silence, because a gated sub-network with no input passes zero
             # gradient to everything except b_out.
-            lam_scale = (min(1.0, epoch / float(args.spike_lambda_warmup))
-                         if args.spike_lambda_warmup > 0 else 1.0)
+            # ONE ramp for every sparsity term. Shared deliberately: both
+            # the spike objective and the drive penalty can lock in a
+            # structure before the task gradient has said what it needs.
+            lam_scale = (min(1.0, epoch / float(args.lambda_warmup))
+                         if args.lambda_warmup > 0 else 1.0)
             tot, gtot, nb, ftot = 0.0, 0.0, 0, 0.0
             for _ in range(args.chunks_per_epoch):
                 (x, g, y, m, sw, rst,
@@ -3826,8 +4111,8 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 # pressure is active.
                 if (args.drive_lambda > 0.0
                         and hasattr(model, "drive_penalty")):
-                    dpen = args.drive_lambda * model.drive_penalty(
-                        args.drive_penalty)
+                    dpen = (lam_scale * args.drive_lambda
+                            * model.drive_penalty(args.drive_penalty))
                     loss = loss + dpen
                     ftot += float(dpen.detach())
 
@@ -3969,7 +4254,9 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             spike_rate_cols = {}
             if last_timing_stats:
                 for key, prefix, unit in (("rate", "spk", "t"),
-                                          ("fanin90", "fanin", "g")):
+                                          ("fanin90", "fanin", "g"),
+                                          ("spk_cyc", "dspk", "g"),
+                                          ("n_active", "nact", "g")):
                     if key not in last_timing_stats[0]:
                         continue
                     for st in last_timing_stats:
@@ -4342,6 +4629,7 @@ def build_model_from_cfg(cfg, device):
             # "timing" is what the model did before drive_source existed, so
             # an older config reconstructs with w_in_gait/w1 as it had them.
             drive_source     = str(cfg_get(cfg, "drive_source", "timing")),
+            tau_drive        = cfg_get(cfg, "tau_drive"),
             tau_syn_min      = float(cfg_get(cfg, "tau_syn_min", 2.0)),
             tau_syn_max      = float(cfg_get(cfg, "tau_syn_max", 20.0)),
             # gate_mode replaced the old boolean event_gated. Map the old
@@ -4782,9 +5070,21 @@ def main():
                          "the task gradient. Raise above 1.0 if units still "
                          "die; lower it if the floor is dragging units up "
                          "that the task would rather run sparser.")
-    ap.add_argument("--spike_lambda_warmup", type=int, default=10,
-                    help="[timing_grouped] Epochs over which the spike "
-                         "penalty's lambda ramps linearly from 0. Insurance "
+    ap.add_argument("--lambda_warmup", type=int, default=30,
+                    help="[timing_grouped] Epochs over which EVERY sparsity "
+                         "penalty's weight ramps linearly from 0 -- both the "
+                         "spike objective (--spike_stats_lambda) and the "
+                         "drive penalty (--drive_lambda). Was "
+                         "--spike_lambda_warmup, which covered only the "
+                         "former. Default 30 because that is roughly how long "
+                         "the task takes to reach reasonable performance, and "
+                         "the reason applies to both terms: the drive "
+                         "penalty's participation ratio is RICH-GET-RICHER, "
+                         "so if it is at full strength before the task has "
+                         "expressed which channels matter, it amplifies "
+                         "whichever channel happens to lead at init -- "
+                         "seed-dependence by construction. Insurance "
+                         "against a second failure too: "
                          "against a specific failure: when gated, a "
                          "silent timing unit starves its sub-network entirely "
                          "(memo decays, y collapses to b_out) and passes ZERO "
@@ -4917,7 +5217,7 @@ def main():
                          "also what configs predating this option "
                          "reconstruct as.")
     ap.add_argument("--drive_source", type=str, default="timing",
-                    choices=["timing", "cpg"],
+                    choices=["timing", "cpg", "cpg_lif"],
                     help="[timing_grouped] What drives the sub-networks. "
                          "'timing' (default): the learned timing layer, as "
                          "before. 'cpg': skip the timing layer entirely and "
@@ -4937,7 +5237,18 @@ def main():
                          "s_gate (see TimingGroupedSNN), and --drive_lambda "
                          "sparsifies it. Requires --gate_mode none, and "
                          "forces --spike_objective none since there is no "
-                         "learnable spike train to charge for.")
+                         "learnable spike train to charge for. "
+                         "'cpg_lif': as cpg, plus a fixed-threshold LIF per "
+                         "(sub-network, channel) between the gain and the "
+                         "expansion, so u receives binary SPIKES. That breaks "
+                         "the s_gate/u scale redundancy -- halving s drops "
+                         "spikes and u cannot resurrect them -- so "
+                         "--drive_lambda acts on |s_gate| ALONE, and the "
+                         "reporters print exact SPIKE COUNTS instead of a "
+                         "fanin90 that needed an arbitrary cutoff. It also "
+                         "restores sub-burst placement, since a low gain "
+                         "makes a unit integrate several of its channel's "
+                         "spikes before firing.")
     ap.add_argument("--drive_lambda", type=float, default=0.0,
                     help="[--drive_source cpg] Weight on the drive sparsity "
                          "term selected by --drive_penalty. The analogue of "
@@ -5264,6 +5575,8 @@ def main():
     # ── 3. Upsample ──────────────────────────────────────────────
     print("\n[3/6] Upsampling gait tables ...")
     gait_tables, target_rows = upsample_gait_tables(gait_tables_orig, gait_names)
+    print(np.array(gait_tables).shape)
+    print(np.array(gait_tables)[0, :, 0])
 
     targets, valid, tgt_range = build_targets(phase, gait_tables,
                                               phase_zero=args.phase_zero)
@@ -5319,6 +5632,10 @@ def main():
             synaptic=args.synaptic,
             tau_syn_min=args.tau_syn_min, tau_syn_max=args.tau_syn_max,
             drive_source=args.drive_source,
+            # Fixed, derived: bursts are back-to-back so period/n_cpg is one
+            # burst width. See _TAU_DRIVE_BURSTS.
+            tau_drive=(_TAU_DRIVE_BURSTS * float(period)
+                       / float(args.n_cpg_neurons)),
             slope=args.slope, timing_slope=args.timing_slope).to(device)
     else:
         # The dense ABLATION. Every option below is shared with
@@ -5400,7 +5717,7 @@ def main():
         print(f"      drive_source={args.drive_source}"
               + (f"  drive_lambda={args.drive_lambda:g} "
                  f"({args.drive_penalty})"
-                 if args.drive_source == "cpg" else ""))
+                 if args.drive_source in ("cpg", "cpg_lif") else ""))
         print(f"      film_mode={args.film_mode}  "
               f"readout_gait_bias={bool(args.readout_gait_bias)}  "
               f"synaptic={args.synaptic}"
@@ -5463,13 +5780,22 @@ def main():
         print(f"               (the shared-router alternative produced "
               f"near-identical timing phases across gaits and was reverted — "
               f"see the TimingGroupedSNN docstring)")
-    elif args.arch == "timing_grouped" and args.drive_source == "cpg":
+    elif (args.arch == "timing_grouped"
+          and args.drive_source in ("cpg", "cpg_lif")):
         n_sgate = model.s_gate.weight.numel()
         n_u     = model.u.numel()
         print(f"      drive: s_gate {n_sgate:,} params (per-gait "
               f"{args.n_cpg_neurons} x {model.G} channel selection) + "
               f"u {n_u:,} params (gait-shared {args.n_cpg_neurons} x "
               f"{model.G} x {args.hidden} expansion)")
+        if args.drive_source == "cpg_lif":
+            print(f"             + {model.G * args.n_cpg_neurons:,} drive LIF "
+                  f"units ({model.G} sub-nets x {args.n_cpg_neurons} "
+                  f"channels, one input each), 0 learnable params: "
+                  f"FIXED threshold {model.thresh:g}, FIXED tau "
+                  f"{model.tau_drive:.1f}, zero reset")
+            print(f"             penalty acts on |s_gate| alone; spike counts "
+                  f"are reported, not penalised")
     print(f"      tau range [{args.tau_min:.0f}, {args.tau_max:.0f}] steps "
           f"vs CPG period {period:.0f}")
     if args.tau_max < period:
@@ -5498,7 +5824,14 @@ def main():
         # and run_training, so the number warned about and the number acted
         # on are the same by construction.
         sat_rate = 0.95 * float(args.n_cpg_neurons) * float(cpg_rate)
-        if args.drive_source == "cpg":
+        if args.drive_source == "cpg_lif":
+            # Spike counts, not drive weights: the fixed-threshold LIF makes
+            # "zero spikes" exact, so there is no cutoff to choose.
+            timing_diag = lambda: drive_spike_report(
+                model, spikes, len(gait_tables), device, period,
+                t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
+                indent="      ")
+        elif args.drive_source == "cpg":
             # No timing layer to measure, and the CPG's own rates are
             # constant every epoch. Report drive SELECTION instead -- same
             # (lines, stats) contract, so run_training is unchanged.
@@ -5619,11 +5952,17 @@ def main():
     # them adds a constant to the loss with exactly zero gradient -- it would
     # inflate the reported floor while changing nothing. --drive_lambda is the
     # sparsity pressure in that mode.
-    if args.drive_source == "cpg" and args.spike_objective != "none":
-        print(f"      NOTE --drive_source cpg: forcing --spike_objective "
-              f"none (was {args.spike_objective!r}). The CPG's spikes are an "
-              f"input, not a learnable train, so a spike penalty on them has "
-              f"zero gradient. Use --drive_lambda instead.")
+    if args.drive_source in ("cpg", "cpg_lif") and args.spike_objective != "none":
+        why = ("The CPG's spikes are an input, not a learnable train, so a "
+               "spike penalty on them has zero gradient."
+               if args.drive_source == "cpg" else
+               "The drive LIF's spike count is a STAIRCASE in s_gate -- flat "
+               "over ~94% of its range -- so a penalty on the count has zero "
+               "true gradient almost everywhere. --drive_lambda on |s_gate| "
+               "is the smooth, monotonically equivalent version, and the "
+               "spike count is REPORTED rather than penalised.")
+        print(f"      NOTE --drive_source {args.drive_source}: forcing "
+              f"--spike_objective none (was {args.spike_objective!r}). {why}")
         args.spike_objective = "none"
     spike_obj = make_spike_objective(
         args.spike_objective,
@@ -5857,6 +6196,9 @@ def main():
                                   if args.arch == "timing_grouped" else None),
             "synaptic":         (str(args.synaptic)
                                  if args.arch == "timing_grouped" else None),
+            "tau_drive":        (float(getattr(model, "tau_drive", 0.0))
+                                 if getattr(model, "drive_lif", False)
+                                 else None),
             "drive_source":     (str(args.drive_source)
                                  if args.arch == "timing_grouped" else None),
             "drive_lambda":     float(args.drive_lambda),

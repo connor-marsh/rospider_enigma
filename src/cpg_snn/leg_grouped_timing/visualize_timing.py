@@ -78,7 +78,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 from train import (
-    TimingGroupedSNN, drive_report,
+    TimingGroupedSNN, drive_report, drive_spike_report,
     LIFCPGStepper, cpg_weight_matrix,
     detect_burst_threshold, burst_onsets,
     upsample_gait_tables, build_group_cols,
@@ -403,6 +403,15 @@ def gt_degrees(gait_tables, phase, gait_idx, phase_zero):
 # ═══════════════════════════════════════════════════════════════════
 
 def drive_channels(share, frac=0.90, alpha_min=0.38):
+    # frac=None selects every STRICTLY POSITIVE channel instead of a
+    # cumulative-mass subset. That is the right selector once the drive is a
+    # spike COUNT (drive_source=cpg_lif): "this channel delivers nothing" is
+    # then the exact integer statement "zero spikes", so there is no cutoff
+    # to choose, and a 90% rule would hide genuinely active channels -- at a
+    # near-uniform 18-channel row it keeps only 15 and drops 3 that really
+    # do spike. The 90% rule remains correct for the continuous drive of
+    # drive_source=cpg, where nothing is ever exactly zero and some cutoff
+    # is unavoidable.
     """
     Which channels to draw for one sub-network, and how strongly.
 
@@ -434,8 +443,13 @@ def drive_channels(share, frac=0.90, alpha_min=0.38):
         return np.empty(0, int), np.empty(0, float)
     p = share / tot
     order = np.argsort(-p)
-    keep = int((np.cumsum(p[order]) < frac).sum()) + 1
-    idx = order[:keep]
+    if frac is None:
+        idx = order[p[order] > 0.0]
+        if idx.size == 0:
+            return np.empty(0, int), np.empty(0, float)
+    else:
+        keep = int((np.cumsum(p[order]) < frac).sum()) + 1
+        idx = order[:keep]
     # Raw share-relative alpha, then mapped into [alpha_min, 1]. Without the
     # floor the weakest member of the 90% set gets alpha = its share divided
     # by the largest share, which for a dominant-plus-tail row is ~0.03 --
@@ -517,9 +531,23 @@ def _savefig(fig, out_dir, name, dpi):
     print(f"    [saved] {p}")
 
 
+def unit_train(tspk, g, ch):
+    """
+    One unit's binary train, for either raster layout.
+
+    tspk is (L, lanes) when a lane IS the unit -- the timing layer, or the
+    raw CPG channels. Under drive_source=cpg_lif it is (L, G, C) instead,
+    because the unit that matters is (sub-network, channel): the drive LIF
+    thins and delays its channel's burst, so sub-network g's copy of channel
+    c is NOT the same train as channel c itself, and plotting the raw
+    channel would show input the sub-network never received.
+    """
+    return tspk[:, g, ch] if tspk.ndim == 3 else tspk[:, ch]
+
+
 def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
                    timing_cols, leg_cols, gait_name, out_dir, dpi, t_lo, t_hi,
-                   drive_share=None):
+                   drive_share=None, drive_frac=0.90):
     """
     The main figure.  Two full-width rasters on top, then a grid of ONE ROW
     PER LEG and ONE COLUMN PER JOINT WITHIN THAT LEG.
@@ -558,6 +586,8 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     the point.
     """
     n_cpg = spikes.shape[1]
+    # tspk is (L, lanes) or (L, G, C); either way axis 1 is the lane count
+    # for the timing-layer path, and the cpg path overrides it with n_lane.
     G     = tspk.shape[1]                   # timing neurons (raster lanes)
     n_legs = len(leg_cols)
     C     = len(leg_cols[0])
@@ -640,13 +670,14 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     # and the panels line up by construction instead of by coincidence.
     if drive_share is not None:
         for j in range(n_lane):
-            for ch, a in zip(*drive_channels(drive_share[j])):
-                idx = np.where(tspk[sl, int(ch)] > 0)[0] + t_lo
+            for ch, a in zip(*drive_channels(drive_share[j],
+                                             frac=drive_frac)):
+                idx = np.where(unit_train(tspk, j, int(ch))[sl] > 0)[0] + t_lo
                 ax_tim.scatter(idx, np.full(len(idx), j), marker="|", s=110,
                                lw=1.5, alpha=float(a),
                                color=TIMING_PALETTE[int(ch)
                                                     % len(TIMING_PALETTE)])
-        lane_lab = [f"g{j}({len(drive_channels(drive_share[j])[0])})"
+        lane_lab = [f"g{j}({len(drive_channels(drive_share[j], frac=drive_frac)[0])})"
                     for j in range(n_lane)]
         tim_title = ("Sub-network drive raster  (lane g = the CPG channels "
                      "driving sub-network g, alpha by drive share — same "
@@ -684,7 +715,8 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
                 # against drive_gates.png's x axis. The dominant channel's
                 # rug is fully opaque, so one solid rug = concentrated and
                 # many mid-alpha rugs = unselected.
-                ch_idx, ch_a = drive_channels(drive_share[g_own])
+                ch_idx, ch_a = drive_channels(drive_share[g_own],
+                                              frac=drive_frac)
                 rugs = [(int(ch), float(a),
                          TIMING_PALETTE[int(ch) % len(TIMING_PALETTE)])
                         for ch, a in zip(ch_idx, ch_a)]
@@ -694,8 +726,9 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
                         if g_own is not None else [])
             # Burst onsets come from the STRONGEST contributor only. Onsets
             # from 17 weakly-weighted channels would be a picket fence.
-            spk_idx = (np.where(tspk[sl, rugs[0][0]] > 0)[0] + t_lo
-                       if rugs else np.empty(0, int))
+            spk_idx = (np.where(unit_train(tspk, g_own if g_own is not None
+                                            else 0, rugs[0][0])[sl] > 0)[0]
+                       + t_lo if rugs else np.empty(0, int))
             bursts = spike_bursts(spk_idx, burst_thr)
             col_ = rugs[0][2] if rugs else "#c8cdd4"
 
@@ -705,7 +738,8 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
                 # -- so the number is printed and the rugs can be counted
                 # against it instead of guessed at.
                 lab = (f" ← g{g_own} ch{rugs[0][0]} "
-                       f"(fanin90 {len(rugs)})")
+                       + (f"(active {len(rugs)})" if drive_frac is None
+                          else f"(fanin90 {len(rugs)})"))
             else:
                 lab = f" ← T{g_own}" if g_own is not None else ""
             title = f"leg {j} · {tnames[k]} (col {c}){lab}"
@@ -729,7 +763,8 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
             lo, hi = ax.get_ylim()
             rug = lo + 0.10 * (hi - lo)
             for ch, a, cc in rugs:
-                idx = np.where(tspk[sl, ch] > 0)[0] + t_lo
+                idx = np.where(unit_train(tspk, g_own if g_own is not None
+                                          else 0, ch)[sl] > 0)[0] + t_lo
                 ax.vlines(idx, lo, rug, color=cc, alpha=0.75 * a, lw=1.0,
                           zorder=5)
             for bst in bursts:
@@ -764,7 +799,7 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
 
 def plot_phase_fold(tspk, phase, gait_tables, gait_idx, timing_cols,
                     gait_name, phase_zero, out_dir, dpi, n_bins=72,
-                    drive_share=None):
+                    drive_share=None, drive_frac=0.90):
     """
     Time folded onto cycle phase.  Removes the 'which cycle' axis so
     alignment is a single picture per TIMING UNIT: the trajectory of the
@@ -787,7 +822,10 @@ def plot_phase_fold(tspk, phase, gait_tables, gait_idx, timing_cols,
     of the drive moves that mean twice as far as one supplying 20%, which a
     plain unweighted pool over the same channels would get wrong.
     """
-    G   = tspk.shape[1]
+    # Rows are sub-networks when drive_share is given (tspk may then be
+    # (L, G, C), whose axis 1 already is G) and timing units otherwise.
+    G   = (drive_share.shape[0] if drive_share is not None
+           else tspk.shape[1])
     tbl = gait_tables[gait_idx]
     R   = tbl.shape[0]
     ok  = np.isfinite(phase)
@@ -816,11 +854,11 @@ def plot_phase_fold(tspk, phase, gait_tables, gait_idx, timing_cols,
         if drive_share is not None:
             # Pool the channels carrying 90% of this sub-network's drive,
             # each spike weighted by its channel's share.
-            ch_idx, _ = drive_channels(drive_share[j])
+            ch_idx, _ = drive_channels(drive_share[j], frac=drive_frac)
             ph_l, w_l = [], []
             tot = float(drive_share[j].sum()) or 1.0
             for ch in ch_idx:
-                sel = (tspk[:, int(ch)] > 0) & ok
+                sel = (unit_train(tspk, j, int(ch)) > 0) & ok
                 if not sel.any():
                     continue
                 ph_l.append(phase[sel])
@@ -912,7 +950,8 @@ def plot_alignment_summary(summary, gait_names, G, out_dir, dpi):
 
 @torch.no_grad()
 def plot_drive_gates(model, gait_names, leg_cols, out_dir, dpi,
-                     gait_idx=None):
+                     gait_idx=None, drive_all=None, metric="product",
+                     report_ctx=None):
     """
     Per-gait CPG-channel selection, for --drive_source cpg.  The counterpart
     of plot_routing, and the central figure for that mode.
@@ -971,7 +1010,8 @@ def plot_drive_gates(model, gait_names, leg_cols, out_dir, dpi,
     if len(gidx) != ng:
         raise ValueError(f"gait_idx has {len(gidx)} entries for "
                          f"{ng} gait names")
-    Dall = model.drive_strength().detach().cpu().numpy()
+    Dall = (np.asarray(drive_all) if drive_all is not None
+            else model.drive_strength().detach().cpu().numpy())
     bad = [i for i in gidx if not 0 <= i < Dall.shape[0]]
     if bad:
         raise ValueError(
@@ -1012,11 +1052,12 @@ def plot_drive_gates(model, gait_names, leg_cols, out_dir, dpi,
     # that matches the rest of the tooling.
     pr = [float((m.sum(axis=1) ** 2 / np.maximum((m ** 2).sum(axis=1), 1e-12))
                 .mean()) for m in Mn]
-    f90m = []
+    f90m, actm = [], []
     for m in Mn:
         srt = -np.sort(-m, axis=1)
         f90m.append(float(((np.cumsum(srt, axis=1) < 0.90).sum(axis=1) + 1)
                           .mean()))
+        actm.append(float((m > 0).sum(axis=1).mean()))
 
     # Near-square grid rather than 1 x ng. Each panel is G x C (18 x 18 on
     # the hexapod), so a single row of them makes every panel tall and thin
@@ -1040,8 +1081,13 @@ def plot_drive_gates(model, gait_names, leg_cols, out_dir, dpi,
         ax.set_xticklabels([f"{i}" for i in range(C)], fontsize=6)
         ax.set_yticks(range(G))
         ax.set_yticklabels([f"g{j}" for j in range(G)], fontsize=6)
-        ax.set_title(f"{gname}  (mean fanin90 {f90m[gi]:.1f}, "
-                     f"mean PR {pr[gi]:.1f}, of {C})", fontsize=8)
+        # Under the spikes metric "active" is exact, so lead with it;
+        # fanin90's cutoff is only needed when nothing is ever zero.
+        ax.set_title((f"{gname}  (mean active {actm[gi]:.1f}, "
+                      f"mean PR {pr[gi]:.1f}, of {C})"
+                      if metric == "spikes" else
+                      f"{gname}  (mean fanin90 {f90m[gi]:.1f}, "
+                      f"mean PR {pr[gi]:.1f}, of {C})"), fontsize=8)
         if gi // ncols == nrows - 1 or gi + ncols >= ng:
             ax.set_xlabel("CPG channel ~ phase", fontsize=7)
         if M.sum() > 0:
@@ -1085,16 +1131,30 @@ def plot_drive_gates(model, gait_names, leg_cols, out_dir, dpi,
     # labels its row gi with names[gi], so a --gaits subset or reordering
     # would attach the right numbers to the wrong gait name.
     if gidx == list(range(ng)):
-        print("    train.py drive_report, verbatim (same function the "
-              "training log uses):")
+        # Whichever reporter the training log used, called verbatim so the
+        # figure and the log cannot disagree. drive_spike_report needs the
+        # CPG train, so it is only callable when one was passed in.
+        rep = ("drive_spike_report" if metric == "spikes" else "drive_report")
+        print(f"    train.py {rep}, verbatim (same function the training "
+              f"log uses):")
         try:
-            lines, _stats = drive_report(model, ng,
-                                         gait_names=list(gait_names),
-                                         indent="      ")
+            if metric == "spikes":
+                if report_ctx is None:
+                    raise ValueError("drive_spike_report needs the CPG train; "
+                                     "pass report_ctx=(spikes, device, period)")
+                sp_, dev_, per_ = report_ctx
+                lines, _ = drive_spike_report(
+                    model, sp_, ng, dev_, per_, t0=0,
+                    n_steps=min(int(6*per_), len(sp_)-1),
+                    gait_names=list(gait_names), indent="      ")
+            else:
+                lines, _ = drive_report(model, ng,
+                                        gait_names=list(gait_names),
+                                        indent="      ")
             for ln in lines:
                 print(ln)
         except Exception as exc:             # never let a print kill a figure
-            print(f"      [drive_report unavailable: {exc}]")
+            print(f"      [{rep} unavailable: {exc}]")
     else:
         print(f"    (skipping train.py's drive_report: --gaits selected "
               f"{gidx}, not the model's own order, and it labels rows by "
@@ -1110,11 +1170,17 @@ def plot_drive_gates(model, gait_names, leg_cols, out_dir, dpi,
         srt = -np.sort(-frac, axis=1)
         k90 = (np.cumsum(srt, axis=1) < 0.90).sum(axis=1) + 1
         eff.append(k90)
-        print(f"    {gait_names[gi]:>8}: fanin90 per sub-network "
-              f"{np.array2string(k90, max_line_width=200)}")
-        print(f"    {'':>8}  mean {k90.mean():.2f}  median "
-              f"{int(np.median(k90))}  min {int(k90.min())}  "
-              f"max {int(k90.max())}  (of {C})")
+        lbl = "active (exact)" if metric == "spikes" else "fanin90"
+        vals = (S[gi] > 0).sum(axis=1) if metric == "spikes" else k90
+        print(f"    {gait_names[gi]:>8}: {lbl} per sub-network "
+              f"{np.array2string(vals, max_line_width=200)}")
+        print(f"    {'':>8}  mean {vals.mean():.2f}  median "
+              f"{int(np.median(vals))}  min {int(vals.min())}  "
+              f"max {int(vals.max())}  (of {C})")
+        if metric == "spikes":
+            print(f"    {'':>8}  fanin90 for comparison: mean "
+                  f"{k90.mean():.2f} -- LOWER than the active count because "
+                  f"a 90% cutoff drops real channels")
     return {"dominant_channel": argmax_tbl,
             "channels_for_90pct_drive": [[int(v) for v in e] for e in eff]}
 
@@ -1392,6 +1458,18 @@ def _build_parser():
                     help="Folder of {name}.csv gait tables, resolved as "
                          "this_file_dir/<gaits_dir> — same default as "
                          "train.py's --gaits_dir.")
+    ap.add_argument("--drive_metric", type=str, default="auto",
+                    choices=["auto", "product", "gain", "spikes"],
+                    help="[--drive_source cpg / cpg_lif] Which drive "
+                         "representation the figures and printouts use. "
+                         "'auto' (default) follows the checkpoint: 'product' "
+                         "(|s_gate|*||u||, with fanin90) under cpg, 'spikes' "
+                         "(exact per-unit spike counts, no cutoff) under "
+                         "cpg_lif. Override to compare representations on one "
+                         "checkpoint: 'gain' plots |s_gate| alone, which is "
+                         "the penalised quantity under cpg_lif but is "
+                         "MEANINGLESS under cpg, where u can rescale it "
+                         "freely.")
     ap.add_argument("--gaits",     type=str, nargs="*", default=None,
                     help="Gait names to plot (default: all in the config).")
     ap.add_argument("--recon", type=int, default=1,
@@ -1592,9 +1670,55 @@ def run_visualization(model_dir, out_dir=None, args=None):
     # Computed once before the loop rather than per gait: drive_strength
     # returns all gaits at once, and it is a pure parameter read. None under
     # --drive_source timing, which leaves every plot call unchanged.
-    drive_all = None
+    drive_all, drive_spk_all, drive_metric = None, None, "product"
     if arch == "timing_grouped" and not getattr(model, "uses_timing", True):
-        D = model.drive_strength().detach().cpu().numpy()      # (n_gaits,G,C)
+        is_lif = bool(getattr(model, "drive_lif", False))
+        drive_metric = (("spikes" if is_lif else "product")
+                        if args.drive_metric == "auto" else args.drive_metric)
+        if drive_metric == "spikes" and not is_lif:
+            raise SystemExit(
+                "--drive_metric spikes needs --drive_source cpg_lif; this "
+                "checkpoint has no drive LIF layer to count spikes from.")
+        print(f"  drive metric: {drive_metric}"
+              + ("  (|s_gate|*||u||, fanin90 by a 90% cutoff)"
+                 if drive_metric == "product" else
+                 "  (exact per-unit spike counts, no cutoff)"
+                 if drive_metric == "spikes" else
+                 "  (|s_gate| alone -- the penalised quantity under cpg_lif)"))
+
+        if drive_metric == "spikes":
+            # Shares come from SPIKE COUNTS, which is the point of cpg_lif:
+            # "channel c delivers nothing" is the exact integer statement
+            # "unit (g,c) emitted zero spikes", with no threshold to pick.
+            # The WHOLE replay, not a fixed prefix. This used to take
+            # spikes[:6*period] -- a window anchored at t=0 -- while the
+            # time-axis figures plot [t_lo, t_hi), which starts after
+            # --warm_cycles and runs --n_cycles. With the defaults (3 and 4)
+            # that window is [3P, 7P), so everything past 6P came out as
+            # zeros and the last plotted period was blank. Replaying all of
+            # it also means the LIF's membrane state at t_lo is the real one
+            # rather than a fresh zero, and the shares below are measured
+            # over the same steps the figures show.
+            L = spikes.shape[0]
+            xs = torch.as_tensor(spikes[:L], dtype=torch.float32,
+                                 device=device).unsqueeze(1)
+            cnts, trains = [], []
+            for gi in range(len(all_names)):
+                gt = torch.full((L, 1), gi, dtype=torch.long, device=device)
+                sp = model.drive_spikes_only(xs, gt)         # (L,1,G,C)
+                tr = sp[:, 0].cpu().numpy()                  # (L,G,C)
+                trains.append(tr)
+                # Counted over the plotted window only, so the shares that
+                # pick and shade the rugs describe exactly the steps drawn.
+                cnts.append(tr[t_lo:t_hi].sum(axis=0))
+            D = np.stack(cnts).astype(np.float64)            # (n_gaits,G,C)
+            drive_spk_all = trains
+        elif drive_metric == "gain":
+            W = model.s_gate.weight.detach()[:len(all_names)]
+            D = W.abs().reshape(len(all_names), model.G,
+                                model.n_neurons).cpu().numpy()
+        else:
+            D = model.drive_strength().detach().cpu().numpy()
         drive_all = D / np.maximum(D.sum(axis=2, keepdims=True), 1e-12)
 
     summary, plotted = {}, []
@@ -1646,11 +1770,27 @@ def run_visualization(model_dir, out_dir=None, args=None):
         else:
             rows_map, d_share = timing_cols, None
 
-        plot_alignment(spikes, tspk, gt, pred, phase, onsets, period,
+        # Under cpg_lif the rug must show the DRIVE LIF's spikes, not the raw
+        # CPG channel's: the unit thins and delays its channel's burst, so
+        # the two differ, and only the former is what the sub-network
+        # actually received. tspk_g is (L, G, C) there, (L, lanes) otherwise.
+        tspk_g = tspk
+        if drive_spk_all is not None and gi < len(drive_spk_all):
+            tr = drive_spk_all[gi]                            # (Ld, G, C)
+            Ld = min(tr.shape[0], tspk.shape[0])
+            tspk_g = np.zeros((tspk.shape[0],) + tr.shape[1:], dtype=tr.dtype)
+            tspk_g[:Ld] = tr[:Ld]
+
+        # frac=None under the spikes metric: "active" is then exact, so
+        # every channel that fires should be drawn rather than a 90% subset.
+        d_frac = None if drive_metric == "spikes" else 0.90
+        plot_alignment(spikes, tspk_g, gt, pred, phase, onsets, period,
                        burst_thr, rows_map, leg_cols, gname, out_dir,
-                       args.dpi, t_lo, t_hi, drive_share=d_share)
-        plot_phase_fold(tspk, phase, gait_tables, gi, rows_map, gname,
-                        phase_zero, out_dir, args.dpi, drive_share=d_share)
+                       args.dpi, t_lo, t_hi, drive_share=d_share,
+                       drive_frac=d_frac)
+        plot_phase_fold(tspk_g, phase, gait_tables, gi, rows_map, gname,
+                        phase_zero, out_dir, args.dpi, drive_share=d_share,
+                        drive_frac=d_frac)
 
         # statistics over the full fold window
         ok    = np.isfinite(phase)
@@ -1659,8 +1799,24 @@ def run_visualization(model_dir, out_dir=None, args=None):
         x_tbl = ((np.arange(tbl.shape[0]) / tbl.shape[0]) - phase_zero) % 1.0
         order = np.argsort(x_tbl)
         rows  = []
-        for j in range(G):
-            m = (tspk[:, j] > 0) & ok
+        # Under cpg_lif the per-row train is the COLLAPSED one: the OR over
+        # that sub-network's C drive units. Valid as a single train because
+        # the units are mutually exclusive (one channel each, zero reset,
+        # CPG channels never coincide), and it is exactly the input-event
+        # train the sub-network receives -- directly comparable to the old
+        # timing layer's spk/cyc. Without this the loop would report the raw
+        # CPG channel's phase, which the drive LIF has thinned and delayed.
+        coll = None
+        if tspk_g.ndim == 3:
+            coll = (tspk_g.sum(axis=2) > 0).astype(np.float32)   # (L, G)
+            if float(tspk_g.sum(axis=2).max()) > 1.0 + 1e-6:
+                print("    WARNING drive units of one sub-network fired on "
+                      "the same timestep; the collapsed train is not valid "
+                      "(needs zero reset).")
+        n_row = coll.shape[1] if coll is not None else G
+        for j in range(n_row):
+            m = ((coll[:, j] > 0) if coll is not None
+                 else (tspk[:, j] > 0)) & ok
             mu, R_ = circular_stats(phase[m])
             f_ph   = fundamental_phase(tbl[order, timing_cols[j][0]])
             res    = circ_diff(mu, f_ph)
@@ -1669,13 +1825,15 @@ def run_visualization(model_dir, out_dir=None, args=None):
                 "cols":            list(timing_cols[j]),
                 "feeds_subnets":   ([g for g, m in enumerate(timing_map)
                                      if j in m] if timing_map else [j]),
-                "rate_per_cycle":  float(tspk[:, j].sum() / ncyc),
+                "rate_per_cycle":  float((coll[:, j] if coll is not None
+                                          else tspk[:, j]).sum() / ncyc),
                 "mean_phase":      None if not np.isfinite(mu) else float(mu),
                 "R":               float(R_),
                 "leg_fundamental_phase": None if not np.isfinite(f_ph) else float(f_ph),
                 "residual_cycles": None if not np.isfinite(res) else float(res),
                 "residual_steps":  None if not np.isfinite(res) else float(res * period),
-                "dead":            bool(tspk[:, j].sum() == 0),
+                "dead":            bool((coll[:, j] if coll is not None
+                                         else tspk[:, j]).sum() == 0),
             })
             tag = "  <-- DEAD" if rows[-1]["dead"] else ""
             print(f"    T{j} (cols {timing_cols[j]}): "
@@ -1696,9 +1854,10 @@ def run_visualization(model_dir, out_dir=None, args=None):
                                out_dir, args.dpi)
         # Mutually exclusive with plot_routing: each returns None in the
         # other's mode, so exactly one of the two figures is produced.
-        drive_gates = plot_drive_gates(model, plotted, leg_cols,
-                                       out_dir, args.dpi,
-                                       gait_idx=[i for i, _ in sel])
+        drive_gates = plot_drive_gates(
+            model, plotted, leg_cols, out_dir, args.dpi,
+            gait_idx=[i for i, _ in sel], drive_all=drive_all,
+            metric=drive_metric, report_ctx=(spikes, device, period))
         metrics_csv = model_dir / "metrics.csv"
         if metrics_csv.exists():
             # Which per-unit history exists depends on the drive mode, and
