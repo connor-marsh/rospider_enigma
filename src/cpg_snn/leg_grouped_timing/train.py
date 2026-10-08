@@ -3644,7 +3644,8 @@ def drive_report(model, n_gaits, gait_names=None, indent="    "):
 
 @torch.no_grad()
 def drive_spike_report(model, spikes, n_gaits, device, period,
-                       t0=0, n_steps=None, gait_names=None, indent="    "):
+                       t0=0, n_steps=None, gait_names=None, indent="    ",
+                       targets=None, valid=None):
     """
     The --drive_source cpg_lif reporter: same (lines, stats) contract as
     timing_report and drive_report, so run_training can call any of them.
@@ -3719,11 +3720,32 @@ def drive_spike_report(model, spikes, n_gaits, device, period,
         fi = lambda v: " ".join(f"{int(z):>2d}" for z in v)
         ff = lambda v: " ".join(f"{z:>5.1f}" for z in v)
         f90 = k90[gi].numpy()
+        # Alignment of each sub-network's COLLAPSED input train (see
+        # alignment_score). Computed from spikes already in hand, so it costs
+        # no extra forward pass. Needs the targets for this window.
+        al = [float("nan")] * G
+        if targets is not None:
+            tr_all = spk[:, 0].cpu().numpy().sum(axis=2)           # (L, G)
+            vmask = (None if valid is None
+                     else np.asarray(valid[sl], dtype=bool))
+            for g in range(G):
+                tau_a, _, _ = alignment_horizon(model, g)
+                theta = targets[gi, sl][:, list(model.group_cols[g])]
+                al[g] = alignment_score(tr_all[:, g], theta, tau_a, vmask)
         lines.append(f"{indent}drive {nm:>5s} : spk/cyc [{ff(coll)}]")
         lines.append(f"{indent}      {'':>5s}   active  [{fi(active)}] of {C}"
                      f"   dom ch [{fi(dom)}]")
         lines.append(f"{indent}      {'':>5s}   fanin90 [{fi(f90)}] of {C}"
                      f"   (of |s_gate|; mean {f90.mean():.1f})")
+        if targets is not None:
+            av = np.array(al, dtype=np.float64)
+            fin = av[np.isfinite(av)]
+            lines.append(
+                f"{indent}      {'':>5s}   align   mean {np.nanmean(av):+.3f}"
+                + (f"  (min {fin.min():+.2f} max {fin.max():+.2f}; "
+                   f"0 = random, 1 = ideal)" if fin.size else "")
+                + (f"  {int((~np.isfinite(av)).sum())} with no input"
+                   if (~np.isfinite(av)).any() else ""))
         stats.append({
             "gait":     nm,
             "spk_cyc":  [float(v) for v in coll],
@@ -3733,13 +3755,14 @@ def drive_spike_report(model, spikes, n_gaits, device, period,
             # no change to plot it.
             "fanin90":  [int(v) for v in f90],
             "dom_ch":   [int(v) for v in dom],
+            "align":    [float(v) for v in al],
         })
     return lines, stats
 
 
 def timing_report(model, spikes, phase, period, n_gaits, device,
                   t0, n_steps=1500, gait_names=None, indent="    ",
-                  sat_rate=None):
+                  sat_rate=None, targets=None, valid=None):
     """
     Per-gait firing statistics for the timing layer.  Returns a list of
     formatted lines (also returned as raw dicts) so the caller can print
@@ -3825,10 +3848,30 @@ def timing_report(model, spikes, phase, period, n_gaits, device,
                              f"WARNING: timing neuron(s) {sat} SATURATED for "
                              f"{name} (>= {sat_rate:.0f} spk/cyc) — firing on "
                              f"most CPG spikes, so they carry no phase.")
+        # Alignment per SUB-NETWORK, from the timing units that feed it
+        # (timing_map), so it is directly comparable with cpg_lif's.
+        al = []
+        if targets is not None and hasattr(model, "timing_map_list"):
+            sl_ = slice(int(t0), int(t0) + n_steps)
+            vmask = (None if valid is None
+                     else np.asarray(valid[sl_], dtype=bool))
+            for gs, units in enumerate(model.timing_map_list):
+                tau_a, _, _ = alignment_horizon(model, gs)
+                train_ = spk[:, list(units)].sum(axis=1)
+                theta = targets[g, sl_][:, list(model.group_cols[gs])]
+                al.append(alignment_score(train_, theta, tau_a, vmask))
+            av = np.array(al, dtype=np.float64)
+            fin = av[np.isfinite(av)]
+            lines.append(
+                f"{indent}       {'':>5s}   align mean {np.nanmean(av):+.3f}"
+                + (f"  (min {fin.min():+.2f} max {fin.max():+.2f} over "
+                   f"{len(av)} sub-networks; 0 = random, 1 = ideal)"
+                   if fin.size else ""))
         stats.append({"gait": name, "rate": [float(v) for v in rate],
                       "phase": [None if not np.isfinite(v) else float(v)
                                 for v in mu],
-                      "R": [float(v) for v in R]})
+                      "R": [float(v) for v in R],
+                      "align": [float(v) for v in al]})
 
     # THE headline diagnostic for gait separation. If the PHASE VECTORS are
     # near-identical across gaits, the timing layer has collapsed to a
@@ -3983,6 +4026,110 @@ class MetricsWriter:
             self.fh = None
 
 
+def _tau_from_logit(logit):
+    """Membrane/synapse time constant from a stored decay logit.
+    Decays are stored as logit(beta) with beta = exp(-1/tau)."""
+    d = torch.sigmoid(logit.detach().float()).clamp(1e-6, 1.0 - 1e-9)
+    return (-1.0 / torch.log(d)).cpu().numpy()
+
+
+def alignment_horizon(model, g):
+    """
+    How far ahead a spike in sub-network g can still be credited with the
+    joint motion it helps produce: tau_a = tau_readout + tau_syn, using the
+    median learned readout membrane tau and, when --synaptic puts a synapse
+    on that path, the median synaptic tau ("all": the readout's own;
+    "hidden": layer 2's, which feeds the readout). tau_readout + tau_syn is
+    the mean duration of a syn->mem response, i.e. how long one spike keeps
+    shaping the output.
+
+    Returns (tau_a, tau_mem, tau_syn).
+    """
+    tau_m = float(np.median(_tau_from_logit(model.betao_logit[g])))
+    syn = getattr(model, "synaptic", "none")
+    tau_s = 0.0
+    if syn == "all" and hasattr(model, "alphao_logit"):
+        tau_s = float(np.median(_tau_from_logit(model.alphao_logit[g])))
+    elif syn == "hidden" and hasattr(model, "alpha2_logit"):
+        tau_s = float(np.median(_tau_from_logit(model.alpha2_logit[g])))
+    return tau_m + tau_s, tau_m, tau_s
+
+
+def alignment_score(train, theta, tau_a, valid=None):
+    """
+    How well a sub-network's input spikes coincide with its joint's fast
+    motion, chance-anchored so it is comparable across joints.
+
+    Per-step credit, a DECAYED MAXIMUM of the joint speed v = |dtheta/dt|:
+
+        w(t) = max over j >= 0 of  r^j * v(t + j),     r = exp(-1/tau_a)
+
+    so a spike gets the speed at its OWN step in full, partial credit for
+    fast motion shortly AHEAD of it (decaying with how far ahead), and none
+    for motion behind it, which it cannot have caused. Every step inside a
+    uniformly fast window scores the same.
+
+    A decayed SUM of future speed (the first version of this) got two things
+    wrong. Under --synaptic its response peaks ~10-20 steps after the spike,
+    so the best-scoring spike sat well BEFORE the fast motion; and even
+    without synaptic, a spike late in a fast window was penalised because
+    most of what it "saw" was the slow motion after the window ends.
+
+        S = (spike-weighted mean of w  -  mean of w over all steps)
+            / (max of w  -  mean of w)
+
+    S = 0 is what random placement gets; S = 1 means every spike lands at
+    the peak speed; S < 0 means spikes land where the joint is still (not
+    bounded at -1 and waveform-dependent, so only compare positive scores
+    across joints). NaN if there are no spikes. Anchored to the MEAN of w,
+    not normalised by the max alone: under max-only normalisation random
+    placement scores ~0.64 on a sinusoid but ~0.25 on a sharp gait-like
+    waveform, so a random sub-network on a smooth joint would outscore a
+    well-placed one on a sharp joint.
+
+    train  : (L,) non-negative per-step spike weights (binary, or weighted)
+    theta  : (L,) or (L, k) target angle(s); k > 1 for a sub-network driving
+             several joints, each put on a common scale before combining
+    tau_a  : credit horizon in steps, from alignment_horizon
+    valid  : (L,) bool, steps to include
+    The window must be a whole number of cycles of ONE gait, so that the
+    circular wrap below lands on the same phase.
+    """
+    th = np.asarray(theta, dtype=np.float64)
+    if th.ndim == 1:
+        th = th[:, None]
+    v = np.abs(np.gradient(th, axis=0))
+    if v.shape[1] > 1:
+        v = v / np.maximum(v.mean(axis=0, keepdims=True), 1e-12)
+        v = np.sqrt((v ** 2).mean(axis=1))
+    else:
+        v = v[:, 0]
+    L = v.shape[0]
+    r = math.exp(-1.0 / max(float(tau_a), 1e-6))
+    # w(t) = max(v(t), r * w(t+1)), wrapped circularly; repeated passes
+    # converge because r < 1 (a long horizon needs more than one lap).
+    w = v.copy()
+    for _ in range(200):
+        prev = w.copy()
+        nxt = w[0]
+        for t in range(L - 1, -1, -1):
+            cand = r * nxt
+            if cand > w[t]:
+                w[t] = cand
+            nxt = w[t]
+        if np.array_equal(w, prev):
+            break
+    ok = (np.ones(L, dtype=bool) if valid is None
+          else np.asarray(valid, dtype=bool)[:L])
+    s = np.asarray(train, dtype=np.float64)[:L] * ok
+    if s.sum() <= 0 or not ok.any():
+        return float("nan")
+    base, top = float(w[ok].mean()), float(w[ok].max())
+    if top - base <= 1e-12:
+        return float("nan")
+    return float(((s * w).sum() / s.sum() - base) / (top - base))
+
+
 def lambda_schedule(epoch, hold, warmup):
     """
     Sparsity-penalty weight multiplier for a 1-based `epoch`.
@@ -4015,7 +4162,8 @@ def lambda_schedule_text(args):
 
 def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                  gait_w, out_dir, timing_diag=None, n_gaits=4, period=254.0,
-                 spike_obj=None, sat_rate=None):
+                 spike_obj=None, sat_rate=None, tgt_range=None,
+                 gait_names=None):
     """
     `timing_diag` : optional zero-arg callable returning (lines, stats).
                     Called every args.timing_log_every epochs for the
@@ -4221,6 +4369,10 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             # masked_loss is sum(err*mask)/max(sum(mask), 1), so
             # loss * mask.sum() recovers the exact masked sum.
             vtot, vsw_tot, vn, vsw_n = 0.0, 0.0, 0.0, 0.0
+            # Per (gait, joint) squared error and step count, for an RMSE in
+            # DEGREES. Accumulated from this pass's predictions, so it costs
+            # no extra forward pass.
+            rm_sse = rm_cnt = None
             with torch.no_grad():
                 for _ in range(args.val_chunks):
                     (x, g, y, m, sw, rst,
@@ -4236,6 +4388,14 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                     if nv > 0:
                         vtot += masked_loss(pred, y, m, g).item() * nv
                         vn += nv
+                        if rm_sse is None:
+                            rm_sse = torch.zeros(n_gaits, pred.shape[2],
+                                                 device=pred.device)
+                            rm_cnt = torch.zeros(n_gaits, device=pred.device)
+                        e2 = ((pred - y) ** 2) * m.unsqueeze(-1)   # (L,B,J)
+                        gi_ = g.reshape(-1).long()
+                        rm_sse.index_add_(0, gi_, e2.reshape(-1, e2.shape[2]))
+                        rm_cnt.index_add_(0, gi_, m.reshape(-1))
 
                     # "post-switch" window: args.settle steps after each switch
                     post = torch.zeros_like(sw)
@@ -4255,6 +4415,21 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                     f"everything. Raise --val_chunks.")
             va_loss = vtot / vn
             vsw     = vsw_tot / vsw_n if vsw_n > 0 else float("nan")
+
+            # Validation RMSE in DEGREES, per gait = mean over joints of each
+            # joint's RMSE. Targets are normalised with one global (lo, hi),
+            # so the conversion is a single factor (hi-lo)/2. NOTE this is
+            # measured on the validation STREAM, which includes gait switches,
+            # so it runs somewhat higher than a steady single-gait RMSE.
+            rmse_g = np.full(n_gaits, np.nan)
+            if rm_sse is not None and tgt_range is not None:
+                scale = (float(tgt_range[1]) - float(tgt_range[0])) / 2.0
+                cnt = rm_cnt.clamp(min=1.0).unsqueeze(1)
+                per = (torch.sqrt(rm_sse / cnt) * scale).cpu().numpy()
+                seen = rm_cnt.cpu().numpy() > 0
+                rmse_g = np.where(seen, per.mean(axis=1), np.nan)
+            gnames = (list(gait_names) if gait_names is not None
+                      else [f"g{i}" for i in range(n_gaits)])
             epoch_s = time.perf_counter() - t_epoch
 
             # Appended together, so an interrupt can never leave these
@@ -4350,7 +4525,8 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 for key, prefix, unit in (("rate", "spk", "t"),
                                           ("fanin90", "fanin", "g"),
                                           ("spk_cyc", "dspk", "g"),
-                                          ("n_active", "nact", "g")):
+                                          ("n_active", "nact", "g"),
+                                          ("align", "align", "g")):
                     if key not in last_timing_stats[0]:
                         continue
                     for st in last_timing_stats:
@@ -4364,6 +4540,11 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 "grad_norm": tr_gnorm, "update_norm": upd,
                 "spike_penalty": tr_floor, "sec": epoch_s,
                 "best": int(is_best),
+                "rmse_mean": (float(np.nanmean(rmse_g))
+                              if np.isfinite(rmse_g).any() else None),
+                **{f"rmse_{gnames[i]}": (float(rmse_g[i])
+                                         if np.isfinite(rmse_g[i]) else None)
+                   for i in range(n_gaits)},
                 **{f"grad_{b}": gblk[b] for b in sorted(blocks)},
                 **{f"upd_{b}": ublk[b] for b in sorted(blocks)},
                 **spike_rate_cols,
@@ -4392,6 +4573,13 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             if run_timing_diag:
                 for ln in timing_lines:
                     print(ln)
+                if np.isfinite(rmse_g).any():
+                    print("      val RMSE (deg, mean over joints): "
+                          + "  ".join(f"{gnames[i]} {rmse_g[i]:.2f}"
+                                      for i in range(n_gaits)
+                                      if np.isfinite(rmse_g[i]))
+                          + f"   | mean {np.nanmean(rmse_g):.2f}"
+                          + "   (validation stream, incl. gait switches)")
 
                 # Failures are tracked per (gait, unit), because the fix is:
                 # w_in_gait has a gait axis, so a unit that is fine for five
@@ -5954,7 +6142,7 @@ def main():
             timing_diag = lambda: drive_spike_report(
                 model, spikes, len(gait_tables), device, period,
                 t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
-                indent="      ")
+                indent="      ", targets=targets, valid=valid)
         elif args.drive_source == "cpg":
             # No timing layer to measure, and the CPG's own rates are
             # constant every epoch. Report drive SELECTION instead -- same
@@ -5966,7 +6154,8 @@ def main():
             timing_diag = lambda: timing_report(
                 model, spikes, phase, period, len(gait_tables), device,
                 t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
-                indent="      ", sat_rate=sat_rate)
+                indent="      ", sat_rate=sat_rate,
+                targets=targets, valid=valid)
     else:
         timing_diag = None
 
@@ -6120,7 +6309,8 @@ def main():
             model, tr_sampler, va_sampler, opt, sched,
             device, args, gait_w, out_dir, timing_diag=timing_diag,
             n_gaits=len(gait_tables), period=period,
-            spike_obj=spike_obj, sat_rate=sat_rate)
+            spike_obj=spike_obj, sat_rate=sat_rate,
+            tgt_range=tgt_range, gait_names=gait_names)
         final_lr = float(opt.param_groups[0]["lr"])
         model.load_state_dict(torch.load(in_path(out_dir, "best_model.pt"),
                                          map_location=device))

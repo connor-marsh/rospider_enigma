@@ -79,6 +79,7 @@ import matplotlib.gridspec as gridspec
 
 from train import (
     TimingGroupedSNN, drive_report, drive_spike_report,
+    alignment_horizon, alignment_score,
     LIFCPGStepper, cpg_weight_matrix,
     detect_burst_threshold, burst_onsets,
     upsample_gait_tables, build_group_cols,
@@ -1814,34 +1815,73 @@ def run_visualization(model_dir, out_dir=None, args=None):
                 print("    WARNING drive units of one sub-network fired on "
                       "the same timestep; the collapsed train is not valid "
                       "(needs zero reset).")
-        n_row = coll.shape[1] if coll is not None else G
+        # One input train per row, by mode. Rows are SUB-NETWORKS under the
+        # cpg modes and timing units otherwise, and each needs its own train:
+        #   cpg_lif  the collapsed drive-LIF train (the OR over its channels)
+        #   cpg      the CPG channels weighted by that sub-network's drive
+        #            share -- NOT raw channel j, which this used to read and
+        #            which has nothing to do with sub-network j
+        #   timing   the timing unit's own spikes
+        # Target columns likewise come from rows_map (group_cols under the
+        # cpg modes), not timing_cols: the two only coincide at per_joint,
+        # so under per_leg decoders row j used to be scored against joint j
+        # instead of leg j.
+        is_drive = drive_all is not None
+        if coll is not None:
+            row_trains = coll                                    # (L, G)
+        elif is_drive and d_share is not None:
+            row_trains = tspk @ d_share.T                        # (L, G)
+        else:
+            row_trains = tspk                                    # (L, T)
+        n_row = row_trains.shape[1]
+        cols_of = rows_map if is_drive else timing_cols
+        un = "g" if is_drive else "T"
+        # Alignment is scored over the plotted window [t_lo, t_hi): whole
+        # cycles of this one gait (alignment_score's circular wrap needs
+        # that), and past warm-up, so the drive state is not a cold start.
+        aw = slice(t_lo, t_hi)
+        al_vals = []
         for j in range(n_row):
-            m = ((coll[:, j] > 0) if coll is not None
-                 else (tspk[:, j] > 0)) & ok
-            mu, R_ = circular_stats(phase[m])
-            f_ph   = fundamental_phase(tbl[order, timing_cols[j][0]])
+            tr_j = row_trains[:, j]
+            m = (tr_j > 0) & ok
+            mu, R_ = circular_stats(phase[m], tr_j[m])
+            f_ph   = fundamental_phase(tbl[order, cols_of[j][0]])
             res    = circ_diff(mu, f_ph)
+            feeds  = ([g for g, mm in enumerate(timing_map) if j in mm]
+                      if (timing_map and not is_drive) else [j])
+            g_ker  = feeds[0] if feeds else j
+            tau_a, tau_m, tau_s = alignment_horizon(model, g_ker)
+            a_sc = alignment_score(tr_j[aw], gt[aw][:, list(cols_of[j])],
+                                   tau_a, ok[aw])
+            al_vals.append(a_sc)
             rows.append({
                 "timing_neuron":   j,
-                "cols":            list(timing_cols[j]),
-                "feeds_subnets":   ([g for g, m in enumerate(timing_map)
-                                     if j in m] if timing_map else [j]),
-                "rate_per_cycle":  float((coll[:, j] if coll is not None
-                                          else tspk[:, j]).sum() / ncyc),
+                "row_kind":        "sub_network" if is_drive else "timing_unit",
+                "cols":            list(cols_of[j]),
+                "feeds_subnets":   feeds,
+                "rate_per_cycle":  float(tr_j.sum() / ncyc),
                 "mean_phase":      None if not np.isfinite(mu) else float(mu),
                 "R":               float(R_),
                 "leg_fundamental_phase": None if not np.isfinite(f_ph) else float(f_ph),
                 "residual_cycles": None if not np.isfinite(res) else float(res),
                 "residual_steps":  None if not np.isfinite(res) else float(res * period),
-                "dead":            bool((coll[:, j] if coll is not None
-                                         else tspk[:, j]).sum() == 0),
+                "alignment_score": None if not np.isfinite(a_sc) else float(a_sc),
+                "align_horizon":   float(tau_a),
+                "kernel_tau_mem":  float(tau_m),
+                "kernel_tau_syn":  float(tau_s),
+                "dead":            bool(tr_j.sum() == 0),
             })
             tag = "  <-- DEAD" if rows[-1]["dead"] else ""
-            print(f"    T{j} (cols {timing_cols[j]}): "
+            print(f"    {un}{j} (cols {list(cols_of[j])}): "
                   f"rate={rows[-1]['rate_per_cycle']:6.2f}/cyc  "
                   f"phase={mu:.3f}  R={R_:.2f}  "
-                  f"leg_fund={f_ph:.3f}  "
+                  f"align={a_sc:+.3f}  "
                   f"residual={res:+.3f} cyc ({res * period:+.0f} steps){tag}")
+        av = np.array(al_vals, dtype=np.float64)
+        if np.isfinite(av).any():
+            print(f"    mean alignment score {np.nanmean(av):+.3f}  "
+                  f"(min {np.nanmin(av):+.2f} max {np.nanmax(av):+.2f}; "
+                  f"0 = random, 1 = ideal)")
         summary[gname] = rows
         plotted.append(gname)
 
@@ -1941,6 +1981,18 @@ def run_visualization(model_dir, out_dir=None, args=None):
         # Populated only under drive_source="cpg"; None otherwise, exactly as
         # learned_routing_argmax is None in that mode.
         "drive_gates": drive_gates,
+        "alignment_score_note": (
+            "alignment_score: per step, the joint speed |dtheta/dt| at that "
+            "step, or decayed credit for faster motion shortly AHEAD of it "
+            "(decayed max, horizon align_horizon = kernel_tau_mem + "
+            "kernel_tau_syn), never for motion behind it; averaged over the "
+            "row's input spikes and chance-anchored: 0 = random placement, "
+            "1 = every spike at the peak speed, <0 = spikes where the joint "
+            "is still (not bounded at -1; only compare positive values "
+            "across joints). A longer horizon credits more anticipation, so "
+            "read it alongside align_horizon when comparing runs with "
+            "different readout taus. Scored over the plotted window "
+            "[t_lo, t_hi)."),
         "residual_note": ("residual = timing-neuron circular mean phase minus "
                           "the phase of the first Fourier component of that "
                           "leg's first gait-table column; a consistent "
