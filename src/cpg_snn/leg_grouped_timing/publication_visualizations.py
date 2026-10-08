@@ -766,7 +766,8 @@ def _build_parser():
     ap.add_argument("--out_dir",   type=str, default=None,
                     help="Default: the model dir. Figures go in "
                          "<out_dir>/publication/.")
-    ap.add_argument("--ckpt", type=str, default="best_model.pt")
+    ap.add_argument("--ckpt", type=str, default="best_model.pt",
+                    help="Checkpoint to load from the run's model/ folder. Default best_model.pt (lowest val loss). Use epoch<N>.pt for a --save_model_every snapshot, e.g. --ckpt epoch100.pt; a wrong name lists the ones that exist.")
     ap.add_argument("--cfg",  type=str, default="cpg_lif_snn_config.json")
     ap.add_argument("--gaits_dir", type=str, default="../gaits")
     ap.add_argument("--n_steps", type=int, default=6000,

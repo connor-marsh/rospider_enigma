@@ -152,6 +152,7 @@ import json
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -872,12 +873,16 @@ GAIT_FILES_BY_N = {4: QUADRUPED_GAIT_FILES, 6: HEXAPOD_GAIT_FILES}
 # torch.onnx.export writes alongside the graph when weights are stored
 # externally and which is useless separated from it.
 OUT_ROUTES = (
-    # (kind, pattern, subfolder);  kind is "prefix" | "exact"
+    # (kind, pattern, subfolder);  kind is "prefix" | "exact" | "regex"
     ("prefix", "recon_",                      "recons"),
     ("prefix", "timing_alignment_",           "timing_alignments"),
     ("prefix", "membranes_",                  "membrane_waveforms"),
     ("prefix", "phase_fold_",                 "phase_folds"),
     ("exact",  "best_model.pt",               "model"),
+    # Periodic checkpoints from --save_model_every. A full-match regex, not
+    # a "epoch" prefix, so nothing else that happens to start with
+    # "epoch" is ever swept into model/.
+    ("regex",  r"epoch\d+\.pt",               "model"),
     ("exact",  "cpg_lif_snn_config.json",     "model"),
     ("exact",  "cpg_lif_snn_step.onnx",       "model"),
     ("exact",  "cpg_lif_snn_step.onnx.data",  "model"),
@@ -895,7 +900,8 @@ def route_subdir(name):
     """Category subfolder for a filename, or "" to leave it loose."""
     for kind, pat, sub in OUT_ROUTES:
         if ((kind == "prefix" and name.startswith(pat))
-                or (kind == "exact" and name == pat)):
+                or (kind == "exact" and name == pat)
+                or (kind == "regex" and re.fullmatch(pat, name))):
             return sub
     return ""
 
@@ -1137,6 +1143,23 @@ class StreamSampler:
         self.gait  = self.rng.integers(0, n_gaits, size=self.B)
         self.count = self.rng.integers(self.smin, self.smax, size=self.B)
         self._off  = {}                     # cached arange(L) per bptt
+
+    def mark_all_reset(self):
+        """
+        Record that the NETWORK state of every head was just zeroed.
+
+        Call this whenever the caller re-initialises the model state outside
+        the sampler -- run_training does so at the start of every train and
+        every validation pass. The warm-up mask below is driven by
+        `since_reset`, which the sampler otherwise only zeroes when it
+        rewinds a head itself, so a per-epoch `init_state` went unnoticed:
+        the cold-start transient was SCORED every epoch, in both train and
+        val. It dilutes over 40 train chunks but is ~1/8 of an 8-chunk val,
+        and a longer-settling network (e.g. --synaptic) makes it larger --
+        which is how val loss came out ~10x higher at unchanged RMSE, and
+        why best_model.pt was being chosen on a cold-start artifact.
+        """
+        self.since_reset[:] = 0
 
     def _offsets(self, L):
         off = self._off.get(L)
@@ -3960,6 +3983,36 @@ class MetricsWriter:
             self.fh = None
 
 
+def lambda_schedule(epoch, hold, warmup):
+    """
+    Sparsity-penalty weight multiplier for a 1-based `epoch`.
+
+        epoch <= hold                  -> 0.0 exactly
+        hold < epoch <= hold+warmup    -> (epoch - hold) / warmup
+        beyond                         -> 1.0
+
+    hold=0 reproduces the old ramp-from-epoch-1 schedule exactly, and
+    warmup=0 makes it a step from 0 to 1 at epoch hold+1.
+    """
+    if epoch <= hold:
+        return 0.0
+    if warmup <= 0:
+        return 1.0
+    return min(1.0, (epoch - hold) / float(warmup))
+
+
+def lambda_schedule_text(args):
+    """One-line human description of the schedule, for startup prints."""
+    h, w = int(args.lambda_hold), int(args.lambda_warmup)
+    parts = []
+    if h > 0:
+        parts.append(f"0 for epochs 1-{h}")
+    if w > 0:
+        parts.append(f"linear ramp over epochs {h + 1}-{h + w}")
+    parts.append(f"full strength from epoch {h + w + 1}")
+    return ", ".join(parts)
+
+
 def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                  gait_w, out_dir, timing_diag=None, n_gaits=4, period=254.0,
                  spike_obj=None, sat_rate=None):
@@ -4015,20 +4068,19 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                  and hasattr(model, "n_timing"))
     if use_stats:
         print(f"\n  Spike objective: {spike_obj.describe()}")
-        if args.lambda_warmup > 0:
-            print(f"  lambda ramps linearly from 0 over the first "
-                  f"{args.lambda_warmup} epoch(s), so the network learns "
-                  f"to USE spikes before it is charged for them.")
+        if args.lambda_hold > 0 or args.lambda_warmup > 0:
+            print(f"  lambda: {lambda_schedule_text(args)}, so the network "
+                  f"learns to USE spikes before it is charged for them.")
         print(f"  Judge it on free-run RMSE, not on the spike count.")
     # Announced separately: under --drive_source cpg / cpg_lif the spike
     # objective is forced off, so the block above never prints, yet the same
     # ramp IS applied to the drive penalty.
-    if args.drive_lambda > 0.0 and args.lambda_warmup > 0:
+    if args.drive_lambda > 0.0 and (args.lambda_hold > 0
+                                    or args.lambda_warmup > 0):
         print(f"\n  Drive penalty ({args.drive_penalty}, lambda "
-              f"{args.drive_lambda:g}) ramps linearly from 0 over the first "
-              f"{args.lambda_warmup} epoch(s), so the task can show which "
-              f"channels matter before the rich-get-richer penalty starts "
-              f"amplifying whichever one leads.")
+              f"{args.drive_lambda:g}): {lambda_schedule_text(args)}, so the "
+              f"task can show which channels matter before the penalty "
+              f"starts pruning.")
 
     # Consecutive timing reports each (gait, unit) pair has been observed
     # dead or saturated, for reinit_timing_units.  Keyed per PAIR, not per
@@ -4062,16 +4114,19 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             # ---- train -------------------------------------------------
             model.train()
             state = model.init_state(args.batch, device)
+            tr_sampler.mark_all_reset()     # so the warm-up mask covers it
             # Linear lambda warm-up.  See MinCountSpikeObjective's
             # docstring: an L1 spike cost applied before the task loss has
             # learned to need the spikes can prune a unit into unrecoverable
             # silence, because a gated sub-network with no input passes zero
             # gradient to everything except b_out.
-            # ONE ramp for every sparsity term. Shared deliberately: both
-            # the spike objective and the drive penalty can lock in a
-            # structure before the task gradient has said what it needs.
-            lam_scale = (min(1.0, epoch / float(args.lambda_warmup))
-                         if args.lambda_warmup > 0 else 1.0)
+            # ONE schedule for every sparsity term: zero for --lambda_hold
+            # epochs, then a linear ramp over --lambda_warmup epochs, then
+            # full strength. Shared deliberately: both the spike objective
+            # and the drive penalty can lock in a structure before the task
+            # gradient has said what it needs.
+            lam_scale = lambda_schedule(epoch, args.lambda_hold,
+                                        args.lambda_warmup)
             tot, gtot, nb, ftot = 0.0, 0.0, 0, 0.0
             for _ in range(args.chunks_per_epoch):
                 (x, g, y, m, sw, rst,
@@ -4156,7 +4211,16 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             # ---- validate ----------------------------------------------
             model.eval()
             vstate = model.init_state(args.batch, device)
-            vtot, vsw_tot, vn, vsw_n = 0.0, 0.0, 0, 0
+            va_sampler.mark_all_reset()     # so the warm-up mask covers it
+            # Accumulated as (sum of masked error, number of valid steps)
+            # rather than as an average of per-chunk means. bptt and the
+            # warm-up are both ~one period, so after the per-epoch reset the
+            # FIRST chunk is almost entirely masked: an equal-weight mean
+            # would count its handful of valid steps as much as a full chunk,
+            # and a fully masked chunk would add 0 and drag val DOWN.
+            # masked_loss is sum(err*mask)/max(sum(mask), 1), so
+            # loss * mask.sum() recovers the exact masked sum.
+            vtot, vsw_tot, vn, vsw_n = 0.0, 0.0, 0.0, 0.0
             with torch.no_grad():
                 for _ in range(args.val_chunks):
                     (x, g, y, m, sw, rst,
@@ -4168,19 +4232,29 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                     pred, vstate = model(x, g, vstate)
                     m = m * warm            # same warm-up exclusion as train
 
-                    vtot += masked_loss(pred, y, m, g).item(); vn += 1
+                    nv = float(m.sum())
+                    if nv > 0:
+                        vtot += masked_loss(pred, y, m, g).item() * nv
+                        vn += nv
 
                     # "post-switch" window: args.settle steps after each switch
                     post = torch.zeros_like(sw)
                     idx = sw.nonzero(as_tuple=False)
                     for t_i, b_i in idx:
                         post[t_i:min(t_i + args.settle, sw.shape[0]), b_i] = 1.0
-                    if post.sum() > 0:
-                        vsw_tot += masked_loss(pred, y, m * post, g).item()
-                        vsw_n   += 1
+                    mp = m * post
+                    npv = float(mp.sum())
+                    if npv > 0:
+                        vsw_tot += masked_loss(pred, y, mp, g).item() * npv
+                        vsw_n   += npv
 
-            va_loss = vtot / max(vn, 1)
-            vsw     = vsw_tot / max(vsw_n, 1) if vsw_n else float("nan")
+            if vn <= 0:
+                raise RuntimeError(
+                    f"validation scored ZERO steps: the post-reset warm-up "
+                    f"({args.val_chunks} chunks x {args.bptt} steps) masked "
+                    f"everything. Raise --val_chunks.")
+            va_loss = vtot / vn
+            vsw     = vsw_tot / vsw_n if vsw_n > 0 else float("nan")
             epoch_s = time.perf_counter() - t_epoch
 
             # Appended together, so an interrupt can never leave these
@@ -4209,10 +4283,30 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 hist[f"u_{b}"].append(ublk[b])
 
             flag = ""
+            # A real boolean for metrics.csv. `flag` is a DISPLAY string and
+            # now carries more than the best marker (the snapshot tag), so
+            # deriving `best` from it by string comparison would silently
+            # log 0 on any epoch that is both a new best and a snapshot.
+            is_best = False
             if va_loss < best:
                 best = va_loss
                 torch.save(model.state_dict(), best_path)
                 flag = " *"
+                is_best = True
+
+            # Periodic snapshot, saved REGARDLESS of val. Independent of
+            # best_model.pt on purpose: val selects whichever epoch scored
+            # lowest, and under a --lambda_hold that can be an unpenalised
+            # epoch from before any pruning, so the saved best may not be
+            # the model trained under the final objective. These give a
+            # fixed trajectory to pick from instead. Routed into model/
+            # alongside best_model.pt (see OUT_ROUTES), and loadable by name
+            # with --ckpt epochN.pt in every downstream script.
+            if (args.save_model_every > 0
+                    and epoch % args.save_model_every == 0):
+                torch.save(model.state_dict(),
+                           out_path(out_dir, f"epoch{epoch}.pt"))
+                flag += " [saved epoch]"
 
             if epoch % args.log_every == 0 or epoch == 1:
                 print(f"  {epoch:>6}  {tr_loss:>10.6f}  {va_loss:>10.6f}  "
@@ -4269,7 +4363,7 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                 "val_post_switch": vsw, "lr": opt.param_groups[0]["lr"],
                 "grad_norm": tr_gnorm, "update_norm": upd,
                 "spike_penalty": tr_floor, "sec": epoch_s,
-                "best": int(flag.strip() == "*"),
+                "best": int(is_best),
                 **{f"grad_{b}": gblk[b] for b in sorted(blocks)},
                 **{f"upd_{b}": ublk[b] for b in sorted(blocks)},
                 **spike_rate_cols,
@@ -4669,7 +4763,20 @@ def load_run(model_dir, ckpt_name, cfg_name, device):
     ckpt_path = in_path(model_dir, ckpt_name)
     for p in (cfg_path, ckpt_path):
         if not p.exists():
-            raise FileNotFoundError(f"Not found: {p}")
+            # With --save_model_every there are several checkpoints per run,
+            # so a mistyped --ckpt should say which ones DO exist.
+            have = sorted({q.name for d in (Path(model_dir),
+                                             Path(model_dir, "model"))
+                           if d.is_dir() for q in d.glob("*.pt")},
+                          key=lambda n: (n != "best_model.pt",
+                                         int(re.sub(r"\D", "", n) or 0), n))
+            hint = (f"  Available checkpoints: {', '.join(have)}"
+                    if have else "  No .pt checkpoints found in this run.")
+            if p == cfg_path:
+                hint += ("\n  The config is written when training FINISHES, "
+                         "so an interrupted run's epoch<N>.pt snapshots "
+                         "cannot be loaded until it completes.")
+            raise FileNotFoundError(f"Not found: {p}\n{hint}")
 
     cfg = json.loads(cfg_path.read_text())
     model, arch = build_model_from_cfg(cfg, device)
@@ -5070,7 +5177,26 @@ def main():
                          "the task gradient. Raise above 1.0 if units still "
                          "die; lower it if the floor is dragging units up "
                          "that the task would rather run sparser.")
-    ap.add_argument("--lambda_warmup", type=int, default=30,
+    ap.add_argument("--save_model_every", type=int, default=50,
+                    help="Save a snapshot epoch<N>.pt every N epochs, "
+                         "regardless of validation loss, alongside "
+                         "best_model.pt in the run's model/ folder. 0 = off. "
+                         "Load one in any downstream script with "
+                         "--ckpt epoch<N>.pt; the default is still "
+                         "best_model.pt. Note the final epoch is only "
+                         "snapshotted if it is a multiple of N.")
+    ap.add_argument("--lambda_hold", type=int, default=50,
+                    help="[timing_grouped] Epochs at the START of training "
+                         "during which every sparsity penalty's weight is "
+                         "EXACTLY zero, before --lambda_warmup's ramp begins. "
+                         "A ramp alone is not enough: with the s_gate init "
+                         "spread the participation-ratio penalty has a "
+                         "gradient from step 1, so even the ramp's first "
+                         "epoch (1/warmup strength) amplifies init noise "
+                         "during exactly the period the task is working out "
+                         "which channels matter. 0 = no hold, which "
+                         "reproduces the old ramp-from-epoch-1 behaviour.")
+    ap.add_argument("--lambda_warmup", type=int, default=20,
                     help="[timing_grouped] Epochs over which EVERY sparsity "
                          "penalty's weight ramps linearly from 0 -- both the "
                          "spike objective (--spike_stats_lambda) and the "
@@ -5575,8 +5701,6 @@ def main():
     # ── 3. Upsample ──────────────────────────────────────────────
     print("\n[3/6] Upsampling gait tables ...")
     gait_tables, target_rows = upsample_gait_tables(gait_tables_orig, gait_names)
-    print(np.array(gait_tables).shape)
-    print(np.array(gait_tables)[0, :, 0])
 
     targets, valid, tgt_range = build_targets(phase, gait_tables,
                                               phase_zero=args.phase_zero)

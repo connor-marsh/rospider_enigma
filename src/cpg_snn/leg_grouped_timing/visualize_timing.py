@@ -1445,7 +1445,8 @@ def _build_parser():
                          "resolved as outputs/<model_dir> — e.g. --model_dir "
                          "test1 reads from outputs/test1. Default '' means "
                          "outputs/ itself.")
-    ap.add_argument("--ckpt",      type=str, default="best_model.pt")
+    ap.add_argument("--ckpt",      type=str, default="best_model.pt",
+                    help="Checkpoint to load from the run's model/ folder. Default best_model.pt (lowest val loss). Use epoch<N>.pt for a --save_model_every snapshot, e.g. --ckpt epoch100.pt; a wrong name lists the ones that exist.")
     ap.add_argument("--cfg",       type=str, default="cpg_lif_snn_config.json")
     ap.add_argument("--out_dir",   type=str, default=None,
                     help="Where plots and timing_summary.json are written, "
