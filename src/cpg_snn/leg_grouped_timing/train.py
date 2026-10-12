@@ -5075,7 +5075,322 @@ def load_run(model_dir, ckpt_name, cfg_name, device):
 # 10.  ONNX export
 # ═══════════════════════════════════════════════════════════════════
 
-def export_onnx(model, out_dir, device, cfg):
+def build_run_config(*, args, model, device, out_dir,
+                     n_par, calib, spike_obj, gait_tables,
+                     gait_tables_orig, gait_names, gait_files, gaits_dir,
+                     n_legs, n_joints, group_cols, timing_cols,
+                     timing_map, leg_cols, layout_src, tgt_range,
+                     target_rows, period, cpg_params, cpg_rate,
+                     cpg_R, warm_steps, neuron_offsets, burst_thresholds,
+                     onsets, spikes, valid, t_lo,
+                     t_split, t_hi):
+    """
+    The run's config dict, built from everything known BEFORE training.
+
+    Written to disk at the start of training (write_run_config) and again,
+    completed, at the end. Historically it was only written at the end --
+    inside export_onnx -- which meant an epoch<N>.pt snapshot of a run still
+    in progress could not be loaded, because load_run needs the config. None
+    of the end-of-training values are needed to rebuild a model:
+    build_model_from_cfg reads only architecture/shape/time-constant keys,
+    all fixed before the first update. Those values are left as None here
+    and filled in by record_training_outcome:
+
+        per_joint_rmse_deg, timing_layer_stats, and in "training":
+        epochs_completed, gradient_steps, sample_timesteps, lr_final,
+        best_val_mse, history
+
+    "status" is "training" until then.
+
+    Keyword-only so a missing input fails at the call with its name, rather
+    than as a confusing error deep inside the dict.
+    """
+    cfg = {
+        # ── identity ──────────────────────────────────────────────
+        "model":            ("cpg_lif_timing_grouped"
+                             if args.arch == "timing_grouped"
+                             else "cpg_lif_dense_stateful"),
+        "arch":             args.arch,
+        "config_version":   3,
+        # "training" until record_training_outcome runs, then "complete"
+        # (or "dry_run"). Lets a reader tell a mid-run config from a
+        # finished one, since this file now exists from the start.
+        "status":           "training",
+        "created_utc":      datetime.now(timezone.utc).isoformat(
+                                timespec="seconds"),
+
+        # ── deployment-critical: inference.py reads these by name at
+        #    the top level.  Do not move or rename them. ───────────
+        # NOTE: for arch=timing_grouped, `hidden` is PER GROUP and the state
+        # is (mem_timing (B,n_timing), mem1/mem2/memo (B,n_timing,hidden)).
+        "hidden":           args.hidden,
+        "hidden_is_per_group": args.arch == "timing_grouped",
+        "max_gaits":        int(args.max_gaits),
+        "n_gaits":          len(gait_tables),
+        "n_legs":           int(n_legs),
+        "n_joints":         int(n_joints),
+        "n_cpg_neurons":    int(args.n_cpg_neurons),
+        "fake_cpg":         bool(args.fake_cpg),
+        "n_timing":         (int(args.n_timing)
+                             if args.arch == "timing_grouped" else None),
+        "readout_hidden":   (int(args.readout_hidden)
+                             if args.arch == "timing_grouped" else None),
+        "group_cols":       ([list(g) for g in group_cols]
+                             if group_cols is not None else None),
+        # The structure is recorded three ways on purpose: the two shape
+        # NAMES are the deployment contract, timing_map is what the model
+        # actually wired up, and timing_cols/group_cols are what each unit
+        # owns. build_model_from_cfg reads timing_map, so a hand-edited shape
+        # name cannot silently change the architecture out from under a
+        # checkpoint.
+        "timing_shape":     (str(args.timing_shape)
+                             if args.arch == "timing_grouped" else None),
+        "decoder_shape":    (str(args.decoder_shape)
+                             if args.arch == "timing_grouped" else None),
+        "timing_cols":      ([list(t) for t in timing_cols]
+                             if timing_cols is not None else None),
+        "timing_map":       ([list(m) for m in timing_map]
+                             if timing_map is not None else None),
+        "timing_fan_in":    (len(timing_map[0])
+                             if timing_map is not None else None),
+        "gait_names":       gait_names,
+        # Same list as gait_names for CSV-loaded gaits (file stem == display
+        # name, matching train_snn.py's convention) — kept as a separate key
+        # anyway, so a future remap of display names doesn't have to also
+        # change what visualize_timing.py loads from disk.
+        "gait_files":       gait_files,
+        "gaits_dir":        str(gaits_dir.resolve()),
+        "leg_cols":         [list(c) for c in leg_cols],
+        "leg_layout_source": layout_src,
+        "global_min":       float(tgt_range[0]),
+        "global_max":       float(tgt_range[1]),
+        "target_rows":      int(target_rows),
+        "phase_zero":       float(args.phase_zero),
+        "cpg_period_steps": float(period),
+        "cpg": {
+            # Every tunable parameter comes from the SAME dict that built the
+            # oscillator -- see cpg_params above. Previously these were bare
+            # literals duplicated from LIFCPGStepper's signature, so the
+            # config described defaults rather than what actually ran.
+            **cpg_params,
+            "i_app": args.i_app,
+            "from_fb_weight": CPG_FROM_FB_WEIGHT,
+            "N": int(args.n_cpg_neurons),
+            "W": cpg_weight_matrix(args.n_cpg_neurons).tolist(),
+            "warmup": args.warmup,
+        },
+        "per_joint_rmse_deg": None,      # set by record_training_outcome
+        "timing_layer_stats": None,      # set by record_training_outcome
+        "gain_calibration":   calib,
+        "cpg_spike_stats":    {"spikes_per_cycle": cpg_rate,
+                               "concentration_R": cpg_R},
+
+        # ── full argparse namespace, verbatim ──────────────────────
+        "args": vars(args),
+
+        # ── run provenance ────────────────────────────────────────
+        "run": {
+            "git":            git_info(),
+            "argv":           sys.argv,
+            "cwd":            os.getcwd(),
+            "script":         os.path.abspath(__file__),
+            "out_dir":        str(out_dir.resolve()),
+            "hostname":       platform.node(),
+            "platform":       platform.platform(),
+            "processor":      platform.processor(),
+            "python":         sys.version.split()[0],
+            "torch":          torch.__version__,
+            "numpy":          np.__version__,
+            "device":         str(device),
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_device":    (torch.cuda.get_device_name(0)
+                               if torch.cuda.is_available() else None),
+            "torch_compile_step":       device.type == "cuda",
+            "float32_matmul_precision": "high",
+            "seed":           args.seed,
+        },
+
+        # ── model detail (not needed to run, useful to reproduce) ──
+        # Names and shapes are read off the live model so this section
+        # cannot drift from what was actually exported.
+        "model_detail": {
+            "class":            type(model).__name__,
+            "arch":             args.arch,
+            "fully_connected":  args.arch == "dense",
+            "leg_grouped":      args.arch == "timing_grouped",
+            "cross_talk":       False,
+            "timing_layer":     (args.arch == "timing_grouped"),
+            "input_routing":    (args.arch == "timing_grouped"),
+            "input_routing_kind": ("per-gait learned w_in_gait embedding"
+                                   if args.arch == "timing_grouped" else None),
+            "n_params":         int(n_par),
+            "param_breakdown":  (model.param_breakdown()
+                                 if hasattr(model, "param_breakdown") else None),
+            "recurrent":        False,
+            "n_cpg_neurons":    int(args.n_cpg_neurons),
+            "n_timing":         (int(args.n_timing)
+                                 if args.arch == "timing_grouped" else None),
+            "n_decoders":       (len(group_cols)
+                                 if group_cols is not None else None),
+            "timing_shape":     (str(args.timing_shape)
+                                 if args.arch == "timing_grouped" else None),
+            "decoder_shape":    (str(args.decoder_shape)
+                                 if args.arch == "timing_grouped" else None),
+            "timing_map":       ([list(m) for m in timing_map]
+                                 if timing_map is not None else None),
+            "hidden_per_group": (int(args.hidden)
+                                 if args.arch == "timing_grouped" else None),
+            "tau_min":          float(args.tau_min),
+            "tau_max":          float(args.tau_max),
+            "tau_timing_min":   (float(args.tau_timing_min)
+                                 if args.arch == "timing_grouped" else None),
+            "tau_timing_max":   (float(args.tau_timing_max)
+                                 if args.arch == "timing_grouped" else None),
+            # The six below apply to BOTH arches now that DenseSNN accepts
+            # them, so they are recorded unconditionally: a None here would
+            # make build_model_from_cfg fall back to a default and rebuild a
+            # dense checkpoint as something it never was.
+            "sub_ln":           str(args.sub_ln),
+            "timing_layernorm": False,
+            "readout_hidden":   int(args.readout_hidden),
+            "tau_readout_max":  float(args.tau_readout_max),
+            "timing_reset":     (args.timing_reset
+                                 if args.arch == "timing_grouped" else None),
+            "freeze_blocks":    (args.freeze_blocks or None),
+            "bias_mode":        str(args.bias_mode),
+            "gate_mode":        (args.gate_mode
+                                 if args.arch == "timing_grouped" else None),
+            "spike_objective":  (spike_obj.describe()
+                                 if args.arch == "timing_grouped" else None),
+            "min_count_floor":  float(args.min_count_floor),
+            "min_count_floor_weight": float(args.min_count_floor_weight),
+            "sub_film":         str(args.sub_film),
+            "film_mode":        str(args.film_mode),
+            "readout_gait_bias": (bool(args.readout_gait_bias)
+                                  if args.arch == "timing_grouped" else None),
+            "synaptic":         (str(args.synaptic)
+                                 if args.arch == "timing_grouped" else None),
+            "tau_drive":        (float(getattr(model, "tau_drive", 0.0))
+                                 if getattr(model, "drive_lif", False)
+                                 else None),
+            "drive_source":     (str(args.drive_source)
+                                 if args.arch == "timing_grouped" else None),
+            "drive_lambda":     float(args.drive_lambda),
+            "drive_penalty":    str(args.drive_penalty),
+            "tau_syn_min":      float(args.tau_syn_min),
+            "tau_syn_max":      float(args.tau_syn_max),
+            # Was read by build_model_from_cfg but never written, so a
+            # --hidden_reset zero checkpoint silently reconstructed as
+            # "subtract" for EITHER architecture. Pre-existing bug.
+            "hidden_reset":     str(args.hidden_reset),
+            "warm_steps":       warm_steps,
+
+
+            "timing_slope":     (float(args.timing_slope)
+                                 if args.arch == "timing_grouped" else None),
+            "input_conditioning": ("free per-gait CPG->timing weight matrix "
+                                   "(w_in_gait embedding)"
+                                   if args.arch == "timing_grouped" else None),
+            "slope":            float(args.slope),
+            "thresh":           1.0,
+            "surrogate":        "fast-sigmoid straight-through "
+                                "(plain ops, bit-exact forward)",
+            "state_tensors":    [n.replace("_in", "")
+                                 for n in model.state_names_in],
+            "state_shapes":     [list(s.shape)
+                                 for s in model.init_state(1, "cpu")],
+            # Whether cpg_lif_snn_step.onnx was actually written. The two
+            # signatures below describe the step interface regardless, so
+            # they do not imply the file exists.
+            "onnx_exported":    bool(args.export_onnx),
+            "onnx_inputs":      ["spikes", "gait"] + list(model.state_names_in),
+            "onnx_outputs":     ["angles"] + list(model.state_names_out),
+            "weights_file":     "model/best_model.pt",
+            "config_file":      "model/cpg_lif_snn_config.json",
+        },
+
+        # ── CPG analysis ──────────────────────────────────────────
+        "cpg_analysis": {
+            "period_steps":           float(period),
+            "neuron_burst_offsets":   neuron_offsets.tolist(),
+            "burst_isi_thresholds":   [float(t) for t in burst_thresholds],
+            "bursts_per_neuron":      [int(len(o)) for o in onsets],
+            "spikes_per_neuron":      [int(c) for c in spikes.sum(0)],
+            "phase_valid_coverage":   float(valid.mean()),
+        },
+
+        # ── data / split ──────────────────────────────────────────
+        "data": {
+            "tmax":                 int(args.tmax),
+            "warmup":               int(args.warmup),
+            "t_lo":                 int(t_lo),
+            "t_split":              int(t_split),
+            "t_hi":                 int(t_hi),
+            "train_steps":          int(t_split - t_lo),
+            "val_steps":            int(t_hi - t_split),
+            "gait_table_rows_orig": [int(g.shape[0])
+                                     for g in gait_tables_orig],
+            "target_rows":          int(target_rows),
+            "target_range_deg":     [float(tgt_range[0]), float(tgt_range[1])],
+        },
+
+        # ── training outcome ──────────────────────────────────────
+        "training": {
+            "dry_run":            bool(args.dry_run),
+            "epochs_requested":   int(args.epochs),
+            "epochs_completed":   0,
+            "chunks_per_epoch":   int(args.chunks_per_epoch),
+            "gradient_steps":     0,
+            "sample_timesteps":   0,
+            "batch":              int(args.batch),
+            "bptt":               int(args.bptt),
+            "lr_initial":         float(args.lr),
+            "lr_final":           None,
+            "lr_schedule":        "CosineAnnealingLR (per gradient step)",
+            "lr_T_max_steps":     int(args.epochs * args.chunks_per_epoch),
+            "lr_eta_min":         1e-5,
+            "optimizer":          "Adam",
+            "grad_clip":          float(args.clip),
+            "best_val_mse":       None,
+            "history":            None,
+        },
+    }
+    return cfg
+
+
+def record_training_outcome(cfg, *, args, best, hist, final_lr, timing_stats,
+                            rmse):
+    """
+    Fill the config's end-of-training fields in place (see build_run_config
+    for which they are) and mark it complete.
+    """
+    epochs_done = len(hist["train"])
+    grad_steps  = epochs_done * args.chunks_per_epoch
+    cfg["per_joint_rmse_deg"] = rmse.tolist()
+    cfg["timing_layer_stats"] = timing_stats
+    tr = cfg["training"]
+    tr["epochs_completed"] = int(epochs_done)
+    tr["gradient_steps"]   = int(grad_steps)
+    tr["sample_timesteps"] = int(grad_steps * args.bptt * args.batch)
+    tr["lr_final"]         = final_lr
+    tr["best_val_mse"]     = best
+    tr["history"]          = hist
+    cfg["status"] = "dry_run" if args.dry_run else "complete"
+    cfg["completed_utc"] = datetime.now(timezone.utc).isoformat(
+        timespec="seconds")
+    return cfg
+
+
+def write_run_config(cfg, out_dir):
+    """Write the config to the run's config file; return its path."""
+    cfg_path = out_path(out_dir, "cpg_lif_snn_config.json")
+    with open(cfg_path, "w") as f:
+        json.dump(json_safe(cfg), f, indent=2, default=str)
+    print(f"    [saved] config ({cfg.get('status', '?')}) -> {cfg_path}")
+    return cfg_path
+
+
+def export_onnx(model, out_dir, device):
     model.eval()
 
     # If main() compiled model.step, swap the eager version back in for the
@@ -5128,10 +5443,6 @@ def export_onnx(model, out_dir, device, cfg):
         if compiled_step is not None:
             model.step = compiled_step
 
-    cfg_path = out_path(out_dir, "cpg_lif_snn_config.json")
-    with open(cfg_path, "w") as f:
-        json.dump(json_safe(cfg), f, indent=2, default=str)
-    print(f"    [saved] config -> {cfg_path}")
     return path
 
 
@@ -5819,6 +6130,13 @@ def main():
                          "firing report. Slower than --log_every because it "
                          "prints one line per gait; the compute is "
                          "negligible (timing units only, batch 1).")
+    ap.add_argument("--export_onnx", type=int, default=0,
+                    help="1 = export a single-step ONNX graph of the trained "
+                         "model (cpg_lif_snn_step.onnx) and, if onnxruntime "
+                         "is installed, check it against PyTorch. Default 0: "
+                         "nothing ONNX-related runs or is imported at all, so "
+                         "an environment without the onnx / onnxscript / "
+                         "onnxruntime packages trains and finishes normally.")
     ap.add_argument("--visualize", type=int, default=1,
                     help="1 = run visualize_timing.py's timing-layer analysis at the "
                          "end of training, writing into this run's own output "
@@ -6390,6 +6708,23 @@ def main():
     final_lr      = float(args.lr)
     timing_stats  = []
 
+    # Write the config NOW, before any training, so every epoch<N>.pt
+    # snapshot is loadable while the run is still going. It is rewritten,
+    # completed, at the end (record_training_outcome + write_run_config).
+    cfg = build_run_config(
+        args=args, model=model, device=device, out_dir=out_dir, n_par=n_par,
+        calib=calib, spike_obj=spike_obj, gait_tables=gait_tables,
+        gait_tables_orig=gait_tables_orig, gait_names=gait_names,
+        gait_files=gait_files, gaits_dir=gaits_dir, n_legs=n_legs,
+        n_joints=n_joints, group_cols=group_cols, timing_cols=timing_cols,
+        timing_map=timing_map, leg_cols=leg_cols, layout_src=layout_src,
+        tgt_range=tgt_range, target_rows=target_rows, period=period,
+        cpg_params=cpg_params, cpg_rate=cpg_rate, cpg_R=cpg_R,
+        warm_steps=warm_steps, neuron_offsets=neuron_offsets,
+        burst_thresholds=burst_thresholds, onsets=onsets, spikes=spikes,
+        valid=valid, t_lo=t_lo, t_split=t_split, t_hi=t_hi)
+    write_run_config(cfg, out_dir)
+
     if not args.dry_run:
         opt   = torch.optim.Adam(
             [p for p in model.parameters() if p.requires_grad], lr=args.lr)
@@ -6444,252 +6779,21 @@ def main():
                     t0=t_eval, gait_names=gait_names, leg_cols=leg_cols,
                     g_from=0, g_to=1)
 
-    epochs_done = len(hist["train"])
-    grad_steps  = epochs_done * args.chunks_per_epoch
-
-    cfg = {
-        # ── identity ──────────────────────────────────────────────
-        "model":            ("cpg_lif_timing_grouped"
-                             if args.arch == "timing_grouped"
-                             else "cpg_lif_dense_stateful"),
-        "arch":             args.arch,
-        "config_version":   3,
-        "created_utc":      datetime.now(timezone.utc).isoformat(
-                                timespec="seconds"),
-
-        # ── deployment-critical: inference.py reads these by name at
-        #    the top level.  Do not move or rename them. ───────────
-        # NOTE: for arch=timing_grouped, `hidden` is PER GROUP and the state
-        # is (mem_timing (B,n_timing), mem1/mem2/memo (B,n_timing,hidden)).
-        "hidden":           args.hidden,
-        "hidden_is_per_group": args.arch == "timing_grouped",
-        "max_gaits":        int(args.max_gaits),
-        "n_gaits":          len(gait_tables),
-        "n_legs":           int(n_legs),
-        "n_joints":         int(n_joints),
-        "n_cpg_neurons":    int(args.n_cpg_neurons),
-        "fake_cpg":         bool(args.fake_cpg),
-        "n_timing":         (int(args.n_timing)
-                             if args.arch == "timing_grouped" else None),
-        "readout_hidden":   (int(args.readout_hidden)
-                             if args.arch == "timing_grouped" else None),
-        "group_cols":       ([list(g) for g in group_cols]
-                             if group_cols is not None else None),
-        # The structure is recorded three ways on purpose: the two shape
-        # NAMES are the deployment contract, timing_map is what the model
-        # actually wired up, and timing_cols/group_cols are what each unit
-        # owns. build_model_from_cfg reads timing_map, so a hand-edited shape
-        # name cannot silently change the architecture out from under a
-        # checkpoint.
-        "timing_shape":     (str(args.timing_shape)
-                             if args.arch == "timing_grouped" else None),
-        "decoder_shape":    (str(args.decoder_shape)
-                             if args.arch == "timing_grouped" else None),
-        "timing_cols":      ([list(t) for t in timing_cols]
-                             if timing_cols is not None else None),
-        "timing_map":       ([list(m) for m in timing_map]
-                             if timing_map is not None else None),
-        "timing_fan_in":    (len(timing_map[0])
-                             if timing_map is not None else None),
-        "gait_names":       gait_names,
-        # Same list as gait_names for CSV-loaded gaits (file stem == display
-        # name, matching train_snn.py's convention) — kept as a separate key
-        # anyway, so a future remap of display names doesn't have to also
-        # change what visualize_timing.py loads from disk.
-        "gait_files":       gait_files,
-        "gaits_dir":        str(gaits_dir.resolve()),
-        "leg_cols":         [list(c) for c in leg_cols],
-        "leg_layout_source": layout_src,
-        "global_min":       float(tgt_range[0]),
-        "global_max":       float(tgt_range[1]),
-        "target_rows":      int(target_rows),
-        "phase_zero":       float(args.phase_zero),
-        "cpg_period_steps": float(period),
-        "cpg": {
-            # Every tunable parameter comes from the SAME dict that built the
-            # oscillator -- see cpg_params above. Previously these were bare
-            # literals duplicated from LIFCPGStepper's signature, so the
-            # config described defaults rather than what actually ran.
-            **cpg_params,
-            "i_app": args.i_app,
-            "from_fb_weight": CPG_FROM_FB_WEIGHT,
-            "N": int(args.n_cpg_neurons),
-            "W": cpg_weight_matrix(args.n_cpg_neurons).tolist(),
-            "warmup": args.warmup,
-        },
-        "per_joint_rmse_deg": rmse.tolist(),
-        "timing_layer_stats": timing_stats,
-        "gain_calibration":   calib,
-        "cpg_spike_stats":    {"spikes_per_cycle": cpg_rate,
-                               "concentration_R": cpg_R},
-
-        # ── full argparse namespace, verbatim ──────────────────────
-        "args": vars(args),
-
-        # ── run provenance ────────────────────────────────────────
-        "run": {
-            "git":            git_info(),
-            "argv":           sys.argv,
-            "cwd":            os.getcwd(),
-            "script":         os.path.abspath(__file__),
-            "out_dir":        str(out_dir.resolve()),
-            "hostname":       platform.node(),
-            "platform":       platform.platform(),
-            "processor":      platform.processor(),
-            "python":         sys.version.split()[0],
-            "torch":          torch.__version__,
-            "numpy":          np.__version__,
-            "device":         str(device),
-            "cuda_available": torch.cuda.is_available(),
-            "cuda_device":    (torch.cuda.get_device_name(0)
-                               if torch.cuda.is_available() else None),
-            "torch_compile_step":       device.type == "cuda",
-            "float32_matmul_precision": "high",
-            "seed":           args.seed,
-        },
-
-        # ── model detail (not needed to run, useful to reproduce) ──
-        # Names and shapes are read off the live model so this section
-        # cannot drift from what was actually exported.
-        "model_detail": {
-            "class":            type(model).__name__,
-            "arch":             args.arch,
-            "fully_connected":  args.arch == "dense",
-            "leg_grouped":      args.arch == "timing_grouped",
-            "cross_talk":       False,
-            "timing_layer":     (args.arch == "timing_grouped"),
-            "input_routing":    (args.arch == "timing_grouped"),
-            "input_routing_kind": ("per-gait learned w_in_gait embedding"
-                                   if args.arch == "timing_grouped" else None),
-            "n_params":         int(n_par),
-            "param_breakdown":  (model.param_breakdown()
-                                 if hasattr(model, "param_breakdown") else None),
-            "recurrent":        False,
-            "n_cpg_neurons":    int(args.n_cpg_neurons),
-            "n_timing":         (int(args.n_timing)
-                                 if args.arch == "timing_grouped" else None),
-            "n_decoders":       (len(group_cols)
-                                 if group_cols is not None else None),
-            "timing_shape":     (str(args.timing_shape)
-                                 if args.arch == "timing_grouped" else None),
-            "decoder_shape":    (str(args.decoder_shape)
-                                 if args.arch == "timing_grouped" else None),
-            "timing_map":       ([list(m) for m in timing_map]
-                                 if timing_map is not None else None),
-            "hidden_per_group": (int(args.hidden)
-                                 if args.arch == "timing_grouped" else None),
-            "tau_min":          float(args.tau_min),
-            "tau_max":          float(args.tau_max),
-            "tau_timing_min":   (float(args.tau_timing_min)
-                                 if args.arch == "timing_grouped" else None),
-            "tau_timing_max":   (float(args.tau_timing_max)
-                                 if args.arch == "timing_grouped" else None),
-            # The six below apply to BOTH arches now that DenseSNN accepts
-            # them, so they are recorded unconditionally: a None here would
-            # make build_model_from_cfg fall back to a default and rebuild a
-            # dense checkpoint as something it never was.
-            "sub_ln":           str(args.sub_ln),
-            "timing_layernorm": False,
-            "readout_hidden":   int(args.readout_hidden),
-            "tau_readout_max":  float(args.tau_readout_max),
-            "timing_reset":     (args.timing_reset
-                                 if args.arch == "timing_grouped" else None),
-            "freeze_blocks":    (args.freeze_blocks or None),
-            "bias_mode":        str(args.bias_mode),
-            "gate_mode":        (args.gate_mode
-                                 if args.arch == "timing_grouped" else None),
-            "spike_objective":  (spike_obj.describe()
-                                 if args.arch == "timing_grouped" else None),
-            "min_count_floor":  float(args.min_count_floor),
-            "min_count_floor_weight": float(args.min_count_floor_weight),
-            "sub_film":         str(args.sub_film),
-            "film_mode":        str(args.film_mode),
-            "readout_gait_bias": (bool(args.readout_gait_bias)
-                                  if args.arch == "timing_grouped" else None),
-            "synaptic":         (str(args.synaptic)
-                                 if args.arch == "timing_grouped" else None),
-            "tau_drive":        (float(getattr(model, "tau_drive", 0.0))
-                                 if getattr(model, "drive_lif", False)
-                                 else None),
-            "drive_source":     (str(args.drive_source)
-                                 if args.arch == "timing_grouped" else None),
-            "drive_lambda":     float(args.drive_lambda),
-            "drive_penalty":    str(args.drive_penalty),
-            "tau_syn_min":      float(args.tau_syn_min),
-            "tau_syn_max":      float(args.tau_syn_max),
-            # Was read by build_model_from_cfg but never written, so a
-            # --hidden_reset zero checkpoint silently reconstructed as
-            # "subtract" for EITHER architecture. Pre-existing bug.
-            "hidden_reset":     str(args.hidden_reset),
-            "warm_steps":       warm_steps,
-
-
-            "timing_slope":     (float(args.timing_slope)
-                                 if args.arch == "timing_grouped" else None),
-            "input_conditioning": ("free per-gait CPG->timing weight matrix "
-                                   "(w_in_gait embedding)"
-                                   if args.arch == "timing_grouped" else None),
-            "slope":            float(args.slope),
-            "thresh":           1.0,
-            "surrogate":        "fast-sigmoid straight-through "
-                                "(plain ops, bit-exact forward)",
-            "state_tensors":    [n.replace("_in", "")
-                                 for n in model.state_names_in],
-            "state_shapes":     [list(s.shape)
-                                 for s in model.init_state(1, "cpu")],
-            "onnx_inputs":      ["spikes", "gait"] + list(model.state_names_in),
-            "onnx_outputs":     ["angles"] + list(model.state_names_out),
-            "weights_file":     "model/best_model.pt",
-            "config_file":      "model/cpg_lif_snn_config.json",
-        },
-
-        # ── CPG analysis ──────────────────────────────────────────
-        "cpg_analysis": {
-            "period_steps":           float(period),
-            "neuron_burst_offsets":   neuron_offsets.tolist(),
-            "burst_isi_thresholds":   [float(t) for t in burst_thresholds],
-            "bursts_per_neuron":      [int(len(o)) for o in onsets],
-            "spikes_per_neuron":      [int(c) for c in spikes.sum(0)],
-            "phase_valid_coverage":   float(valid.mean()),
-        },
-
-        # ── data / split ──────────────────────────────────────────
-        "data": {
-            "tmax":                 int(args.tmax),
-            "warmup":               int(args.warmup),
-            "t_lo":                 int(t_lo),
-            "t_split":              int(t_split),
-            "t_hi":                 int(t_hi),
-            "train_steps":          int(t_split - t_lo),
-            "val_steps":            int(t_hi - t_split),
-            "gait_table_rows_orig": [int(g.shape[0])
-                                     for g in gait_tables_orig],
-            "target_rows":          int(target_rows),
-            "target_range_deg":     [float(tgt_range[0]), float(tgt_range[1])],
-        },
-
-        # ── training outcome ──────────────────────────────────────
-        "training": {
-            "dry_run":            bool(args.dry_run),
-            "epochs_requested":   int(args.epochs),
-            "epochs_completed":   int(epochs_done),
-            "chunks_per_epoch":   int(args.chunks_per_epoch),
-            "gradient_steps":     int(grad_steps),
-            "sample_timesteps":   int(grad_steps * args.bptt * args.batch),
-            "batch":              int(args.batch),
-            "bptt":               int(args.bptt),
-            "lr_initial":         float(args.lr),
-            "lr_final":           final_lr,
-            "lr_schedule":        "CosineAnnealingLR (per gradient step)",
-            "lr_T_max_steps":     int(args.epochs * args.chunks_per_epoch),
-            "lr_eta_min":         1e-5,
-            "optimizer":          "Adam",
-            "grad_clip":          float(args.clip),
-            "best_val_mse":       best,
-            "history":            hist,
-        },
-    }
-    export_onnx(model, out_dir, device, cfg)
+    # Complete the config with what only a finished run knows, then write it
+    # BEFORE the ONNX export, so an export failure can no longer lose it (it
+    # used to be written at the end of export_onnx).
+    record_training_outcome(cfg, args=args, best=best, hist=hist,
+                            final_lr=final_lr, timing_stats=timing_stats,
+                            rmse=rmse)
+    write_run_config(cfg, out_dir)
+    # Gated, and the ONLY route into ONNX code: export_onnx is the sole place
+    # torch.onnx is used or onnxruntime is imported. Skipping it leaves the
+    # model exactly as an export would (export_onnx restores the compiled
+    # step in its finally), and visualization reloads from disk anyway.
+    if args.export_onnx:
+        export_onnx(model, out_dir, device)
+    else:
+        print("    ONNX export skipped (--export_onnx 0)")
 
     # ── 7. Timing-layer visualisation ───────────────────────────
     # Imported HERE, not at module scope: visualize_timing.py imports from this file,
