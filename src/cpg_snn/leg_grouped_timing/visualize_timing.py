@@ -79,7 +79,7 @@ import matplotlib.gridspec as gridspec
 
 from train import (
     TimingGroupedSNN, drive_report, drive_spike_report,
-    alignment_horizon, alignment_score,
+    alignment_pair, alignment_section, _ALIGN_VEL_TAU, _ALIGN_COR_TAU,
     LIFCPGStepper, cpg_weight_matrix,
     detect_burst_threshold, burst_onsets,
     upsample_gait_tables, build_group_cols,
@@ -1499,6 +1499,19 @@ def _build_parser():
                     help="Cycles accumulated for the phase-fold histograms "
                          "and the alignment statistics. More is better here — "
                          "it only costs CPU and it tightens R.")
+    ap.add_argument("--scores_only", action="store_true",
+                    help="Compute ONLY the alignment scores and the per-row "
+                         "timing summary: replays the CPG and the spike "
+                         "trains the scores need, skips every prediction, "
+                         "membrane trace, figure and the reconstruction. "
+                         "Writes timing_summary*.json and alignment_scores*.csv. "
+                         "For re-scoring old runs or many checkpoints quickly.")
+    ap.add_argument("--align_vel_tau", type=float, default=_ALIGN_VEL_TAU,
+                    help="Credit horizon (steps) of the VELOCITY alignment "
+                         "score. Default matches train.py's.")
+    ap.add_argument("--align_cor_tau", type=float, default=_ALIGN_COR_TAU,
+                    help="Credit horizon (steps) of the CORNER alignment "
+                         "score. Default matches train.py's.")
     ap.add_argument("--no_pred",    action="store_true",
                     help="Skip the model forward pass (CPG + GT + timing only).")
     ap.add_argument("--no_membranes", action="store_true")
@@ -1546,8 +1559,31 @@ def run_visualization(model_dir, out_dir=None, args=None):
     # membrane_waveforms/ phase_folds/ misc_info/ inside it, so a subfolder
     # would just bury those one level deeper. Standalone and
     # called-from-train.py therefore write to the same place.
-    out_dir = Path(out_dir) if out_dir is not None else Path(model_dir)
+    # A checkpoint other than best_model.pt must never overwrite what train.py
+    # wrote when it finished and visualized best_model.pt. So unless --out_dir
+    # is given, its outputs go to their own folder, viz_<checkpoint>/, and the
+    # two data files also carry the checkpoint name -- they identify
+    # themselves even if moved.
+    ckpt_stem = Path(args.ckpt).stem
+    is_best = (Path(args.ckpt).name == "best_model.pt")
+    data_sfx = "" if is_best else f"_{ckpt_stem}"
+    if out_dir is None:
+        out_dir = (Path(model_dir) if is_best
+                   else Path(model_dir) / f"viz_{ckpt_stem}")
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.scores_only:
+        # Everything the scores do not need, off: predictions are the one
+        # expensive step (a full network forward per gait), and nothing in
+        # the scores reads them.
+        args.no_pred = True
+        args.no_membranes = True
+        args.recon = 0
+        print("  --scores_only: skipping predictions, membranes, figures and "
+              "the reconstruction.")
+    if not is_best:
+        print(f"  checkpoint {args.ckpt}: writing to {out_dir} "
+              f"(data files suffixed '{data_sfx}')")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -1724,6 +1760,7 @@ def run_visualization(model_dir, out_dir=None, args=None):
         drive_all = D / np.maximum(D.sum(axis=2, keepdims=True), 1e-12)
 
     summary, plotted = {}, []
+    align_rows = []
     for gi, gname in sel:
         print(f"  {gname}:")
         gt = gt_degrees(gait_tables, phase, gi, phase_zero)
@@ -1786,13 +1823,14 @@ def run_visualization(model_dir, out_dir=None, args=None):
         # frac=None under the spikes metric: "active" is then exact, so
         # every channel that fires should be drawn rather than a 90% subset.
         d_frac = None if drive_metric == "spikes" else 0.90
-        plot_alignment(spikes, tspk_g, gt, pred, phase, onsets, period,
-                       burst_thr, rows_map, leg_cols, gname, out_dir,
-                       args.dpi, t_lo, t_hi, drive_share=d_share,
-                       drive_frac=d_frac)
-        plot_phase_fold(tspk_g, phase, gait_tables, gi, rows_map, gname,
-                        phase_zero, out_dir, args.dpi, drive_share=d_share,
-                        drive_frac=d_frac)
+        if not args.scores_only:
+            plot_alignment(spikes, tspk_g, gt, pred, phase, onsets, period,
+                           burst_thr, rows_map, leg_cols, gname, out_dir,
+                           args.dpi, t_lo, t_hi, drive_share=d_share,
+                           drive_frac=d_frac)
+            plot_phase_fold(tspk_g, phase, gait_tables, gi, rows_map, gname,
+                            phase_zero, out_dir, args.dpi,
+                            drive_share=d_share, drive_frac=d_frac)
 
         # statistics over the full fold window
         ok    = np.isfinite(phase)
@@ -1840,7 +1878,8 @@ def run_visualization(model_dir, out_dir=None, args=None):
         # cycles of this one gait (alignment_score's circular wrap needs
         # that), and past warm-up, so the drive state is not a cold start.
         aw = slice(t_lo, t_hi)
-        al_vals = []
+        ph_w = np.asarray(phase[aw], dtype=np.float64)
+        vel_l, cor_l = [], []
         for j in range(n_row):
             tr_j = row_trains[:, j]
             m = (tr_j > 0) & ok
@@ -1849,11 +1888,13 @@ def run_visualization(model_dir, out_dir=None, args=None):
             res    = circ_diff(mu, f_ph)
             feeds  = ([g for g, mm in enumerate(timing_map) if j in mm]
                       if (timing_map and not is_drive) else [j])
-            g_ker  = feeds[0] if feeds else j
-            tau_a, tau_m, tau_s = alignment_horizon(model, g_ker)
-            a_sc = alignment_score(tr_j[aw], gt[aw][:, list(cols_of[j])],
-                                   tau_a, ok[aw])
-            al_vals.append(a_sc)
+            # Both scores take their derivatives from the SMOOTH table at the
+            # exact phase (joint_demand), never from `gt`, which is a
+            # staircase lookup and would make the corner score noise.
+            a_vel, a_cor = alignment_pair(
+                tr_j[aw], gait_tables[gi], cols_of[j], ph_w, phase_zero,
+                ok[aw], args.align_vel_tau, args.align_cor_tau)
+            vel_l.append(a_vel); cor_l.append(a_cor)
             rows.append({
                 "timing_neuron":   j,
                 "row_kind":        "sub_network" if is_drive else "timing_unit",
@@ -1865,30 +1906,31 @@ def run_visualization(model_dir, out_dir=None, args=None):
                 "leg_fundamental_phase": None if not np.isfinite(f_ph) else float(f_ph),
                 "residual_cycles": None if not np.isfinite(res) else float(res),
                 "residual_steps":  None if not np.isfinite(res) else float(res * period),
-                "alignment_score": None if not np.isfinite(a_sc) else float(a_sc),
-                "align_horizon":   float(tau_a),
-                "kernel_tau_mem":  float(tau_m),
-                "kernel_tau_syn":  float(tau_s),
+                "alignment_velocity": None if not np.isfinite(a_vel) else float(a_vel),
+                "alignment_corner":   None if not np.isfinite(a_cor) else float(a_cor),
                 "dead":            bool(tr_j.sum() == 0),
             })
             tag = "  <-- DEAD" if rows[-1]["dead"] else ""
             print(f"    {un}{j} (cols {list(cols_of[j])}): "
                   f"rate={rows[-1]['rate_per_cycle']:6.2f}/cyc  "
                   f"phase={mu:.3f}  R={R_:.2f}  "
-                  f"align={a_sc:+.3f}  "
                   f"residual={res:+.3f} cyc ({res * period:+.0f} steps){tag}")
-        av = np.array(al_vals, dtype=np.float64)
-        if np.isfinite(av).any():
-            print(f"    mean alignment score {np.nanmean(av):+.3f}  "
-                  f"(min {np.nanmin(av):+.2f} max {np.nanmax(av):+.2f}; "
-                  f"0 = random, 1 = ideal)")
+        # Collected, printed once in an ALIGNMENT section after every gait.
+        align_rows.append((gname, vel_l, cor_l))
         summary[gname] = rows
         plotted.append(gname)
 
+    # ── alignment section: once, after every gait, grouped by statistic ──
+    if align_rows:
+        print()
+        for ln in alignment_section(align_rows, indent="  "):
+            print(ln)
+
     # ── 4. cross-gait figures ───────────────────────────────────
-    print("\n[4/5] Cross-gait figures ...")
     routing = drive_gates = None
-    if arch == "timing_grouped" and summary:
+    if not args.scores_only:
+        print("\n[4/5] Cross-gait figures ...")
+    if arch == "timing_grouped" and summary and not args.scores_only:
         plot_alignment_summary(summary, plotted, model.n_timing,
                                out_dir, args.dpi)
         routing = plot_routing(model, all_names, device, period,
@@ -1913,7 +1955,8 @@ def run_visualization(model_dir, out_dir=None, args=None):
                                          plotted, out_dir, args.dpi)
         else:
             print(f"  [unit history] {metrics_csv} not found, skipping")
-    plot_taus(model, period, cfg, out_dir, args.dpi)
+    if not args.scores_only:
+        plot_taus(model, period, cfg, out_dir, args.dpi)
 
     # ── 4b. reconstruction + transitions ────────────────────────
     # These are the figures train.py makes at the end of a run, regenerated
@@ -1967,7 +2010,8 @@ def run_visualization(model_dir, out_dir=None, args=None):
                             switch_at=int(round(args.recon_cycles * period)))
 
     # ── 5. dump ─────────────────────────────────────────────────
-    print("\n[5/5] Writing timing_summary.json ...")
+    print(f"\n[5/5] Writing timing_summary{data_sfx}.json and "
+          f"alignment_scores{data_sfx}.csv ...")
     blob = {
         "source": {"model_dir": str(model_dir), "ckpt": args.ckpt,
                    "cfg": args.cfg, "arch": arch},
@@ -1982,25 +2026,49 @@ def run_visualization(model_dir, out_dir=None, args=None):
         # learned_routing_argmax is None in that mode.
         "drive_gates": drive_gates,
         "alignment_score_note": (
-            "alignment_score: per step, the joint speed |dtheta/dt| at that "
-            "step, or decayed credit for faster motion shortly AHEAD of it "
-            "(decayed max, horizon align_horizon = kernel_tau_mem + "
-            "kernel_tau_syn), never for motion behind it; averaged over the "
-            "row's input spikes and chance-anchored: 0 = random placement, "
-            "1 = every spike at the peak speed, <0 = spikes where the joint "
-            "is still (not bounded at -1; only compare positive values "
-            "across joints). A longer horizon credits more anticipation, so "
-            "read it alongside align_horizon when comparing runs with "
-            "different readout taus. Scored over the plotted window "
-            "[t_lo, t_hi)."),
+            "alignment_velocity / alignment_corner: how well the row's input "
+            "spikes coincide with the joint's speed |dtheta/dt| / curvature "
+            "|dtheta^2/dt^2|, both taken from the SMOOTH gait table at each "
+            "step's exact phase (not the staircase per-step target). Per "
+            "step, the demand at that step, or decayed credit for higher "
+            "demand shortly AHEAD (horizons in alignment_horizons), never "
+            "for demand behind it; averaged over the spikes and "
+            "chance-anchored: 0 = random placement, 1 = every spike at the "
+            "peak, <0 = spikes where demand is low (not bounded at -1; only "
+            "compare positive values across joints). Scored over the "
+            "plotted window [t_lo, t_hi)."),
         "residual_note": ("residual = timing-neuron circular mean phase minus "
                           "the phase of the first Fourier component of that "
                           "leg's first gait-table column; a consistent "
                           "reference, not a biomechanical footfall event"),
     }
-    p = out_path(out_dir, "timing_summary.json")
+    blob["checkpoint"] = str(args.ckpt)
+    blob["alignment_horizons"] = {"velocity": float(args.align_vel_tau),
+                                  "corner": float(args.align_cor_tau)}
+    p = out_path(out_dir, f"timing_summary{data_sfx}.json")
     p.write_text(json.dumps(blob, indent=2))
     print(f"    [saved] {p}")
+
+    # The alignment numbers alone, as a flat table: one row per (gait, row),
+    # readable in a spreadsheet and easy to stack across runs/checkpoints,
+    # without digging through the JSON.
+    import csv as _csv
+    pc = out_path(out_dir, f"alignment_scores{data_sfx}.csv")
+    with open(pc, "w", newline="") as fh:
+        wr = _csv.writer(fh)
+        wr.writerow(["checkpoint", "gait", "row_kind", "row", "cols",
+                     "align_velocity", "align_corner", "rate_per_cycle",
+                     "dead"])
+        for gname in plotted:
+            for r in summary.get(gname, []):
+                fmt = lambda v: "" if v is None else f"{v:.4f}"
+                wr.writerow([args.ckpt, gname, r.get("row_kind", ""),
+                             r["timing_neuron"],
+                             " ".join(str(c) for c in r["cols"]),
+                             fmt(r.get("alignment_velocity")),
+                             fmt(r.get("alignment_corner")),
+                             f"{r['rate_per_cycle']:.3f}", int(r["dead"])])
+    print(f"    [saved] {pc}")
     print(f"\nDone — {out_dir.resolve()}")
 
 

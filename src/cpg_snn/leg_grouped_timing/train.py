@@ -891,7 +891,11 @@ OUT_ROUTES = (
     ("exact",  "cpg_raster.png",              "misc_info"),
     ("exact",  "routing_matrices.png",        "misc_info"),
     ("exact",  "tau_distributions.png",       "misc_info"),
-    ("exact",  "timing_summary.json",         "misc_info"),
+    # Prefix, not exact: visualize_timing suffixes these with the checkpoint
+    # name when it is not best_model.pt (timing_summary_epoch100.json), so
+    # analysing another snapshot never overwrites the best model's.
+    ("prefix", "timing_summary",              "misc_info"),
+    ("prefix", "alignment_scores",            "misc_info"),
 )
 OUT_CATEGORY_DIRS = tuple(dict.fromkeys(d for _, _, d in OUT_ROUTES))
 
@@ -3645,7 +3649,7 @@ def drive_report(model, n_gaits, gait_names=None, indent="    "):
 @torch.no_grad()
 def drive_spike_report(model, spikes, n_gaits, device, period,
                        t0=0, n_steps=None, gait_names=None, indent="    ",
-                       targets=None, valid=None):
+                       align_ctx=None):
     """
     The --drive_source cpg_lif reporter: same (lines, stats) contract as
     timing_report and drive_report, so run_training can call any of them.
@@ -3696,6 +3700,7 @@ def drive_spike_report(model, spikes, n_gaits, device, period,
     srt = sh.sort(dim=2, descending=True).values
     k90 = (srt.cumsum(dim=2) < 0.90).sum(dim=2) + 1                 # (ng,G)
 
+    align_rows = []
     lines, stats = [], []
     for gi in range(n_gaits):
         gt = torch.full((L, 1), gi, dtype=torch.long, device=device)
@@ -3720,32 +3725,24 @@ def drive_spike_report(model, spikes, n_gaits, device, period,
         fi = lambda v: " ".join(f"{int(z):>2d}" for z in v)
         ff = lambda v: " ".join(f"{z:>5.1f}" for z in v)
         f90 = k90[gi].numpy()
-        # Alignment of each sub-network's COLLAPSED input train (see
-        # alignment_score). Computed from spikes already in hand, so it costs
-        # no extra forward pass. Needs the targets for this window.
-        al = [float("nan")] * G
-        if targets is not None:
+        # Velocity and corner alignment of each sub-network's COLLAPSED
+        # input train. Uses spikes already in hand, so no extra forward pass.
+        av_, ac_ = [float("nan")] * G, [float("nan")] * G
+        if align_ctx is not None:
             tr_all = spk[:, 0].cpu().numpy().sum(axis=2)           # (L, G)
-            vmask = (None if valid is None
-                     else np.asarray(valid[sl], dtype=bool))
+            ph_w = np.asarray(align_ctx["phase"][sl], dtype=np.float64)
             for g in range(G):
-                tau_a, _, _ = alignment_horizon(model, g)
-                theta = targets[gi, sl][:, list(model.group_cols[g])]
-                al[g] = alignment_score(tr_all[:, g], theta, tau_a, vmask)
+                av_[g], ac_[g] = alignment_pair(
+                    tr_all[:, g], align_ctx["tables"][gi],
+                    model.group_cols[g], ph_w, align_ctx["phase_zero"],
+                    np.isfinite(ph_w), align_ctx["vel_tau"],
+                    align_ctx["cor_tau"])
+            align_rows.append((nm, av_, ac_))
         lines.append(f"{indent}drive {nm:>5s} : spk/cyc [{ff(coll)}]")
         lines.append(f"{indent}      {'':>5s}   active  [{fi(active)}] of {C}"
                      f"   dom ch [{fi(dom)}]")
         lines.append(f"{indent}      {'':>5s}   fanin90 [{fi(f90)}] of {C}"
                      f"   (of |s_gate|; mean {f90.mean():.1f})")
-        if targets is not None:
-            av = np.array(al, dtype=np.float64)
-            fin = av[np.isfinite(av)]
-            lines.append(
-                f"{indent}      {'':>5s}   align   mean {np.nanmean(av):+.3f}"
-                + (f"  (min {fin.min():+.2f} max {fin.max():+.2f}; "
-                   f"0 = random, 1 = ideal)" if fin.size else "")
-                + (f"  {int((~np.isfinite(av)).sum())} with no input"
-                   if (~np.isfinite(av)).any() else ""))
         stats.append({
             "gait":     nm,
             "spk_cyc":  [float(v) for v in coll],
@@ -3755,14 +3752,19 @@ def drive_spike_report(model, spikes, n_gaits, device, period,
             # no change to plot it.
             "fanin90":  [int(v) for v in f90],
             "dom_ch":   [int(v) for v in dom],
-            "align":    [float(v) for v in al],
+            "align_vel": [float(v) for v in av_],
+            "align_cor": [float(v) for v in ac_],
         })
+    # One ALIGNMENT section at the END, not a line inside every gait block,
+    # grouped by statistic so the two scores sit side by side.
+    if align_rows:
+        lines += alignment_section(align_rows, indent=indent)
     return lines, stats
 
 
 def timing_report(model, spikes, phase, period, n_gaits, device,
                   t0, n_steps=1500, gait_names=None, indent="    ",
-                  sat_rate=None, targets=None, valid=None):
+                  sat_rate=None, align_ctx=None):
     """
     Per-gait firing statistics for the timing layer.  Returns a list of
     formatted lines (also returned as raw dicts) so the caller can print
@@ -3817,6 +3819,7 @@ def timing_report(model, spikes, phase, period, n_gaits, device,
     n_cycles = max(n_steps / float(period), 1e-9)
 
     lines, stats = [], []
+    align_rows = []
     for g in range(n_gaits):
         gg  = torch.full((n_steps, 1), g, dtype=torch.long, device=device)
         spk = model.timing_only(x, gg)[:, 0].cpu().numpy()
@@ -3848,30 +3851,26 @@ def timing_report(model, spikes, phase, period, n_gaits, device,
                              f"WARNING: timing neuron(s) {sat} SATURATED for "
                              f"{name} (>= {sat_rate:.0f} spk/cyc) — firing on "
                              f"most CPG spikes, so they carry no phase.")
-        # Alignment per SUB-NETWORK, from the timing units that feed it
-        # (timing_map), so it is directly comparable with cpg_lif's.
-        al = []
-        if targets is not None and hasattr(model, "timing_map_list"):
-            sl_ = slice(int(t0), int(t0) + n_steps)
-            vmask = (None if valid is None
-                     else np.asarray(valid[sl_], dtype=bool))
+        # Velocity and corner alignment per SUB-NETWORK, from the timing
+        # units that feed it (timing_map), so it is directly comparable with
+        # cpg_lif's.
+        av_, ac_ = [], []
+        if align_ctx is not None and hasattr(model, "timing_map_list"):
+            ph_w = np.asarray(ph, dtype=np.float64)
             for gs, units in enumerate(model.timing_map_list):
-                tau_a, _, _ = alignment_horizon(model, gs)
-                train_ = spk[:, list(units)].sum(axis=1)
-                theta = targets[g, sl_][:, list(model.group_cols[gs])]
-                al.append(alignment_score(train_, theta, tau_a, vmask))
-            av = np.array(al, dtype=np.float64)
-            fin = av[np.isfinite(av)]
-            lines.append(
-                f"{indent}       {'':>5s}   align mean {np.nanmean(av):+.3f}"
-                + (f"  (min {fin.min():+.2f} max {fin.max():+.2f} over "
-                   f"{len(av)} sub-networks; 0 = random, 1 = ideal)"
-                   if fin.size else ""))
+                a1, a2 = alignment_pair(
+                    spk[:, list(units)].sum(axis=1), align_ctx["tables"][g],
+                    model.group_cols[gs], ph_w, align_ctx["phase_zero"],
+                    np.isfinite(ph_w), align_ctx["vel_tau"],
+                    align_ctx["cor_tau"])
+                av_.append(a1); ac_.append(a2)
+            align_rows.append((name, av_, ac_))
         stats.append({"gait": name, "rate": [float(v) for v in rate],
                       "phase": [None if not np.isfinite(v) else float(v)
                                 for v in mu],
                       "R": [float(v) for v in R],
-                      "align": [float(v) for v in al]})
+                      "align_vel": [float(v) for v in av_],
+                      "align_cor": [float(v) for v in ac_]})
 
     # THE headline diagnostic for gait separation. If the PHASE VECTORS are
     # near-identical across gaits, the timing layer has collapsed to a
@@ -3891,6 +3890,8 @@ def timing_report(model, spikes, phase, period, n_gaits, device,
                          f"{spread:.3f}  (max deviation on the unit circle; "
                          f"below ~0.1 means the gaits are NOT being "
                          f"distinguished)")
+    if align_rows:
+        lines += alignment_section(align_rows, indent=indent)
     return lines, stats
 
 
@@ -4033,81 +4034,110 @@ def _tau_from_logit(logit):
     return (-1.0 / torch.log(d)).cpu().numpy()
 
 
-def alignment_horizon(model, g):
+# Alignment-score credit horizons, in steps. FIXED rather than derived from
+# the model's learned readout/synaptic taus, so the yardstick is identical
+# across runs -- a horizon that tracked tau_readout would change the score's
+# meaning exactly in the readout-tau experiments it is meant to compare.
+#   velocity: a few steps, roughly a drive spike's propagation delay through
+#             the two spiking hidden layers.
+#   corner:   ~one step: credit for being AT a corner, not for anticipating
+#             it. |theta''| around a corner is itself spread over a few steps
+#             by the cubic upsampling, which gives spikes just either side of
+#             a corner some credit without any decay.
+_ALIGN_VEL_TAU = 3.0
+_ALIGN_COR_TAU = 1.0
+
+
+def joint_demand(table, cols, phase, phase_zero=0.0, order=1):
     """
-    How far ahead a spike in sub-network g can still be credited with the
-    joint motion it helps produce: tau_a = tau_readout + tau_syn, using the
-    median learned readout membrane tau and, when --synaptic puts a synapse
-    on that path, the median synaptic tau ("all": the readout's own;
-    "hidden": layer 2's, which feeds the readout). tau_readout + tau_syn is
-    the mean duration of a syn->mem response, i.e. how long one spike keeps
-    shaping the output.
+    Per-step |d^order theta / dphase^order| for a sub-network's joint
+    column(s), taken from the SMOOTH gait table at each step's exact phase.
 
-    Returns (tau_a, tau_mem, tau_syn).
+    NOT from the per-step target. build_targets looks up the LOWER
+    neighbouring table row for each step, so the per-step target is a
+    staircase sampling of the table, and differentiating it measured 8.4%
+    error in the first derivative and 143% in the second (noise larger than
+    the signal) for a 512-row table at 180 steps per cycle. Differencing the
+    table itself (periodic, since the gait wraps) and interpolating to the
+    exact phase gives 0.1% and 2.1%.
+
+    Units are per unit PHASE. Under the fake CPG dphase/dstep is constant,
+    and the alignment score is chance-anchored and therefore scale-free, so
+    the conversion to per-step units would cancel anyway.
+
+    table : (R, J) one gait's upsampled table
+    cols  : the sub-network's output columns; several are each scaled to
+            their own mean before an RMS combine, so no joint dominates by
+            amplitude
+    phase : (L,) per-step phase in [0,1), NaN where undefined (demand 0)
+    order : 1 = speed, 2 = curvature (the corner signal)
     """
-    tau_m = float(np.median(_tau_from_logit(model.betao_logit[g])))
-    syn = getattr(model, "synaptic", "none")
-    tau_s = 0.0
-    if syn == "all" and hasattr(model, "alphao_logit"):
-        tau_s = float(np.median(_tau_from_logit(model.alphao_logit[g])))
-    elif syn == "hidden" and hasattr(model, "alpha2_logit"):
-        tau_s = float(np.median(_tau_from_logit(model.alpha2_logit[g])))
-    return tau_m + tau_s, tau_m, tau_s
+    T = np.asarray(table, dtype=np.float64)[:, list(cols)]
+    R = T.shape[0]
+    if order == 1:
+        d = (np.roll(T, -1, axis=0) - np.roll(T, 1, axis=0)) * (R / 2.0)
+    elif order == 2:
+        d = (np.roll(T, -1, axis=0) - 2.0 * T
+             + np.roll(T, 1, axis=0)) * float(R * R)
+    else:
+        raise ValueError(f"order must be 1 or 2, got {order!r}")
+    d = np.abs(d)
+    if d.shape[1] > 1:
+        d = d / np.maximum(d.mean(axis=0, keepdims=True), 1e-12)
+        d = np.sqrt((d ** 2).mean(axis=1))
+    else:
+        d = d[:, 0]
+    ph = np.asarray(phase, dtype=np.float64)
+    ok = np.isfinite(ph)
+    x = ((np.where(ok, ph, 0.0) + phase_zero) % 1.0) * R
+    i0 = np.floor(x).astype(np.int64) % R
+    f = x - np.floor(x)
+    out = (1.0 - f) * d[i0] + f * d[(i0 + 1) % R]
+    out[~ok] = 0.0
+    return out
 
 
-def alignment_score(train, theta, tau_a, valid=None):
+def alignment_score(train, demand, tau, valid=None):
     """
-    How well a sub-network's input spikes coincide with its joint's fast
-    motion, chance-anchored so it is comparable across joints.
+    How well a sub-network's input spikes coincide with a per-step demand
+    signal, chance-anchored so it is comparable across joints. Used twice:
+    with demand = |speed| (velocity score) and |curvature| (corner score),
+    both from joint_demand.
 
-    Per-step credit, a DECAYED MAXIMUM of the joint speed v = |dtheta/dt|:
+    Per-step credit, a DECAYED MAXIMUM of the demand v:
 
-        w(t) = max over j >= 0 of  r^j * v(t + j),     r = exp(-1/tau_a)
+        w(t) = max over j >= 0 of  r^j * v(t + j),     r = exp(-1/tau)
 
-    so a spike gets the speed at its OWN step in full, partial credit for
-    fast motion shortly AHEAD of it (decaying with how far ahead), and none
-    for motion behind it, which it cannot have caused. Every step inside a
-    uniformly fast window scores the same.
-
-    A decayed SUM of future speed (the first version of this) got two things
-    wrong. Under --synaptic its response peaks ~10-20 steps after the spike,
-    so the best-scoring spike sat well BEFORE the fast motion; and even
-    without synaptic, a spike late in a fast window was penalised because
-    most of what it "saw" was the slow motion after the window ends.
+    so a spike gets the demand at its OWN step in full, partial credit for
+    higher demand shortly AHEAD of it, and none for demand behind it, which
+    it cannot have caused. Every step inside a uniformly high region scores
+    the same. (A decayed SUM, the first version, placed the best spike before
+    fast motion under --synaptic and penalised spikes late in a fast window.)
 
         S = (spike-weighted mean of w  -  mean of w over all steps)
             / (max of w  -  mean of w)
 
     S = 0 is what random placement gets; S = 1 means every spike lands at
-    the peak speed; S < 0 means spikes land where the joint is still (not
+    the peak demand; S < 0 means spikes land where demand is low (not
     bounded at -1 and waveform-dependent, so only compare positive scores
     across joints). NaN if there are no spikes. Anchored to the MEAN of w,
     not normalised by the max alone: under max-only normalisation random
     placement scores ~0.64 on a sinusoid but ~0.25 on a sharp gait-like
-    waveform, so a random sub-network on a smooth joint would outscore a
-    well-placed one on a sharp joint.
+    waveform, so random placement on a smooth joint would outscore good
+    placement on a sharp one.
 
     train  : (L,) non-negative per-step spike weights (binary, or weighted)
-    theta  : (L,) or (L, k) target angle(s); k > 1 for a sub-network driving
-             several joints, each put on a common scale before combining
-    tau_a  : credit horizon in steps, from alignment_horizon
+    demand : (L,) from joint_demand
+    tau    : credit horizon in steps (_ALIGN_VEL_TAU / _ALIGN_COR_TAU)
     valid  : (L,) bool, steps to include
     The window must be a whole number of cycles of ONE gait, so that the
     circular wrap below lands on the same phase.
     """
-    th = np.asarray(theta, dtype=np.float64)
-    if th.ndim == 1:
-        th = th[:, None]
-    v = np.abs(np.gradient(th, axis=0))
-    if v.shape[1] > 1:
-        v = v / np.maximum(v.mean(axis=0, keepdims=True), 1e-12)
-        v = np.sqrt((v ** 2).mean(axis=1))
-    else:
-        v = v[:, 0]
+    v = np.asarray(demand, dtype=np.float64)
     L = v.shape[0]
-    r = math.exp(-1.0 / max(float(tau_a), 1e-6))
+    r = math.exp(-1.0 / max(float(tau), 1e-6))
     # w(t) = max(v(t), r * w(t+1)), wrapped circularly; repeated passes
-    # converge because r < 1 (a long horizon needs more than one lap).
+    # converge because r < 1.
     w = v.copy()
     for _ in range(200):
         prev = w.copy()
@@ -4128,6 +4158,45 @@ def alignment_score(train, theta, tau_a, valid=None):
     if top - base <= 1e-12:
         return float("nan")
     return float(((s * w).sum() / s.sum() - base) / (top - base))
+
+
+def alignment_pair(train, table, cols, phase, phase_zero, valid=None,
+                   vel_tau=_ALIGN_VEL_TAU, cor_tau=_ALIGN_COR_TAU):
+    """(velocity score, corner score) for one sub-network over one window."""
+    return (alignment_score(train, joint_demand(table, cols, phase,
+                                                phase_zero, 1),
+                            vel_tau, valid),
+            alignment_score(train, joint_demand(table, cols, phase,
+                                                phase_zero, 2),
+                            cor_tau, valid))
+
+
+def alignment_section(per_gait, indent="      "):
+    """
+    The printed ALIGNMENT block: one line per gait, grouped by STATISTIC
+    with the two score types side by side -- max (vel, cor), min (vel, cor),
+    mean (vel, cor) -- so the two can be compared at a glance.
+
+    per_gait : list of (gait_name, vel_scores, cor_scores)
+    """
+    def st(a):
+        a = np.asarray(a, dtype=np.float64)
+        f = a[np.isfinite(a)]
+        if f.size == 0:
+            return (float("nan"),) * 3
+        return float(f.max()), float(f.min()), float(f.mean())
+    fmt = lambda x: "  n/a" if not np.isfinite(x) else f"{x:+.2f}"
+    out = [f"{indent}alignment   (velocity, corner)   "
+           f"0 = random, 1 = ideal"]
+    for nm, vel, cor in per_gait:
+        mv, nv, av = st(vel)
+        mc, nc, ac = st(cor)
+        dead = int((~np.isfinite(np.asarray(vel, dtype=np.float64))).sum())
+        out.append(f"{indent}  {nm:>10s} : max ({fmt(mv)}, {fmt(mc)})   "
+                   f"min ({fmt(nv)}, {fmt(nc)})   "
+                   f"mean ({fmt(av)}, {fmt(ac)})"
+                   + (f"   [{dead} with no input]" if dead else ""))
+    return out
 
 
 def lambda_schedule(epoch, hold, warmup):
@@ -4245,6 +4314,16 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
           f"norm, clip={args.clip:g};")
     print(f"   routinely much larger than clip means most updates are being "
           f"truncated and the LR is too hot.)")
+
+    # epoch0.pt: the model BEFORE the first update -- after any gain
+    # calibration, since that runs earlier and is part of the starting state.
+    # The only exact record of the initial weights and time constants, so
+    # trained-vs-initial comparisons (e.g. whether the taus actually moved)
+    # do not depend on reproducing the RNG. Saved whenever periodic snapshots
+    # are on.
+    if args.save_model_every > 0:
+        torch.save(model.state_dict(), out_path(out_dir, "epoch0.pt"))
+        print("  [saved] epoch0.pt (initial weights, before any update)")
 
     try:
         for epoch in range(1, args.epochs + 1):
@@ -4526,7 +4605,8 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                                           ("fanin90", "fanin", "g"),
                                           ("spk_cyc", "dspk", "g"),
                                           ("n_active", "nact", "g"),
-                                          ("align", "align", "g")):
+                                          ("align_vel", "avel", "g"),
+                                          ("align_cor", "acor", "g")):
                     if key not in last_timing_stats[0]:
                         continue
                     for st in last_timing_stats:
@@ -5365,6 +5445,17 @@ def main():
                          "the task gradient. Raise above 1.0 if units still "
                          "die; lower it if the floor is dragging units up "
                          "that the task would rather run sparser.")
+    ap.add_argument("--align_vel_tau", type=float, default=_ALIGN_VEL_TAU,
+                    help="Credit horizon (steps) of the VELOCITY alignment "
+                         "score: a spike gets the joint speed at its own step "
+                         "plus credit for faster motion up to ~this far ahead, "
+                         "decaying. Fixed rather than derived from the "
+                         "learned taus so runs with different readout taus "
+                         "are scored on the same yardstick.")
+    ap.add_argument("--align_cor_tau", type=float, default=_ALIGN_COR_TAU,
+                    help="Credit horizon (steps) of the CORNER alignment "
+                         "score (|theta''|): ~1 means credit for being at a "
+                         "corner, not for anticipating one.")
     ap.add_argument("--save_model_every", type=int, default=50,
                     help="Save a snapshot epoch<N>.pt every N epochs, "
                          "regardless of validation loss, alongside "
@@ -5892,6 +5983,13 @@ def main():
 
     targets, valid, tgt_range = build_targets(phase, gait_tables,
                                               phase_zero=args.phase_zero)
+    # What the alignment scores need: the SMOOTH tables (derivatives are
+    # taken from them, not from the staircase per-step targets above), the
+    # per-step phase they are evaluated at, and the two credit horizons.
+    align_ctx = {"tables": gait_tables, "phase": phase,
+                 "phase_zero": float(args.phase_zero),
+                 "vel_tau": float(args.align_vel_tau),
+                 "cor_tau": float(args.align_cor_tau)}
     print(f"      targets {targets.shape}   valid coverage "
           f"{valid.mean()*100:.2f}%   range [{tgt_range[0]:.1f}, "
           f"{tgt_range[1]:.1f}] deg")
@@ -6142,7 +6240,7 @@ def main():
             timing_diag = lambda: drive_spike_report(
                 model, spikes, len(gait_tables), device, period,
                 t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
-                indent="      ", targets=targets, valid=valid)
+                indent="      ", align_ctx=align_ctx)
         elif args.drive_source == "cpg":
             # No timing layer to measure, and the CPG's own rates are
             # constant every epoch. Report drive SELECTION instead -- same
@@ -6155,7 +6253,7 @@ def main():
                 model, spikes, phase, period, len(gait_tables), device,
                 t0=t_diag, n_steps=int(6 * period), gait_names=gait_names,
                 indent="      ", sat_rate=sat_rate,
-                targets=targets, valid=valid)
+                align_ctx=align_ctx)
     else:
         timing_diag = None
 
