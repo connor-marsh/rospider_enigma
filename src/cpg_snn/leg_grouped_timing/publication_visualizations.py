@@ -10,6 +10,8 @@ diagnostic ones in visualize_timing.py -- not merely their styling:
   fig_timing_alignment 6 legs (rows), each leg's 3 joints overlaid and scaled
                        to their own range, under a shared CPG and timing
                        raster with burst onsets aligned across every row
+                       (also written as dense_timing_alignment_<gait>: one
+                       color per sub-network, spike runs merged into blocks)
   fig_training_curves  loss against epoch on a log axis with the learning-rate
                        schedule beneath, read from the run's metrics.csv
 
@@ -73,7 +75,7 @@ def joint_label(leg, k, n_per_leg):
 # turbo and the timing raster's TIMING_COLORS so the three legends cannot be
 # confused.
 JOINT_COLORS = ["#0b5fa5", "#e08214", "#1a7a3c"]
-# Timing-neuron colours. Hand-picked rather than sampled from tab20, half of
+# Timing-neuron colors. Hand-picked rather than sampled from tab20, half of
 # whose entries are pale tints that vanish as 1 px rug ticks. Consecutive
 # entries are far apart in hue because the neurons sharing a leg row are
 # consecutive indices, so that is where contrast actually has to hold.
@@ -329,7 +331,7 @@ def fig_transitions(model, spikes, gait_tables, device, tgt_range,
                       fontsize=plt.rcParams["axes.labelsize"] - 1)
         ax.set_xlim(0, total / period)
 
-    # Gait labels along the top, centred on their segment.
+    # Gait labels along the top, centered on their segment.
     top = axes[0]
     for i, g in enumerate(seq):
         top.annotate(gait_label(gait_names[g]),
@@ -352,9 +354,25 @@ def fig_transitions(model, spikes, gait_tables, device, tgt_range,
 # Figure 3: timing alignment
 # ═══════════════════════════════════════════════════════════════════
 
+def _spike_blocks(train, period, max_gap=2):
+    """
+    (start, width) bars in CPG cycles for broken_barh. Spikes at most `max_gap`
+    steps apart (one empty step between them, the CPG's in-burst spacing) merge
+    into one block, so back-to-back bursts become one continuous block; an
+    isolated spike is a one-step block.
+    """
+    idx = np.flatnonzero(np.asarray(train))
+    if idx.size == 0:
+        return []
+    breaks = np.flatnonzero(np.diff(idx) > max_gap)
+    starts = np.r_[idx[0], idx[breaks + 1]]
+    ends = np.r_[idx[breaks], idx[-1]]
+    return [(s / period, (e - s + 1) / period) for s, e in zip(starts, ends)]
+
+
 def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
                          gait_names, leg_cols, period, onsets, out_dir,
-                         gait, n_cycles=3.0, warm_cycles=2.0):
+                         gait, n_cycles=3.0, warm_cycles=2.0, dense=False):
     """
     One row per leg, that leg's joints overlaid and each scaled to its OWN
     range so a 5-degree tibia adjustment is as visible as a 60-degree coxa
@@ -364,10 +382,15 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
 
     Under --drive_source cpg_lif the timing raster has one lane per
     SUB-NETWORK: its C drive-LIF units collapsed into one effective timing
-    neuron, every active channel drawn, alpha by spike share and colour by
+    neuron, every active channel drawn, alpha by spike share and color by
     channel -- the same rule, via the same functions, as the diagnostic
     timing-alignment plot in visualize_timing.py. Each joint's rug shows its
     sub-network's lane.
+
+    dense=True draws the same figure as dense_timing_alignment_<gait>: one color
+    per sub-network (or timing unit), and spikes merged into solid blocks
+    (see _spike_blocks), so spike density reads as block width against the
+    joint's velocity.
     """
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
@@ -408,7 +431,7 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
     #             channel each, zero reset, CPG channels never coincide), so
     #             a lane collapses them into ONE effective timing neuron per
     #             sub-network: every active channel drawn, alpha by spike
-    #             share, colour by channel. Shares are counted over the
+    #             share, color by channel. Shares are counted over the
     #             plotted window only, matching visualize_timing.
     #
     #   cpg       no spiking drive layer; the raw CPG channels are the
@@ -463,16 +486,15 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
             ax.axvline(o, color="0.45", lw=1.0, ls="--", alpha=0.7, zorder=0)
 
     cmap = plt.get_cmap("turbo")
-    # One colour per TIMING neuron, used for both its raster lane and its rug
+    # One color per TIMING neuron, used for both its raster lane and its rug
     # ticks in the leg rows below, so a tick can be matched to the lane that
     # produced it.
     T_all = tspk_all.shape[1]
     tcol = [TIMING_COLORS[i % len(TIMING_COLORS)] for i in range(T_all)]
     for i in range(n_cpg):
         idx = np.where(cpg[:, i] > 0)[0]
-        ax_cpg.scatter(idx / period, np.full(len(idx), i), marker="|",
-                       s=130, lw=1.6,
-                       color=cmap(0.12 + 0.76 * i / max(n_cpg - 1, 1)))
+        ax_cpg.vlines(idx / period, i - 0.4, i + 0.4, lw=1.6,
+                      color=cmap(0.12 + 0.76 * i / max(n_cpg - 1, 1)))
     # A tick per neuron but text only at the ends: with a lane every ~6 px
     # the full set of labels overlapped, while dropping ticks entirely loses
     # the lane positions.
@@ -484,25 +506,40 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
     ax_cpg.grid(False)
     guides(ax_cpg)
 
-    if sel is None:
-        T = T_all
-        for j in range(T):
+    def lane_train(j):
+        """Binary (n,) train of lane j: a timing unit, or (cpg / cpg_lif) the
+        OR of the channels selected for sub-network j."""
+        if sel is None:
+            return tspk_all[:, j] > 0
+        out = np.zeros(n, dtype=bool)
+        for ch in sel[j][0]:
+            out |= unit_train(tspk_all, j, int(ch)) > 0
+        return out
+
+    # Ticks are vlines in DATA units (80% of a lane). Scatter markers are sized
+    # in points, so at 18 lanes a tick covered ~3.5 lanes and each sub-network's
+    # spikes bled across its neighbors.
+    T = T_all if sel is None else len(sel)
+    lane_name = "T" if sel is None else "g"
+    lane_col = [TIMING_COLORS[j % len(TIMING_COLORS)] for j in range(T)]
+    for j in range(T):
+        if dense:
+            ax_tim.broken_barh(_spike_blocks(lane_train(j), period),
+                               (j - 0.4, 0.8), facecolor=lane_col[j],
+                               edgecolor="none")
+        elif sel is None:
             idx = np.where(tspk_all[:, j] > 0)[0]
-            ax_tim.scatter(idx / period, np.full(len(idx), j), marker="|",
-                           s=110, lw=1.6, color=tcol[j])
-        lane_name = "T"
-    else:
-        # One lane per SUB-NETWORK, filled by the same rule as the rugs
-        # below, so lane g reads as exactly the rug beneath its joints.
-        T = len(sel)
-        for j in range(T):
+            ax_tim.vlines(idx / period, j - 0.4, j + 0.4, lw=1.6,
+                          color=tcol[j])
+        else:
+            # Same rule as the rugs below, so lane g reads as exactly the
+            # rug beneath its joints.
             for ch, a in zip(*sel[j]):
                 idx = np.where(unit_train(tspk_all, j, int(ch)) > 0)[0]
-                ax_tim.scatter(idx / period, np.full(len(idx), j),
-                               marker="|", s=110, lw=1.6, alpha=float(a),
-                               color=TIMING_COLORS[int(ch)
-                                                   % len(TIMING_COLORS)])
-        lane_name = "g"
+                ax_tim.vlines(idx / period, j - 0.4, j + 0.4, lw=1.6,
+                              alpha=float(a),
+                              color=TIMING_COLORS[int(ch)
+                                                  % len(TIMING_COLORS)])
     ax_tim.set_ylim(-0.7, T - 0.3)
     ax_tim.set_yticks(range(T))
     ax_tim.set_yticklabels([f"{lane_name}{i}" if i in (0, T - 1) else ""
@@ -527,13 +564,17 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
             g_own = owner.get(c)
             if g_own is None or g_own >= T:
                 continue
-            if sel is None:
+            if dense:
+                ax.broken_barh(_spike_blocks(lane_train(g_own), period),
+                               (-9 - 5 * k, 6), facecolor=lane_col[g_own],
+                               edgecolor="none")
+            elif sel is None:
                 idx = np.where(tspk_all[:, g_own] > 0)[0]
                 ax.vlines(idx / period, -9 - 5 * k, -3 - 5 * k,
                           color=tcol[g_own], lw=1.3, alpha=0.95)
             else:
                 # Every channel feeding this joint's sub-network, alpha by
-                # share, colour by channel -- identical to its raster lane.
+                # share, color by channel -- identical to its raster lane.
                 for ch, a in zip(*sel[g_own]):
                     idx = np.where(unit_train(tspk_all, g_own, int(ch))
                                    > 0)[0]
@@ -544,15 +585,15 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
         ax.set_ylim(-9 - 5 * len(cols), 108)
         ax.set_yticks([0, 50, 100])
         # Short label: "(% range)" on two lines was tall enough to collide
-        # with the neighbouring row's label at this row height.
+        # with the neighboring row's label at this row height.
         ax.set_ylabel(f"Leg {li} (%)")
         guides(ax)
 
     ax_leg[-1].set_xlabel("CPG cycles        "
                           "(each joint scaled to its own min-max range)")
     ax_cpg.set_xlim(0, n / period)
-    fig.suptitle(f"Timing-layer alignment - {gait_label(gait_names[gait])}",
-                 y=0.986)
+    title = "Timing-layer spike density" if dense else "Timing-layer alignment"
+    fig.suptitle(f"{title} - {gait_label(gait_names[gait])}", y=0.986)
     fig.align_ylabels([ax_cpg, ax_tim] + ax_leg)
     # Figure-level legend below the axes: on ax_leg[0] it sat on top of the
     # traces it was labelling.
@@ -560,7 +601,8 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
     if h:
         fig.legend(h, lb, loc="lower center", ncol=len(h),
                    bbox_to_anchor=(0.5, 0.0))
-    _save(fig, out_dir, f"timing_alignment_{gait_names[gait]}")
+    _save(fig, out_dir,
+          f"{'dense_' if dense else ''}timing_alignment_{gait_names[gait]}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -663,7 +705,7 @@ def fig_training_curves(model_dir, out_dir):
         # and the default bottom tick reads "0.000" -- which states something
         # false. Keeping the axis linear preserves the cosine shape, so
         # instead the floor is lifted above zero (removing the 0.000 tick
-        # entirely) and the true minimum gets its own labelled tick.
+        # entirely) and the true minimum gets its own labeled tick.
         lo = float(np.nanmin(lr))
         hi = float(np.nanmax(lr))
         if np.isfinite(lo) and np.isfinite(hi) and hi > lo > 0:
@@ -744,11 +786,12 @@ def run_publication(model_dir, out_dir=None, args=None):
                         cycles_per_gait=args.pub_cycles_per_gait)
         fig_training_curves(model_dir, out_dir)
         for nm in _split(args.pub_align_gaits) or [all_names[0]]:
-            fig_timing_alignment(
-                model, spikes, tables, device, tgt_range, all_names,
-                leg_cols, period, onsets, out_dir,
-                gait=resolve_gaits([nm], all_names, "--pub_align_gaits")[0],
-                n_cycles=args.pub_cycles)
+            gi = resolve_gaits([nm], all_names, "--pub_align_gaits")[0]
+            for dense in (False, True):
+                fig_timing_alignment(
+                    model, spikes, tables, device, tgt_range, all_names,
+                    leg_cols, period, onsets, out_dir, gait=gi,
+                    n_cycles=args.pub_cycles, dense=dense)
     print("\nDone.")
 
 
