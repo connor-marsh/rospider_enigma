@@ -338,9 +338,10 @@ def json_safe(obj):
     Recursively coerce numpy scalars/arrays, Paths and tuples into
     JSON-serialisable types.
 
-    Worth having: the config is written at the very END of a training run,
-    so a bare json.dump choking on a np.float32 would throw away the whole
-    run's artifacts at the last possible moment.
+    Worth having: the config is written twice -- before training starts and
+    again, completed, when it ends -- so a bare json.dump choking on a
+    np.float32 would either abort a run before it begins or lose its
+    results at the last possible moment.
     """
     if isinstance(obj, dict):
         return {str(k): json_safe(v) for k, v in obj.items()}
@@ -5047,9 +5048,16 @@ def load_run(model_dir, ckpt_name, cfg_name, device):
             hint = (f"  Available checkpoints: {', '.join(have)}"
                     if have else "  No .pt checkpoints found in this run.")
             if p == cfg_path:
-                hint += ("\n  The config is written when training FINISHES, "
-                         "so an interrupted run's epoch<N>.pt snapshots "
-                         "cannot be loaded until it completes.")
+                # The config is written just BEFORE training starts (and
+                # again, completed, at the end), and before epoch0.pt or any
+                # snapshot, so a run on the current code that has snapshots
+                # also has a config. Missing means a wrong folder, a run
+                # that died during setup, or a run from before that change.
+                hint += ("\n  The config is written just before training "
+                         "starts, so it should exist for any run that saved "
+                         "a checkpoint. Check --model_dir; if it is right, "
+                         "this run predates that change (older versions only "
+                         "wrote the config when training finished).")
             raise FileNotFoundError(f"Not found: {p}\n{hint}")
 
     cfg = json.loads(cfg_path.read_text())
