@@ -10,8 +10,9 @@ diagnostic ones in visualize_timing.py -- not merely their styling:
   fig_timing_alignment 6 legs (rows), each leg's 3 joints overlaid and scaled
                        to their own range, under a shared CPG and timing
                        raster with burst onsets aligned across every row
-                       (also written as dense_timing_alignment_<gait>: one
-                       color per sub-network, spike runs merged into blocks)
+                       (also written as dense_timing_alignment_<gait>: raster
+                       colored per leg, carpets per joint, spike runs merged
+                       into blocks)
   fig_training_curves  loss against epoch on a log axis with the learning-rate
                        schedule beneath, read from the run's metrics.csv
 
@@ -84,6 +85,10 @@ TIMING_COLORS = [
     "#f032e6", "#9a6324", "#800000", "#808000", "#000075", "#b8860b",
     "#1b9e77", "#d95f02", "#7570b3", "#66a61e", "#a6761d", "#525252",
 ]
+# One color per LEG for the dense figure's timing raster. Drawn from
+# TIMING_COLORS but skipping the blue/orange/green hues of JOINT_COLORS, which
+# color the carpets there, so a leg is never mistaken for a joint.
+LEG_COLORS = ["#e6194b", "#911eb4", "#008080", "#9a6324", "#000075", "#808000"]
 GT_C   = "#1f3a5f"
 PRED_C = "#c1272d"
 SPK_C  = "#2a9d8f"
@@ -387,8 +392,9 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
     timing-alignment plot in visualize_timing.py. Each joint's rug shows its
     sub-network's lane.
 
-    dense=True draws the same figure as dense_timing_alignment_<gait>: one color
-    per sub-network (or timing unit), and spikes merged into solid blocks
+    dense=True draws the same figure as dense_timing_alignment_<gait>: raster
+    lanes colored per LEG, carpets in their joint's trace color, and spikes merged
+    into solid blocks
     (see _spike_blocks), so spike density reads as block width against the
     joint's velocity.
     """
@@ -522,6 +528,19 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
     T = T_all if sel is None else len(sel)
     lane_name = "T" if sel is None else "g"
     lane_col = [TIMING_COLORS[j % len(TIMING_COLORS)] for j in range(T)]
+    if dense:
+        # One color per LEG: a lane takes the leg of the columns it drives. A
+        # lane is a sub-network under cpg / cpg_lif, a timing unit otherwise
+        # (mapped to the sub-network it feeds), so this holds for any shape.
+        col_leg = {c: li for li, cols in enumerate(leg_cols) for c in cols}
+        unit_grp = {u: g for g, us in enumerate(model.timing_map_list)
+                    for u in us}
+        def lane_leg(j):
+            g = j if sel is not None else unit_grp.get(j)
+            cols = model.group_cols[g] if g is not None and g < len(model.group_cols) else []
+            return col_leg.get(cols[0]) if cols else None
+        lane_col = [LEG_COLORS[lane_leg(j) % len(LEG_COLORS)]
+                    if lane_leg(j) is not None else "0.4" for j in range(T)]
     for j in range(T):
         if dense:
             ax_tim.broken_barh(_spike_blocks(lane_train(j), period),
@@ -565,8 +584,11 @@ def fig_timing_alignment(model, spikes, gait_tables, device, tgt_range,
             if g_own is None or g_own >= T:
                 continue
             if dense:
+                # Carpet in its joint's trace color, so each one reads as
+                # belonging to the waveform drawn above it.
                 ax.broken_barh(_spike_blocks(lane_train(g_own), period),
-                               (-9 - 5 * k, 6), facecolor=lane_col[g_own],
+                               (-9 - 5 * k, 6),
+                               facecolor=JOINT_COLORS[k % len(JOINT_COLORS)],
                                edgecolor="none")
             elif sel is None:
                 idx = np.where(tspk_all[:, g_own] > 0)[0]
