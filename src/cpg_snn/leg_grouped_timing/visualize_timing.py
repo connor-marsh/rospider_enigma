@@ -78,7 +78,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 from train import (
-    TimingGroupedSNN, drive_report, drive_spike_report,
+    TimingGroupedSNN, drive_report, drive_spike_report, default_leg_layout,
     alignment_pair, alignment_section, _ALIGN_VEL_TAU, _ALIGN_COR_TAU,
     LIFCPGStepper, cpg_weight_matrix,
     detect_burst_threshold, burst_onsets,
@@ -1621,8 +1621,19 @@ def run_visualization(model_dir, out_dir=None, args=None):
     gait_tables_orig, all_names = load_gait_tables(gait_files, gaits_dir)
     print(f"  Loaded {len(all_names)} gait CSV(s) from {gaits_dir.resolve()}: "
           f"{all_names}")
-    leg_cols = ([list(c) for c in cfg_leg_cols] if cfg_leg_cols
-                else [list(c) for c in model.group_cols])
+    # Fallbacks for configs without leg_cols: the network's own grouping when
+    # it has one, otherwise the same layout rule training uses. DenseSNN has
+    # no group_cols, so reading model.group_cols unconditionally broke dense
+    # configs that predate leg_cols.
+    _mgroups = getattr(model, "group_cols", None)
+    if cfg_leg_cols:
+        leg_cols = [list(c) for c in cfg_leg_cols]
+    elif _mgroups is not None:
+        leg_cols = [list(c) for c in _mgroups]
+    else:
+        leg_cols = [list(c) for c in default_leg_layout(
+            int(cfg_get(cfg, "n_cpg_neurons", 0) or 0),
+            int(gait_tables_orig[0].shape[1]))[1]]
     print(f"  Alignment grid: {len(leg_cols)} legs x {len(leg_cols[0])} "
           f"joints/leg"
           + ("" if cfg_leg_cols else "  (leg_cols absent from config — "
@@ -1643,7 +1654,13 @@ def run_visualization(model_dir, out_dir=None, args=None):
     # timing_cols falls back to group_cols, which is exact for every config
     # written before --timing_shape existed: there was one timing unit per
     # sub-network, so a unit's columns WERE its group's columns.
-    group_cols  = [list(g) for g in model.group_cols]
+    # Empty under --arch dense, which has no sub-networks. Nothing on the
+    # dense path reads group_cols / timing_cols / timing_map -- the per-gait
+    # loop `continue`s before any timing structure and the cross-gait figures
+    # are timing-grouped only -- but reading model.group_cols unconditionally
+    # raised AttributeError there, so dense runs got no figures at all
+    # (train.py's auto-visualization swallows the error to protect the run).
+    group_cols  = [list(g) for g in (_mgroups or [])]
     cfg_tcols   = cfg_get(cfg, "timing_cols")
     timing_cols = ([list(c) for c in cfg_tcols] if cfg_tcols
                    else [list(g) for g in group_cols])
@@ -1681,7 +1698,9 @@ def run_visualization(model_dir, out_dir=None, args=None):
 
     if arch != "timing_grouped":
         print(f"\n  arch={arch} has NO timing layer — emitting the CPG, "
-              f"gait-table and tau figures only.")
+              f"gait-table and tau figures only. Alignment scores need a "
+              f"per-sub-network input train, so timing_summary / "
+              f"alignment_scores are written with no rows.")
 
     # ── 2. replay CPG ───────────────────────────────────────────
     print("\n[2/5] Replaying the CPG from config ...")

@@ -4645,6 +4645,19 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
                           f"{ublk[b]:>10.4g}{us:>6.1f}%"
                           f"{(us/gs if gs > 1e-9 else float('inf')):>8.1f}"
                           f"{ublk[b]/math.sqrt(max(npar,1)):>11.2e}")
+                # Validation RMSE belongs to this every-N block, not to the
+                # timing diagnostic: it has nothing to do with timing, and the
+                # timing print never runs under --arch dense, so dense runs
+                # never saw it. rmse_g itself is computed every epoch for
+                # every arch (from the val pass above) and logged to
+                # metrics.csv regardless; this is only the print.
+                if np.isfinite(rmse_g).any():
+                    print("      val RMSE (deg, mean over joints): "
+                          + "  ".join(f"{gnames[i]} {rmse_g[i]:.2f}"
+                                      for i in range(n_gaits)
+                                      if np.isfinite(rmse_g[i]))
+                          + f"   | mean {np.nanmean(rmse_g):.2f}"
+                          + "   (validation stream, incl. gait switches)")
 
             # Timing layer: cheap (timing units only, batch 1) but it prints
             # n_gaits lines, so it runs on its own slower cadence. The actual
@@ -4653,13 +4666,6 @@ def run_training(model, tr_sampler, va_sampler, opt, sched, device, args,
             if run_timing_diag:
                 for ln in timing_lines:
                     print(ln)
-                if np.isfinite(rmse_g).any():
-                    print("      val RMSE (deg, mean over joints): "
-                          + "  ".join(f"{gnames[i]} {rmse_g[i]:.2f}"
-                                      for i in range(n_gaits)
-                                      if np.isfinite(rmse_g[i]))
-                          + f"   | mean {np.nanmean(rmse_g):.2f}"
-                          + "   (validation stream, incl. gait switches)")
 
                 # Failures are tracked per (gait, unit), because the fix is:
                 # w_in_gait has a gait axis, so a unit that is fine for five
@@ -6573,7 +6579,13 @@ def main():
                 indent="      ", sat_rate=sat_rate,
                 align_ctx=align_ctx)
     else:
+        # Both timing-diagnostic hook values, so run_training always receives
+        # defined arguments: sat_rate used to be assigned only in the branch
+        # above, which made --arch dense fail at the run_training call with
+        # an unbound local. run_training's own default is also None, and it
+        # only reads sat_rate inside the timing-layer reinit rescue.
         timing_diag = None
+        sat_rate    = None
 
     # ── Gain calibration ────────────────────────────────────────
     # Before ANY training: bisect each router/timing unit's FiLM gamma until
