@@ -65,6 +65,9 @@ Outputs (into --out_dir)
     drive_fanin_history.png       Channels carrying 90% of each
                                   sub-network's drive, over training.
                                   --drive_source cpg / cpg_lif counterpart.
+    timing_alignment_by_joint.png Timing rasters regrouped by gait (rows) and joint
+                                  (columns), one lane per leg, to compare a
+                                  joint's timing across gaits.
     alignment_history.png         Velocity and corner alignment scores over
                                   training, per gait (timing and cpg_lif).
     tau_distributions.png         Learned time constants vs their init range
@@ -318,6 +321,74 @@ def plot_timing_rate_history(metrics_csv, timing_cols, leg_cols, gait_names,
                  fontsize=10, fontweight="bold", y=1.0)
     plt.tight_layout(rect=(0, 0, 1, 0.96))
     _savefig(fig, out_dir, fname, dpi)
+
+
+def plot_joint_gait_grid(by_joint, leg_cols, period, out_dir, dpi):
+    """Timing rasters regrouped by joint and compared across gaits: one row per gait, one
+    column per joint type (coxa, femur, ...), and in each cell one lane per leg, so a leg keeps
+    its lane and color everywhere. A lane is whatever drives that joint: its timing unit
+    (--drive_source timing) or its sub-network's collapsed drive train (cpg_lif); under plain cpg
+    the ticks are shaded by drive share. A unit that drives a whole leg (a per_leg shape) cannot
+    be split by joint, so those go in a single "whole leg" column.
+
+    by_joint: gait -> (trains (L, n_row) over the plotted window, cols_of[row])
+    """
+    from matplotlib.colors import to_rgba
+    gaits = list(by_joint)
+    if not gaits:
+        return
+    leg_of = {c: l for l, cols in enumerate(leg_cols) for c in cols}
+    k_of = {c: k for cols in leg_cols for k, c in enumerate(cols)}
+    n_legs, n_k = len(leg_cols), max(len(c) for c in leg_cols)
+
+    def slot(cols):
+        """(leg, column key): a joint index for a single-joint unit, "leg" for a whole leg."""
+        return leg_of.get(cols[0]), (k_of.get(cols[0]) if len(cols) == 1 else "leg")
+    keys = []
+    for g in gaits:
+        for cols in by_joint[g][1]:
+            kk = slot(cols)[1]
+            if kk is not None and kk not in keys:
+                keys.append(kk)
+    keys.sort(key=lambda kk: (kk == "leg", kk if kk != "leg" else 0))
+    jnames = joint_type_names(n_k)
+    titles = [jnames[kk] if kk != "leg" else "whole leg (one unit per leg)" for kk in keys]
+    lnames = (["LF", "LM", "LR", "RF", "RM", "RR"] if n_legs == 6
+              else [f"leg {l}" for l in range(n_legs)])
+    fig, axes = plt.subplots(len(gaits), len(keys), sharex=True, sharey=True, squeeze=False,
+                             figsize=(1.4 + 4.6 * len(keys), 0.7 + (0.28 * n_legs + 0.45) * len(gaits)))
+    n_cyc = max(by_joint[g][0].shape[0] for g in gaits) / period
+    for r, g in enumerate(gaits):
+        trains, cols_of = by_joint[g]
+        top = float(trains.max()) if trains.size else 0.0
+        for j, cols in enumerate(cols_of):
+            l, kk = slot(cols)
+            if l is None or kk not in keys or j >= trains.shape[1]:
+                continue
+            idx = np.flatnonzero(trains[:, j] > 0)
+            if idx.size:
+                shade = np.clip(trains[idx, j] / top, 0.15, 1.0) if top > 0 else np.ones(idx.size)
+                base = TIMING_PALETTE[l % len(TIMING_PALETTE)]
+                # vlines in DATA units, so a tick fits its lane at any lane count
+                axes[r, keys.index(kk)].vlines(idx / period, l - 0.4, l + 0.4, lw=1.2,
+                                               colors=[to_rgba(base, float(x)) for x in shade])
+    for r, g in enumerate(gaits):
+        for c in range(len(keys)):
+            ax = axes[r, c]
+            for cyc in range(1, int(np.ceil(n_cyc))):
+                ax.axvline(cyc, color="0.75", lw=0.6, zorder=0)
+            ax.set_xlim(0, n_cyc); ax.set_ylim(n_legs - 0.5, -0.5)       # first leg on top
+            ax.set_yticks(range(n_legs)); ax.set_yticklabels(lnames, fontsize=7)
+            if r == 0:
+                ax.set_title(titles[c], fontsize=10)
+            if c == 0:
+                ax.set_ylabel(g, fontsize=9)
+            if r == len(gaits) - 1:
+                ax.set_xlabel("CPG cycles", fontsize=8)
+    fig.suptitle("Timing rasters by joint, across gaits   (lane = leg; a leg keeps its lane and color)",
+                 fontsize=10, fontweight="bold")
+    plt.tight_layout(rect=(0, 0, 1, 1 - 0.35 / fig.get_figheight()))
+    _savefig(fig, out_dir, "timing_alignment_by_joint.png", dpi)
 
 
 def plot_alignment_history(metrics_csv, gait_names, out_dir, dpi, ramp=None, lines=True):
@@ -887,6 +958,7 @@ def plot_alignment_summary(summary, gait_names, G, out_dir, dpi):
     old fixed permutation could not.
     """
     ng   = len(gait_names)
+    pre  = "g" if summary[gait_names[0]][0].get("row_kind") == "sub_network" else "T"
     res  = np.full((ng, G), np.nan)
     rate = np.full((ng, G), np.nan)
     conc = np.full((ng, G), np.nan)
@@ -908,7 +980,7 @@ def plot_alignment_summary(summary, gait_names, G, out_dir, dpi):
         im = ax.imshow(M, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
         plt.colorbar(im, ax=ax, fraction=0.046)
         ax.set_xticks(range(G))
-        ax.set_xticklabels([f"T{j}" for j in range(G)], fontsize=8)
+        ax.set_xticklabels([f"{pre}{j}" for j in range(G)], fontsize=8)
         ax.set_yticks(range(ng))
         ax.set_yticklabels(gait_names, fontsize=8)
         ax.set_title(title, fontsize=9)
@@ -1538,7 +1610,14 @@ def run_visualization(model_dir, out_dir=None, args=None):
     timing_cols = ([list(c) for c in cfg_tcols] if cfg_tcols
                    else [list(g) for g in group_cols])
     timing_map  = cfg_get(cfg, "timing_map")
-    if arch == "timing_grouped":
+    if arch == "timing_grouped" and not getattr(model, "uses_timing", True):
+        # cpg / cpg_lif: no timing layer. n_timing is the CPG channel count there, and the
+        # config's timing_cols (from --timing_shape) is recorded but unused, so comparing the two
+        # is meaningless; with --n_cpg_neurons 18 and per_joint they only matched by coincidence.
+        print(f"  Structure: no timing layer (--drive_source "
+              f"{cfg_get(cfg, 'drive_source', 'cpg')}): {model.n_neurons} CPG channel(s) -> "
+              f"{len(group_cols)} sub-network(s) ({cfg_get(cfg, 'decoder_shape', 'per_leg')})")
+    elif arch == "timing_grouped":
         n_t = int(getattr(model, "n_timing", len(timing_cols)))
         if len(timing_cols) != n_t:
             raise ValueError(
@@ -1643,6 +1722,7 @@ def run_visualization(model_dir, out_dir=None, args=None):
 
     summary, plotted = {}, []
     align_rows = []
+    by_joint = {}             # gait -> (row trains over the plotted window, cols per row)
     for gi, gname in sel:
         print(f"  {gname}:")
         gt = gt_degrees(gait_tables, phase, gi, phase_zero)
@@ -1778,6 +1858,7 @@ def run_visualization(model_dir, out_dir=None, args=None):
                   f"residual={res:+.3f} cyc ({res * period:+.0f} steps){tag}")
         # Collected, printed once in an ALIGNMENT section after every gait.
         align_rows.append((gname, vel_l, cor_l))
+        by_joint[gname] = (np.asarray(row_trains[aw], dtype=float), [list(c) for c in cols_of])
         summary[gname] = rows
         plotted.append(gname)
 
@@ -1792,7 +1873,10 @@ def run_visualization(model_dir, out_dir=None, args=None):
     if not args.scores_only:
         print("\n[4/5] Cross-gait figures ...")
     if arch == "timing_grouped" and summary and not args.scores_only:
-        plot_alignment_summary(summary, plotted, model.n_timing,
+        plot_joint_gait_grid(by_joint, leg_cols, period, out_dir, args.dpi)
+        # Column count from the summary's own rows: timing units, or sub-networks under the cpg
+        # modes (model.n_timing is the CPG channel count there, which dropped sub-networks).
+        plot_alignment_summary(summary, plotted, len(summary[plotted[0]]),
                                out_dir, args.dpi)
         routing = plot_routing(model, all_names, device, period,
                                out_dir, args.dpi)

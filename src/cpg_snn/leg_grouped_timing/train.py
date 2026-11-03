@@ -289,6 +289,8 @@ CPG_PARAMS = {
 }
 
 CPG_W_BY_N = {
+    1: np.asarray([[0]]),
+
     3: np.asarray([
         [    0.0      , -523.65135942, -593.28982051],
         [-696.81822016,     0.0      , -632.34680962],
@@ -454,6 +456,10 @@ class LIFCPGStepper:
             start = i * n_spikes
             for t in range(start, n_steps, period):
                 pattern[i, t:t + n_spikes:self.refrac_main + 1] = 1.0
+        if self.N == 1:
+            pattern = np.zeros((self.N, n_steps), dtype=np.float32)
+            for t in range(0, n_steps, period):
+                pattern[0, t:t + n_spikes:self.refrac_main + 1] = 1.0
         return pattern.T
 
     def reset(self):
@@ -4936,13 +4942,13 @@ def main():
     else:
         print("    ONNX export skipped (--export_onnx 0)")
 
-    # ── 7. Timing-layer visualiization ───────────────────────────
+    # ── 7. Timing-layer visualization ───────────────────────────
     # Imported HERE: visualize_timing.py imports from this file, so a top-level import is
     # circular. out_dir is both the model dir and the output dir, so figures land in this run's
     # category folders, and re-reading best_model.pt and the config doubles as an end-of-run
     # check that they load.
     if args.visualize and not args.dry_run:
-        print("\n[7/7] Timing-layer visualiization ...")
+        print("\n[7/7] Timing-layer visualization ...")
         try:
             from visualize_timing import default_args, run_visualization
             # recon=0: phase 6 already wrote recon_*.png and transition.png with this run's
