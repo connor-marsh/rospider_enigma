@@ -5,7 +5,7 @@ training run, replays the CPG, steps the network one timestep at a time, and
 publishes joint commands to the servo controller.
 
 Everything about the model comes from the config through the same `load_run`
-that visualize_timing.py uses, so architecture, drive mode, taus, group layout
+that visualize.py uses, so architecture, drive mode, taus, group layout
 and gait set are whatever that checkpoint was trained with, including for configs
 predating any given option. No ONNX.
 
@@ -32,9 +32,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from train import (
-    LIFCPGStepper, cfg_get, load_run, outputs_path,
-)
+from cpgsnn.common import cfg_get, outputs_path
+from cpgsnn.cpg import LIFCPGStepper
+from cpgsnn.run_io import load_run
 
 # Hexapod servo ids, in gait-table column order (18 columns -> 18 servos).
 HEXAPOD_SERVO_IDS = [5, 3, 1, 11, 9, 7, 17, 15, 13,
@@ -411,7 +411,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="CPG-SNN inference on the robot (PyTorch)")
     ap.add_argument("--model_dir", type=str, default="",
-                    help="Resolved as outputs/<model_dir>, like visualize_timing.py "
+                    help="Resolved as outputs/<model_dir>, like visualize.py "
                          "('' = outputs/ itself).")
     ap.add_argument("--ckpt", type=str, default="best_model.pt",
                     help="Checkpoint in the run's model/ folder: best_model.pt (default) "
@@ -455,7 +455,7 @@ def main():
                     help="ServosPosition.duration field (seconds).")
     ap.add_argument("--viz", action="store_true",
                     help="Open the live visualization window (see "
-                         "live_visualization.py); needs a display ('ssh -X' over SSH). "
+                         "cpgsnn/live_visualization.py); needs a display ('ssh -X' over SSH). "
                          "The redraw runs inside the control loop and can overrun a "
                          "control step on an 18-joint hexapod, so prefer --no_robot or "
                          "a low --viz_fps for anything but debugging.")
@@ -513,7 +513,7 @@ def main():
     if args.viz:
         # Imported lazily so matplotlib is not pulled in on the robot unless
         # --viz asks for it.
-        from live_visualization import LiveVisualizer
+        from cpgsnn.live_visualization import LiveVisualizer
         viz = LiveVisualizer(cfg, this_dir / args.gaits_dir,
                              trace_cycles=args.viz_trace_cycles,
                              cpg_cycles=args.viz_cpg_cycles,

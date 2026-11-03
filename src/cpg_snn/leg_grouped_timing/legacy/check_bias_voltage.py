@@ -37,7 +37,7 @@ That gives four possible states per unit, per gait:
                  above a non-positive threshold, and subtractive reset is
                  the same failure one step slower.
 
-`train.py` now clamps v into [-thresh, thresh - 1e-6] after each optimiser
+`train.py` now clamps v into [-thresh, thresh - 1e-6] after each optimizer
 step, so ALWAYS should be extinct in new runs.  It is still reported here
 because pre-clamp checkpoints exist and because a non-zero count is the
 single most useful thing this script can tell you.
@@ -175,7 +175,7 @@ def report_layer(name, th, tonic, decay, gait_names, tonic_live, top):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Loading.  torch and train.py are imported here, not at module scope, so
+# Loading.  torch and cpgsnn are imported here, not at module scope, so
 # the analysis above stays usable without either.
 # ─────────────────────────────────────────────────────────────────────
 
@@ -183,7 +183,7 @@ def load(model_dir_arg, ckpt, cfg_name, this_file_dir):
     import json
 
     import torch                                     # noqa: F401  (load only)
-    from train import cfg_get, in_path, outputs_path
+    from cpgsnn.common import cfg_get, in_path, outputs_path
 
     model_dir = outputs_path(this_file_dir, model_dir_arg)
     cfg_path  = in_path(model_dir, cfg_name)
@@ -210,8 +210,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model_dir", type=str, default="",
                     help="Run name under outputs/, e.g. 'run7'. Empty means "
-                         "outputs/ itself, matching visualize_timing.py.")
-    ap.add_argument("--ckpt", type=str, default="best_model.pt")
+                         "outputs/ itself, matching visualize.py.")
+    ap.add_argument("--ckpt", type=str, default="best_model.pt",
+                    help="Checkpoint to load from the run's model/ folder. Default best_model.pt (lowest val loss). Use epoch<N>.pt for a --save_model_every snapshot, e.g. --ckpt epoch100.pt; a wrong name lists the ones that exist.")
     ap.add_argument("--cfg",  type=str, default="cpg_lif_snn_config.json")
     ap.add_argument("--top",  type=int, default=10,
                     help="How many worst-offending units to list per layer.")
