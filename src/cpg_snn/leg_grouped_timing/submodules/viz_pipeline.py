@@ -259,7 +259,7 @@ def default_args(**overrides):
 def run_visualization(model_dir, out_dir=None, args=None):
     """Everything the CLI does, callable directly. `out_dir=None` means the run directory
     itself (what train.py passes too): figures land in that run's category folders (see
-    OUT_ROUTES in cpgsnn/common.py). The checkpoint and config are re-read from disk rather than
+    OUT_ROUTES in submodules/common.py). The checkpoint and config are re-read from disk rather than
     taking a live model, which doubles as an end-of-run check that the saved artifacts load
     and run.
     """

@@ -1,26 +1,26 @@
-"""CPG -> SNN inference on the robot (PyTorch)
+"""
+CPG -> SNN inference on the robot  (PyTorch)
 ============================================
-Loads best_model.pt (or --ckpt epoch<N>.pt) and cpg_lif_snn_config.json from a
-training run, replays the CPG, steps the network one timestep at a time, and
-publishes joint commands to the servo controller.
+Loads best_model.pt + cpg_lif_snn_config.json from a training run, replays the
+CPG, steps the network one timestep at a time, and publishes joint commands to
+the servo controller.
 
-Everything about the model comes from the config through the same `load_run`
-that visualize.py uses, so architecture, drive mode, taus, group layout
-and gait set are whatever that checkpoint was trained with, including for configs
-predating any given option. No ONNX.
+Everything about the model comes from the config, through the same
+`build_model_from_cfg` / `load_run` that visualize.py uses -- so architecture,
+gate mode, taus, group layout and gait set are whatever that checkpoint was
+trained with, including for configs predating any given option.  No ONNX.
 
-The one thing NOT in the config is the servo wiring (gait-table column -> servo
-id, and the robot's sign/offset conventions): training has no business knowing
-it, so it lives here (--servo_ids).
+The one thing NOT in the config is the servo wiring: gait-table column ->
+servo id, and the sign/offset conventions of the physical robot.  Training has
+no business knowing those, so they live here (--servo_ids).
 
 Usage
 -----
-    python inference.py --model_dir test1
-    python inference.py --model_dir test1 --no_robot          # offline check
-    python inference.py --model_dir test1 --gait ripple
-    python inference.py --model_dir test1 --cycle_time 1.5
-    python inference.py --model_dir test1 --gait_switch schedule --gait_schedule 0:0,8:1,16:0
-    python inference.py --model_dir test1 --gait_switch keyboard --base_gait tripod
+    python run_inference.py --model_dir test1
+    python run_inference.py --model_dir test1 --no_robot     # offline check
+    python run_inference.py --model_dir test1 --gait ripple
+    python run_inference.py --model_dir test1 --cycle_time 1.5
+    python run_inference.py --model_dir test1 --gait_schedule 0:0,8:1,16:0
 """
 
 import argparse
@@ -32,11 +32,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from cpgsnn.common import cfg_get, outputs_path
-from cpgsnn.cpg import LIFCPGStepper
-from cpgsnn.run_io import load_run
+from submodules.common import cfg_get, outputs_path
+from submodules.cpg import LIFCPGStepper
+from submodules.run_io import load_run
 
 # Hexapod servo ids, in gait-table column order (18 columns -> 18 servos).
+# Taken from the previous ONNX inference script.
 HEXAPOD_SERVO_IDS = [5, 3, 1, 11, 9, 7, 17, 15, 13,
                      18, 16, 14, 12, 10, 8, 6, 4, 2]
 
@@ -46,12 +47,13 @@ HEXAPOD_SERVO_IDS = [5, 3, 1, 11, 9, 7, 17, 15, 13,
 # ═══════════════════════════════════════════════════════════════════
 
 class CPGSource:
-    """Yields one (n_cpg,) spike vector per call, matching what training used.
+    """
+    Yields one (n_cpg,) spike vector per call, matching what training used.
 
-    Real CPG: stepped live (cheap numpy). Fake CPG (--fake_cpg, required for N=18,
-    which has no tuned oscillator): fake_step_chunk is a block generator, not a
-    stepper, so one period is precomputed and cycled, which is exact since the
-    pattern is periodic by construction.
+    Real CPG: stepped live -- it is cheap (numpy, N<=6) and runs indefinitely.
+    Fake CPG: fake_step_chunk is a block generator, not a stepper, so one
+    period is precomputed and cycled.  Exact, since the pattern is periodic by
+    construction.
     """
 
     def __init__(self, cfg):
@@ -95,12 +97,15 @@ class CPGSource:
 # 2.  Gait selection
 # ═══════════════════════════════════════════════════════════════════
 #
-# The inference loop only READS `selector.index`; every way of changing the
-# gait is a subclass that writes it from its own thread, so the loop carries no
-# selection logic (the intended end state is one ROS node per method).
+# The inference loop only ever READS `selector.index`.  Every way of changing
+# the gait is a subclass that writes to it from its own thread, so the loop
+# carries no selection logic and the input methods are independent of each
+# other.  The intended end state is one ROS node per method; each would
+# subclass this the same way and drop in without touching the loop.
 
-# W/A/S/D -> gait-name suffix, applied to --base_gait (names come from the gait
-# CSVs: tripod, tripod_left, ...).
+# W/A/S/D -> gait-name suffix.  The names come from the gait CSVs themselves
+# (tripod, tripod_left, tripod_backwards, tripod_right, ...), so a base name
+# plus a suffix is all that is needed -- nothing here is hardcoded to tripod.
 WASD_SUFFIX = {"w": "", "a": "_left", "s": "_backwards", "d": "_right"}
 
 
@@ -115,8 +120,9 @@ class GaitSelector:
         self._lock   = threading.Lock()
         self._stop   = threading.Event()
         self._thread = None
-        # Set by the caller; receives (old_index, new_index, kind), e.g. for
-        # the live visualizer.
+        # Set by the caller; receives (old_index, new_index, kind) so a
+        # listener (e.g. the live visualizer) can report both the transition
+        # and what triggered it, without the selector knowing about it.
         self.on_change = None
 
     @property
@@ -237,9 +243,10 @@ class KeyboardGait(GaitSelector):
 def make_gait_selector(kind, names, args):
     if kind in ("gesture", "joystick"):
         raise NotImplementedError(
-            f"--gait_switch {kind} is not implemented. Subclass GaitSelector, override "
-            f"start() to spawn a listener that calls set_index(), and register it in "
-            f"make_gait_selector.")
+            f"--gait_switch {kind} is not implemented. Subclass GaitSelector, "
+            f"override start() to spawn a listener that calls set_index(), and "
+            f"register it in make_gait_selector -- the inference loop needs no "
+            f"changes.")
     if kind == "schedule":
         if not args.gait_schedule:
             raise SystemExit("--gait_switch schedule needs --gait_schedule")
@@ -302,8 +309,10 @@ def run(model, cfg, pub, sel, viz, args, device):
     period = float(cfg_get(cfg, "cpg_period_steps", 254.0))
     names = list(cfg_get(cfg, "gait_names", []))
 
-    # Timesteps have no inherent duration (training only counted them): one
-    # cycle is `period` steps, so a step is cycle_time/period seconds.
+    # Timesteps have no inherent duration -- training only ever counted them.
+    # cycle_time fixes the mapping: one gait cycle is `period` steps, so a step
+    # is cycle_time/period seconds. This replaces the previous script's magic
+    # sleep(0.07).
     dt = args.cycle_time / period
     print(f"\n  period {period:.0f} steps/cycle, cycle_time {args.cycle_time}s"
           f"  ->  dt {1e3*dt:.2f} ms/step ({1.0/dt:.0f} Hz)")
@@ -321,7 +330,8 @@ def run(model, cfg, pub, sel, viz, args, device):
     print(f"  settling {settle} steps ({args.settle_cycles} cycles) before "
           f"publishing\n")
 
-    lat, t_start, step, started = [], time.perf_counter(), 0, False
+    lat, vlat = [], []
+    t_start, step, started = time.perf_counter(), 0, False
     try:
         while n_steps < 0 or step < n_steps:
             # Selection lives entirely in the selector's own thread; the loop
@@ -346,12 +356,14 @@ def run(model, cfg, pub, sel, viz, args, device):
                 if step % args.publish_every == 0:
                     pub.publish(joints)
                 if viz is not None:
-                    # aux is (timing spikes,) for timing_grouped (the CPG
-                    # vector itself under cpg / cpg_lif), None for dense.
-                    # Buffering is cheap; viz decides when to redraw.
+                    # aux is (timing spikes,) for timing_grouped, None for
+                    # dense. In process mode this is a queue put of a few
+                    # hundred bytes; in inline mode it may redraw.
                     spk_t = (aux[0][0].cpu().numpy() if aux
                              else np.zeros(0, np.float32))
+                    t_v = time.perf_counter()
                     viz.update(x[0].cpu().numpy(), spk_t, joints, sel.index)
+                    vlat.append((time.perf_counter() - t_v) * 1e3)
 
             step += 1
             # Sleep the remainder of this step's budget rather than a fixed
@@ -364,6 +376,12 @@ def run(model, cfg, pub, sel, viz, args, device):
     finally:
         sel.stop()
 
+    if vlat:
+        v = np.array(vlat)
+        print(f"\n  viz handoff cost per step (ms): mean {v.mean():.3f}  "
+              f"p95 {np.percentile(v, 95):.3f}  max {v.max():.3f}")
+        print(f"  (process mode should be well under 1 ms; anything near the "
+              f"step budget means it is drawing inline)")
     if lat:
         l = np.array(lat)
         print(f"\n  model.step latency over {len(l)} calls (ms): "
@@ -388,8 +406,11 @@ def resolve_gait(g, names):
 
 
 def parse_schedule(s, names):
-    """"0:tripod,8:ripple,16:1" -> [(0.0, 0), (8.0, 4), (16.0, 1)]. Sorted by cycle; an
-    entry at cycle 0 is required so the starting gait is explicit.
+    """
+    "0:tripod,8:ripple,16:1" -> [(0.0, 0), (8.0, 4), (16.0, 1)].
+
+    Sorted by cycle, and an entry at cycle 0 is required so the starting gait
+    is explicit rather than inherited from an unrelated flag.
     """
     out = []
     for part in s.split(","):
@@ -411,71 +432,98 @@ def main():
     ap = argparse.ArgumentParser(
         description="CPG-SNN inference on the robot (PyTorch)")
     ap.add_argument("--model_dir", type=str, default="",
-                    help="Resolved as outputs/<model_dir>, like visualize.py "
-                         "('' = outputs/ itself).")
-    ap.add_argument("--ckpt", type=str, default="best_model.pt",
-                    help="Checkpoint in the run's model/ folder: best_model.pt (default) "
-                         "or a --save_model_every snapshot such as epoch100.pt.")
+                    help="Resolved as outputs/<model_dir>, same as "
+                         "visualize.py. Default '' = outputs/ itself.")
+    ap.add_argument("--ckpt", type=str, default="best_model.pt")
     ap.add_argument("--cfg",  type=str, default="cpg_lif_snn_config.json")
     ap.add_argument("--gait_switch", type=str, default="none",
                     choices=["none", "schedule", "keyboard", "gesture",
                              "joystick"],
-                    help="Where gait changes come from: none (hold --gait), schedule "
-                         "(--gait_schedule), keyboard (WASD, using --base_gait plus a "
-                         "direction suffix). gesture and joystick are placeholders "
-                         "that raise NotImplementedError.")
+                    help="Where gait changes come from. 'none': hold --gait "
+                         "(index 0 by default). 'schedule': follow "
+                         "--gait_schedule. 'keyboard': WASD on stdin, using "
+                         "--base_gait plus a direction suffix. 'gesture' and "
+                         "'joystick' are placeholders and raise "
+                         "NotImplementedError.")
     ap.add_argument("--gait", type=str, default="0",
-                    help="Starting gait: an index or a name from the config's "
-                         "gait_names. Used by 'none' and as the initial gait for "
-                         "'keyboard'.")
+                    help="Starting gait, index or name from the config's "
+                         "gait_names. Used by 'none' and as the initial gait "
+                         "for 'keyboard'.")
     ap.add_argument("--gait_schedule", type=str, default=None,
                     help="For --gait_switch schedule: 'cycle:gait' pairs, e.g. "
-                         "'0:tripod,8:ripple,16:0'. Cycles count from the first "
-                         "published cycle.")
+                         "'0:tripod,8:ripple,16:0'. Cycles count from the "
+                         "first published cycle, not from start-up.")
     ap.add_argument("--base_gait", type=str, default="tripod",
-                    help="For --gait_switch keyboard: W uses this name, A/S/D append "
-                         "_left/_backwards/_right; a missing name is reported at "
-                         "start-up and its key does nothing.")
+                    help="For --gait_switch keyboard: W uses this name, A/S/D "
+                         "append _left/_backwards/_right. Any missing name is "
+                         "reported at start-up and its key does nothing.")
     ap.add_argument("--cycle_time", type=float, default=2.0,
-                    help="Wall-clock seconds per gait cycle; fixes the real duration "
-                         "of a CPG timestep (cycle_time/period), since training only "
-                         "counted steps. Lower = faster gait.")
+                    help="Wall-clock seconds per gait cycle. Sets the real "
+                         "duration of a CPG timestep (cycle_time/period); "
+                         "training only counted steps, so this is where the "
+                         "physical timescale is chosen. Lower = faster gait.")
     ap.add_argument("--cycles", type=float, default=0,
-                    help="Gait cycles to run after settling; 0 = until Ctrl+C.")
+                    help="Gait cycles to run after settling. 0 = forever "
+                         "(Ctrl+C to stop).")
     ap.add_argument("--settle_cycles", type=float, default=3.0,
-                    help="Cycles to step the model before publishing, so the servos do "
-                         "not follow the zero-state transient.")
+                    help="Cycles to step the model before publishing, so the "
+                         "membranes are not at their zero-state transient "
+                         "when the servos start following.")
     ap.add_argument("--publish_every", type=int, default=1,
-                    help="Publish every Nth timestep (raise if the servo controller "
-                         "cannot keep up with 1/dt Hz).")
+                    help="Publish every Nth timestep. Raise if the servo "
+                         "controller cannot keep up with 1/dt Hz.")
     ap.add_argument("--servo_ids", type=str, default=None,
-                    help="Comma-separated servo ids in gait-table COLUMN order "
-                         "(default: the 18-servo hexapod map); must be n_joints long.")
+                    help="Comma-separated servo ids in gait-table COLUMN "
+                         "order. Default is the 18-servo hexapod map. Must be "
+                         "n_joints long.")
     ap.add_argument("--duration", type=float, default=0.02,
                     help="ServosPosition.duration field (seconds).")
     ap.add_argument("--viz", action="store_true",
                     help="Open the live visualization window (see "
-                         "cpgsnn/live_visualization.py); needs a display ('ssh -X' over SSH). "
-                         "The redraw runs inside the control loop and can overrun a "
-                         "control step on an 18-joint hexapod, so prefer --no_robot or "
-                         "a low --viz_fps for anything but debugging.")
+                         "live_visualization.py). Needs a display -- over SSH "
+                         "that means 'ssh -X'. Runs in a separate PROCESS by "
+                         "default, so its ~16 ms redraw cannot stall the "
+                         "control loop; see --viz_mode.")
+    ap.add_argument("--viz_mode", type=str, default="process",
+                    choices=["process", "remote", "inline"],
+                    help="'process' (default): the visualizer runs in a child "
+                         "process fed by a bounded queue, so the control loop "
+                         "only pays a few microseconds per frame and frames "
+                         "are dropped rather than the robot being made to "
+                         "wait. 'remote': same, but the figure is rendered "
+                         "on another machine over a socket (see --viz_host) — "
+                         "~7 kB/s of numbers instead of a framebuffer, which "
+                         "is the way to watch it over SSH without the lag of "
+                         "X11 forwarding or VNC. 'inline': draw inside the "
+                         "control loop, which overruns a 16 ms step on an "
+                         "18-joint hexapod; use only to debug the visualizer.")
+    ap.add_argument("--viz_host", type=str, default="localhost:5555",
+                    help="host:port for --viz_mode remote. With an SSH reverse "
+                         "tunnel ('ssh -R 5555:localhost:5555 user@robot') the "
+                         "default reaches the laptop. Start the viewer there "
+                         "with 'python live_visualization.py --listen 5555'.")
     ap.add_argument("--viz_fps", type=float, default=12.0,
-                    help="Redraw rate for --viz (buffering still happens every "
-                         "timestep).")
+                    help="Redraw rate for --viz. Buffering still happens every "
+                         "timestep; only drawing is throttled.")
     ap.add_argument("--viz_trace_cycles", type=float, default=5.0,
-                    help="History shown in the joint-angle plots, in CPG cycles "
-                         "(cycles, not timesteps, so it is meaningful at any period).")
+                    help="History shown in the joint-angle plots, in CPG "
+                         "cycles. Expressed in cycles rather than timesteps so "
+                         "it stays meaningful whether the period is 352 (real "
+                         "oscillator) or 120 (--fake_cpg).")
     ap.add_argument("--viz_cpg_cycles", type=float, default=1.5,
-                    help="History shown in the CPG spike plot, in cycles; much shorter "
-                         "than --viz_trace_cycles so individual spikes in a burst stay "
-                         "visible.")
+                    help="History shown in the CPG spike plot, in CPG cycles. "
+                         "Much shorter than --viz_trace_cycles on purpose: at "
+                         "5 cycles the individual spikes in a burst merge into "
+                         "a solid block, and seeing them is the point of that "
+                         "plot.")
     ap.add_argument("--gaits_dir", type=str, default="../gaits",
                     help="Folder of {name}.csv gait tables, resolved as "
-                         "this_file_dir/<gaits_dir>; only --viz uses it (per-gait "
-                         "per-joint min/max for the trace scale).")
+                         "this_file_dir/<gaits_dir>. Only needed for --viz, "
+                         "which reads per-gait per-joint min/max from them to "
+                         "scale the trace plot.")
     ap.add_argument("--no_robot", action="store_true",
-                    help="Compute commands but publish nothing; no ROS imports, so "
-                         "this runs anywhere.")
+                    help="Compute commands but publish nothing. No ROS "
+                         "imports, so this runs anywhere.")
     ap.add_argument("--device", type=str, default=None,
                     help="cuda / cpu. Default: cuda if available.")
     args = ap.parse_args()
@@ -512,14 +560,37 @@ def main():
     viz = None
     if args.viz:
         # Imported lazily so matplotlib is not pulled in on the robot unless
-        # --viz asks for it.
-        from cpgsnn.live_visualization import LiveVisualizer
-        viz = LiveVisualizer(cfg, this_dir / args.gaits_dir,
-                             trace_cycles=args.viz_trace_cycles,
-                             cpg_cycles=args.viz_cpg_cycles,
-                             fps=args.viz_fps)
+        # the visualization is actually asked for. In "process" mode the parent
+        # never imports a GUI backend at all -- only the child does.
+        opts = dict(trace_cycles=args.viz_trace_cycles,
+                    cpg_cycles=args.viz_cpg_cycles, fps=args.viz_fps)
+        if args.viz_mode == "process":
+            from live_visualization import VisualizerProxy
+            viz = VisualizerProxy(cfg, this_dir / args.gaits_dir, **opts)
+            print(f"  live visualization in a child process (pid "
+                  f"{viz.proc.pid}); the control loop cannot be stalled by it")
+        elif args.viz_mode == "remote":
+            from live_visualization import VisualizerClient
+            host, _, port = args.viz_host.partition(":")
+            try:
+                viz = VisualizerClient(cfg, host or "localhost",
+                                       int(port or 5555))
+            except OSError as e:
+                raise SystemExit(
+                    f"Could not reach the remote visualizer at "
+                    f"{args.viz_host} ({e}). Start it on the viewing machine "
+                    f"with 'python live_visualization.py --listen "
+                    f"{port or 5555}', and if you are on SSH make sure the "
+                    f"reverse tunnel is up: "
+                    f"ssh -R {port or 5555}:localhost:{port or 5555} user@robot")
+            print(f"  live visualization streaming to {args.viz_host} "
+                  f"(~7 kB/s; rendering happens there, not here)")
+        else:
+            from live_visualization import LiveVisualizer
+            viz = LiveVisualizer(cfg, this_dir / args.gaits_dir, **opts)
+            print("  live visualization INLINE — redraws run inside the "
+                  "control loop and will overrun the step budget")
         sel.on_change = viz.notify_gait_switch
-        print("  live visualiization open")
 
     print("\n[3/3] Running ...")
     try:

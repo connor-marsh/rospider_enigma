@@ -410,8 +410,8 @@ def main():
     train_py = Path(this_file_dir, args.train_script)
     if not train_py.exists():
         raise SystemExit(f"{train_py} not found")
-    flags = train_flags(Path(this_file_dir, "cpgsnn", "train_args.py"),
-                        Path(this_file_dir, "cpgsnn", "cpg.py"))
+    flags = train_flags(Path(this_file_dir, "submodules", "train_args.py"),
+                        Path(this_file_dir, "submodules", "cpg.py"))
     name, fixed, vary = load_spec(args, flags)
     runs = plan_runs(vary)
     root = Path(this_file_dir, "outputs", "zsweeps", name)

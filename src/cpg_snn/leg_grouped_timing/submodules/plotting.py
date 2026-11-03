@@ -494,7 +494,7 @@ def plot_drive_fanin_history(metrics_csv, group_cols, leg_cols, gait_names,
 
 def _savefig(fig, out_dir, name, dpi):
     # out_path routes by filename prefix into recons/ timing_alignments/ membrane_waveforms/
-    # phase_folds/ (see OUT_ROUTES in cpgsnn/common.py).
+    # phase_folds/ (see OUT_ROUTES in submodules/common.py).
     p = out_path(out_dir, name)
     fig.savefig(p, dpi=dpi, bbox_inches="tight")
     plt.close(fig)

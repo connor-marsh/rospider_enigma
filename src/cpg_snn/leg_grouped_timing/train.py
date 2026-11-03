@@ -35,12 +35,12 @@ Usage
     python train.py --arch timing_grouped --hidden 128
     python train.py --n_cpg_neurons 18 --drive_source cpg_lif --drive_lambda 1e-3
 
-The steps live in cpgsnn/train_pipeline.py; see FILES.md for where everything else lives.
+The steps live in submodules/train_pipeline.py; see FILES.md for where everything else lives.
 """
 from types import SimpleNamespace
 
-from cpgsnn import train_pipeline as tp
-from cpgsnn.train_args import build_parser
+from submodules import train_pipeline as tp
+from submodules.train_args import build_parser
 
 
 def main():

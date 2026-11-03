@@ -3,8 +3,8 @@ Visualize a trained CPG-SNN run
 ===============================
 Diagnostic figures and alignment scores by default; publication figures with --publication.
 Loads a checkpoint (.pt) and its config (.json) written by train.py and replays the CPG from the
-config's own parameters. The flows live in cpgsnn/viz_pipeline.py, the figures in
-cpgsnn/plotting.py.
+config's own parameters. The flows live in submodules/viz_pipeline.py, the figures in
+submodules/plotting.py.
 
 Usage
 -----
@@ -23,8 +23,8 @@ Publication mode
 """
 import os
 
-from cpgsnn.common import outputs_path
-from cpgsnn.viz_pipeline import build_parser, run_publication, run_visualization
+from submodules.common import outputs_path
+from submodules.viz_pipeline import build_parser, run_publication, run_visualization
 
 this_file_dir = os.path.dirname(os.path.abspath(__file__))
 

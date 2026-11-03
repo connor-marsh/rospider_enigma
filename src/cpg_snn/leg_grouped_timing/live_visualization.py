@@ -9,18 +9,18 @@ A single matplotlib window, updated from inside the inference loop:
             light up with it, so a spike is visible entering the network and
             arriving at the joints it drives.
   traces    one scrolling plot PER JOINT TYPE (coxa/femur/tibia for a hexapod,
-            shoulder/knee for a quadruped), each in [-1, 1]. Normalisation is
+            shoulder/knee for a quadruped), each in [-1, 1]. Normalization is
             PER GAIT, PER JOINT against that joint's own min and max in the
             active gait table, so a 5-degree joint and a 60-degree joint are
             equally readable. Joint dots in the schematic use the same
-            normalisation on a coolwarm map (blue = joint minimum, red = joint
+            normalization on a coolwarm map (blue = joint minimum, red = joint
             maximum), so a dot and its trace line always agree.
 
 Both x-axes are sized in CPG CYCLES, not fixed timesteps, so they stay
 meaningful whether the period is 352 (real oscillator) or 120 (fake_cpg).
 
 Why matplotlib rather than PyGame/PyQtGraph: it is already a dependency of
-visualize_timing.py, so this adds nothing to install, and it draws both the schematic
+visualize.py, so this adds nothing to install, and it draws both the schematic
 and the scrolling plots in one figure. Blitting keeps it fast enough.
 
 TIMING CAVEAT: `update` buffers cheaply on every call but only REDRAWS at
@@ -45,15 +45,13 @@ from pathlib import Path
 
 import numpy as np
 
-from train import (
-    GAIT_FILES_BY_N, cfg_get, joint_type_names, load_gait_tables,
-    upsample_gait_tables,
-)
+from submodules.common import cfg_get, joint_type_names
+from submodules.data import GAIT_FILES_BY_N, load_gait_tables, upsample_gait_tables
 
 CPG_C    = "#457b9d"
 TIMING_C = "#2a9d8f"
 JOINT_C  = "#6a0572"
-SNN_C    = "#3d405b"     # decoder blocks: fixed colour, never highlighted
+SNN_C    = "#3d405b"     # decoder blocks: fixed color, never highlighted
 ON_C     = "#e63946"
 OFF_A    = 0.60          # edge alpha when idle
 DIM      = "#c8cdd4"
@@ -67,8 +65,8 @@ class LiveVisualizer:
     def __init__(self, cfg, gaits_dir, trace_cycles=5.0, cpg_cycles=1.5,
                  fps=12.0, backend=None):
         import matplotlib
-        # train.py sets Agg at import time (it only ever saves figures), and
-        # importing it above means we inherit that -- plt.show() would then
+        # submodules/cpg.py and submodules/plotting.py set Agg at import time (they only ever
+        # save figures), and inference.py imports cpg, so we inherit that -- plt.show() would then
         # silently open nothing. force=True is required because pyplot is
         # already imported by then, so use() has to switch the live backend.
         if backend:
@@ -121,7 +119,7 @@ class LiveVisualizer:
         self.trace_cycles, self.cpg_cycles = float(trace_cycles), float(cpg_cycles)
 
         # ── ring buffers (raw values + the gait they were produced under, so
-        # history keeps the normalisation that was true when it was recorded)
+        # history keeps the normalization that was true when it was recorded)
         self.W     = int(round(self.trace_cycles * self.period))
         # One ring buffer, sized for the longer window; the CPG plot just reads
         # the most recent W_cpg of it.
@@ -142,7 +140,7 @@ class LiveVisualizer:
         self._acc_cpg = np.zeros(self.n_cpg, bool)
         self._acc_tim = np.zeros(max(self.n_timing, 1), bool)
 
-        # One colour per CPG neuron, shared between its node's outline and its
+        # One color per CPG neuron, shared between its node's outline and its
         # row in the spike plot -- that pairing is what ties the two views
         # together, along with matching N0..Nk labels on both.
         cm = self.plt.get_cmap("turbo")
@@ -300,7 +298,7 @@ class LiveVisualizer:
             for y in self.p_dec[:, 1]:
                 self.dec_boxes.append(plt.Rectangle(
                     (X_DEC - DEC_W / 2, y - h / 2), DEC_W, h))
-            # Fixed colour, no spike highlight: the block stands for a whole
+            # Fixed color, no spike highlight: the block stands for a whole
             # sub-network, so flashing it on its timing spike said less than
             # the edges leaving it already do.
             self.pc_dec = self._PC(self.dec_boxes, edgecolors="k",
@@ -355,7 +353,7 @@ class LiveVisualizer:
         for x, lab in labels:
             ax.text(x, 1.09, lab, ha="center", va="bottom", fontsize=15,
                     fontweight="bold")
-        # N0..Nk beside each CPG node, in that neuron's colour: the other half
+        # N0..Nk beside each CPG node, in that neuron's color: the other half
         # of the pairing with the spike plot's lanes.
         for i, (x, y) in enumerate(self.p_cpg):
             ax.text(x - 0.08, y, f"N{i}", ha="right", va="center", fontsize=13,
@@ -611,7 +609,7 @@ class LiveVisualizer:
 #
 # The control loop's only cost becomes one small array put on a queue, tens of
 # microseconds, instead of a ~16 ms redraw. The queue is BOUNDED and the put
-# is non-blocking: if the visualiser falls behind, frames are dropped and the
+# is non-blocking: if the visualizer falls behind, frames are dropped and the
 # robot loop carries on. It can never be stalled by the window.
 
 _KIND_FRAME, _KIND_GAIT, _KIND_STOP = 0, 1, 2
@@ -631,7 +629,7 @@ def _viz_child(q, cfg, gaits_dir, kwargs):
             # Drain everything pending before drawing: update() buffers
             # cheaply and only redraws on its own fps schedule, so a backlog
             # collapses into one redraw with all the spikes OR-ed in -- which
-            # is exactly the accumulate-between-frames behaviour wanted.
+            # is exactly the accumulate-between-frames behavior wanted.
             while True:
                 try:
                     kind, payload = q.get_nowait()
@@ -724,7 +722,7 @@ class VisualizerProxy:
                 self.proc.terminate()
         if self.sent or self.dropped:
             pct = 100.0 * self.dropped / max(self.sent + self.dropped, 1)
-            print(f"  visualiser: {self.sent} frames sent, {self.dropped} "
+            print(f"  visualizer: {self.sent} frames sent, {self.dropped} "
                   f"dropped ({pct:.1f}%) — drops mean the plot fell behind, "
                   f"not that the control loop stalled")
         self.proc = None
@@ -912,7 +910,7 @@ class VisualizerClient:
             pass
         if self.sent or self.dropped:
             pct = 100.0 * self.dropped / max(self.sent + self.dropped, 1)
-            print(f"  visualiser: {self.sent} frames sent, {self.dropped} "
+            print(f"  visualizer: {self.sent} frames sent, {self.dropped} "
                   f"dropped ({pct:.1f}%)")
 
 
@@ -941,7 +939,7 @@ def serve_visualizer(port, gaits_dir, host="", **kwargs):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
     srv.listen(1)
-    print(f"Visualiser listening on {host or '0.0.0.0'}:{port}")
+    print(f"Visualizer listening on {host or '0.0.0.0'}:{port}")
     print(f"Gait tables: {gaits_dir}")
     print("Waiting for the robot to connect "
           "(Ctrl+C to quit) ...")
@@ -1052,7 +1050,7 @@ def _serve_one(conn, gaits_dir, kwargs):
 def main():
     import argparse
     ap = argparse.ArgumentParser(
-        description="Render the live CPG-SNN visualisation for a robot running "
+        description="Render the live CPG-SNN visualization for a robot running "
                     "run_inference.py --viz_mode remote. Streams ~7 kB/s of "
                     "numbers instead of a framebuffer, so it stays smooth on "
                     "a link where X11 forwarding or VNC will not.")

@@ -389,7 +389,7 @@ def build_model(args, run):
             if leaks:
                 print(f"      natural gating PARTIAL: voltage bias means the sub-networks are "
                 f"driven only on timing spikes, but {' and '.join(leaks)} can still fire a "
-                f"hidden unit without one (see check_bias_voltage.py).")
+                f"hidden unit without one.")
             else:
                 print(f"      natural gating FULL: no explicit gate and no path for a hidden "
                 f"unit to fire on a timing-silent step (voltage bias, gamma-only FiLM, "

@@ -314,9 +314,8 @@ class TimingGroupedSNN(nn.Module):
     film_mode="gamma_only" and hidden_reset="zero" leave no way for a hidden unit
     to fire on a timing-silent step (no bias current, no FiLM beta, no residual
     after a subtractive reset). --bias_mode current, --film_mode gamma_beta and
-    --hidden_reset subtract each reopen one leak, for A/B; check_bias_voltage.py
-    reports which units can fire unprompted. With a leak open, the task loss is
-    partly insensitive to WHEN the timing spikes land.
+    --hidden_reset subtract each reopen one leak, for A/B. With a leak open, the task
+    loss is partly insensitive to WHEN the timing spikes land.
 
     Inside the sub-networks LN (`sub_ln`) uses elementwise_affine=False so no
     parameter is tied across groups; FiLM supplies the per-group per-gait affine.
@@ -714,10 +713,9 @@ class TimingGroupedSNN(nn.Module):
         v >= thresh gives a non-positive threshold and the unit fires every step with no
         way back. The lower bound only caps the threshold at 2*thresh.
 
-        Applied to `.data` after the optimiizer step, not in `step()`, where a clamp
+        Applied to `.data` after the optimizer step, not in `step()`, where a clamp
         would give out-of-range parameters exactly zero gradient and trap them. Not
-        called from load_run: a checkpoint must reconstruct as it was
-        (check_bias_voltage.py finds out-of-range biases).
+        called from load_run: a checkpoint must reconstruct as it was.
         """
         if self.bias_mode != "voltage":
             return
