@@ -44,9 +44,15 @@ one file only affects the files that import it.
 - **train_pipeline**: `setup`, `load_gaits`, `run_cpg_phase`, `analyze_cpg`, `build_targets_phase`, `make_samplers`, `build_model`, `prepare_training`, `calibrate`, `make_objective`, `write_config`, `train`, `evaluate`, `export`, `visualize`
 - **viz_pipeline**: `default_args`, `run_visualization`, `run_publication`
 
-## Other folders
+## Other folders and files
 
-- `docs/`: notes.md, history.md (design history and measurements), and the todo files.
+- `docs/`: `notes.md` (the curated summary: current state, decisions and their reasons,
+  open questions and ideas; rewritten as understanding changes), `history.md` (one dated
+  entry per chat, newest first; only ever added to), and the `*_todo.md` action lists.
+- `.githooks/`: on every commit, checkout, merge and rebase, writes `project_manifest.txt`
+  here (one hash per tracked .py/.md file in this folder). Enabled once with
+  `git config core.hooksPath src/cpg_snn/leg_grouped_timing/.githooks`.
+- `project_manifest.txt`: gitignored; upload it to the project with the code files.
 - `outputs/`: training runs and `zsweeps/` (gitignored).
 - the gait CSV folder, resolved from `--gaits_dir` (default `../gaits`).
 
