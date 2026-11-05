@@ -1,0 +1,24 @@
+#!/bin/sh
+# Writes project_manifest.txt into the code folder (the folder containing this .githooks
+# folder): the SHA-256 of every tracked .py and .md file under it, computed with carriage
+# returns removed so Windows and Unix line endings hash the same, with paths relative to
+# that folder. Upload it to the project along with the files you changed. post-checkout,
+# post-merge and post-rewrite run this same script. Never blocks a commit.
+cd "$(dirname "$0")/.." || exit 0
+if command -v sha256sum >/dev/null 2>&1; then SHA="sha256sum"; else SHA="shasum -a 256"; fi
+out=project_manifest.txt
+{
+  echo "# project manifest: SHA-256 of each file with carriage returns removed"
+  echo "commit: $(git rev-parse --short HEAD) ($(git log -1 --format=%ci))"
+  echo "generated: $(date '+%Y-%m-%d %H:%M:%S %z')"
+  if [ -n "$(git status --porcelain --untracked-files=no -- .)" ]; then
+    echo "uncommitted changes: yes"
+  else
+    echo "uncommitted changes: no"
+  fi
+  git ls-files -- '*.py' '*.md' | while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    echo "$(tr -d '\r' < "$f" | $SHA | cut -c1-64)  $f"
+  done
+} > "$out.tmp" && mv "$out.tmp" "$out"
+exit 0

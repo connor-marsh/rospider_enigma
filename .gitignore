@@ -73,3 +73,5 @@ src/cpg_snn/outputs
 src/cpg_snn/*/outputs
 
 quick_ablation.bash
+
+project_manifest.txt

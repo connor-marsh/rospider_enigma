@@ -1,0 +1,3 @@
+#!/bin/sh
+# Same manifest update as post-commit.
+sh "$(dirname "$0")/post-commit"
