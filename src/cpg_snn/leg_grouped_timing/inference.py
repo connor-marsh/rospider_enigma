@@ -107,6 +107,8 @@ class CPGSource:
 # (tripod, tripod_left, tripod_backwards, tripod_right, ...), so a base name
 # plus a suffix is all that is needed -- nothing here is hardcoded to tripod.
 WASD_SUFFIX = {"w": "", "a": "_left", "s": "_backwards", "d": "_right"}
+GESTURE_SUFFIX = {"one": "", "four": "_left", "three": "_backwards", "two": "_right"}
+GESTURE_BASE = {"fist": "stand", "gun": "tripod", "five": "ripple"}
 
 
 class GaitSelector:
@@ -238,6 +240,56 @@ class KeyboardGait(GaitSelector):
                         self.set_index(self.targets[ch], f"  [key {ch.upper()}]")
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+class GestureGait(GaitSelector):
+    """
+    MediaPipe + Gesture Detection. Can set either direction or gait type
+    Direction: One = Forward, Two = Right, Three = Backwards, Four = Left
+    Types: Fist = Stand, Gun = Tripod, Five = Ripple
+    """
+
+    kind = "keyboard"
+
+    def __init__(self, names, initial=0):
+        super().__init__(names, initial)
+        self.base = self.names[initial]
+        if "_" in self.base:
+            self.base = self.base[0:self.base.index("_")]
+        self.targets, missing = {}, []
+        for key, suffix in GESTURE_SUFFIX.items():
+            name = self.base + suffix
+            if name in self.names:
+                self.targets[key] = self.names.index(name)
+            else:
+                missing.append((key.upper(), name))
+        if not self.targets:
+            raise SystemExit(
+                f"--base_gait {self.base!r} yields no usable names. Config has: "
+                f"{self.names}")
+        if missing:
+            print(f"  no gait for: " + ", ".join(f"{k}={n}" for k, n in missing)
+                  + " (those keys will do nothing)")
+
+    def describe(self):
+        return f"{self.kind}: " + "  ".join(
+            f"{k.upper()}={self.names[i]}" for k, i in self.targets.items())
+
+    def start(self):
+        print(f"  keys: " + "  ".join(f"{k.upper()}={self.names[i]}"
+                                     for k, i in self.targets.items()))
+        self._spawn(self._loop)
+
+    def _loop(self):
+        # import and setup mediapipe
+        try:
+            while not self._stop.is_set():
+                # get gesture
+                gesture = "fist"
+                if gesture in self.targets:
+                    self.set_index(self.targets[ch], f"  [key {ch.upper()}]")
+        finally:
+            # stop mediapipe if needed
+            pass
 
 
 def make_gait_selector(kind, names, args):
