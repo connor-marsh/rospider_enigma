@@ -503,7 +503,7 @@ def _savefig(fig, out_dir, name, dpi):
 
 def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
                    timing_cols, leg_cols, gait_name, out_dir, dpi, t_lo, t_hi,
-                   drive_share=None, drive_frac=0.90):
+                   drive_share=None, drive_frac=0.90, col_scores=None):
     """The main figure: two full-width rasters on top, then a grid of ONE ROW PER LEG and
     ONE COLUMN PER JOINT WITHIN THAT LEG (from `leg_cols`, the robot's anatomy, not the
     network's grouping: 6 x 3 for the hexapod, 4 x 2 for the quadruped, whatever the
@@ -522,6 +522,12 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
     `group_cols`, which has a different length when --timing_shape and --decoder_shape
     differ); with per_leg timing a leg's three panels share one rug. Every axis shares x
     with the rasters.
+
+    `col_scores` (optional) {column: (vel, cor, row_vel, row_cor, n_row_cols)} adds a
+    second title line per panel: the panel's input train scored against THAT joint's
+    demand alone, and, when its row (timing unit or sub-network) covers more than one
+    column, the row's own score over all of them (the number in timing_summary.json).
+    None draws the figure without scores.
     """
     n_cpg = spikes.shape[1]
     # tspk is (L, lanes) or (L, G, C); axis 1 is the lane count on the timing-layer path (the cpg
@@ -672,6 +678,14 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
                 r = float(np.sqrt(np.nanmean(
                     (pred[sl, c] - gt[sl, c]) ** 2)))
                 title += f"   RMSE={r:.2f}°"
+            if col_scores is not None and c in col_scores:
+                fs = lambda x: "n/a" if not np.isfinite(x) else f"{x:+.2f}"
+                v_, c_, rv_, rc_, nrc_ = col_scores[c]
+                title += f"\nalign vel {fs(v_)}  cor {fs(c_)}"
+                if nrc_ > 1 and g_own is not None:
+                    un_ = "g" if drive_share is not None else "T"
+                    title += (f"   ({un_}{g_own} over {nrc_} cols: "
+                              f"vel {fs(rv_)}  cor {fs(rc_)})")
 
             # Timing spikes for THIS leg, on every one of its joint panels:
             # one timing neuron drives the whole group, so the same spike
@@ -713,9 +727,13 @@ def plot_alignment(spikes, tspk, gt, pred, phase, onsets, period, burst_thr,
                 if drive_share is not None else
                 "rug = the timing neuron driving THAT joint (T# in each "
                 "title); full-height line = its burst onset")
+    score_note = ("" if col_scores is None else
+                  "\nalign = velocity / corner alignment of the panel's input "
+                  "train against that joint alone (0 = random, 1 = ideal); "
+                  "( ) = its row's score over all the row's columns")
     fig.suptitle(f"{gait_name} — timing alignment   "
                  f"rows = legs, columns = joints within a leg   |   "
-                 f"{rug_note}",
+                 f"{rug_note}{score_note}",
                  fontsize=11, fontweight="bold")
     _savefig(fig, out_dir, f"timing_alignment_{gait_name}.png", dpi)
 

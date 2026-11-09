@@ -516,14 +516,6 @@ def run_visualization(model_dir, out_dir=None, args=None):
 
         # frac=None under the spikes metric: draw every channel that fires, not a 90% subset.
         d_frac = None if drive_metric == "spikes" else 0.90
-        if not args.scores_only:
-            plot_alignment(spikes, tspk_g, gt, pred, phase, onsets, period,
-                           burst_thr, rows_map, leg_cols, gname, out_dir,
-                           args.dpi, t_lo, t_hi, drive_share=d_share,
-                           drive_frac=d_frac)
-            plot_phase_fold(tspk_g, phase, gait_tables, gi, rows_map, gname,
-                            phase_zero, out_dir, args.dpi,
-                            drive_share=d_share, drive_frac=d_frac)
 
         # statistics over the full fold window
         ok    = np.isfinite(phase)
@@ -596,6 +588,28 @@ def run_visualization(model_dir, out_dir=None, args=None):
                   f"rate={rows[-1]['rate_per_cycle']:6.2f}/cyc  "
                   f"phase={mu:.3f}  R={R_:.2f}  "
                   f"residual={res:+.3f} cyc ({res * period:+.0f} steps){tag}")
+        # Drawn AFTER scoring so each waveform panel can show its scores. Per panel: the owning row's
+        # train scored against that one column's demand, plus the row's own score (over all its
+        # columns, as reported above) for rows covering several columns. cols_of is rows_map here,
+        # the same row -> columns map plot_alignment uses to find a panel's owner.
+        if not args.scores_only:
+            col_scores = {}
+            for j in range(n_row):
+                for c in cols_of[j]:
+                    cv, cc = alignment_pair(
+                        row_trains[aw, j], gait_tables[gi], [c], ph_w,
+                        phase_zero, ok[aw], args.align_vel_tau,
+                        args.align_cor_tau)
+                    col_scores[c] = (cv, cc, vel_l[j], cor_l[j],
+                                     len(cols_of[j]))
+            plot_alignment(spikes, tspk_g, gt, pred, phase, onsets, period,
+                           burst_thr, rows_map, leg_cols, gname, out_dir,
+                           args.dpi, t_lo, t_hi, drive_share=d_share,
+                           drive_frac=d_frac, col_scores=col_scores)
+            plot_phase_fold(tspk_g, phase, gait_tables, gi, rows_map, gname,
+                            phase_zero, out_dir, args.dpi,
+                            drive_share=d_share, drive_frac=d_frac)
+
         # Collected, printed once in an ALIGNMENT section after every gait.
         align_rows.append((gname, vel_l, cor_l))
         by_joint[gname] = (np.asarray(row_trains[aw], dtype=float), [list(c) for c in cols_of])

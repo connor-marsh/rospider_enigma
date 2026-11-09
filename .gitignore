@@ -75,3 +75,5 @@ src/cpg_snn/*/outputs
 quick_ablation.bash
 
 project_manifest.txt
+
+src/cpg_snn/leg_grouped_timing/sweep_configs
