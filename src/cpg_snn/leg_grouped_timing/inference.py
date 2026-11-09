@@ -97,34 +97,41 @@ class CPGSource:
 # 2.  Gait selection
 # ═══════════════════════════════════════════════════════════════════
 #
-# The inference loop only ever READS `selector.index`.  Every way of changing
-# the gait is a subclass that writes to it from its own thread, so the loop
-# carries no selection logic and the input methods are independent of each
-# other.  The intended end state is one ROS node per method; each would
-# subclass this the same way and drop in without touching the loop.
+# The inference loop only ever READS `GaitState.index`.  Every way of changing
+# the gait is a GaitSelector subclass that writes to that one shared state from
+# its own thread, so the loop carries no selection logic and several selectors
+# can run at once (e.g. keyboard + gesture).  If two write close together, the
+# later write wins.  The intended end state is one ROS node per method; each
+# would subclass GaitSelector the same way and drop in without touching the loop.
 
 # W/A/S/D -> gait-name suffix.  The names come from the gait CSVs themselves
 # (tripod, tripod_left, tripod_backwards, tripod_right, ...), so a base name
 # plus a suffix is all that is needed -- nothing here is hardcoded to tripod.
 WASD_SUFFIX = {"w": "", "a": "_left", "s": "_backwards", "d": "_right"}
+# Gestures either pick the direction (keeping the current base gait) or the
+# base gait (keeping the current direction where that gait has it).
 GESTURE_SUFFIX = {"one": "", "four": "_left", "three": "_backwards", "two": "_right"}
 GESTURE_BASE = {"fist": "stand", "gun": "tripod", "five": "ripple"}
 
 
-class GaitSelector:
-    """Thread-safe holder for the current gait index. Base class = fixed."""
+def split_gait(name):
+    """'ripple_left' -> ('ripple', '_left');  'tripod' -> ('tripod', '')."""
+    for suffix in sorted(set(GESTURE_SUFFIX.values()), key=len, reverse=True):
+        if suffix and name.endswith(suffix):
+            return name[:-len(suffix)], suffix
+    return name, ""
 
-    kind = "none"
+
+class GaitState:
+    """Thread-safe current gait index, shared by every selector."""
 
     def __init__(self, names, initial=0):
-        self.names   = list(names)
-        self._idx    = int(initial)
-        self._lock   = threading.Lock()
-        self._stop   = threading.Event()
-        self._thread = None
+        self.names = list(names)
+        self._idx  = int(initial)
+        self._lock = threading.Lock()
         # Set by the caller; receives (old_index, new_index, kind) so a
         # listener (e.g. the live visualizer) can report both the transition
-        # and what triggered it, without the selector knowing about it.
+        # and what triggered it, without the selectors knowing about it.
         self.on_change = None
 
     @property
@@ -132,7 +139,7 @@ class GaitSelector:
         with self._lock:
             return self._idx
 
-    def set_index(self, i, why=""):
+    def set_index(self, i, kind="", why=""):
         if not 0 <= i < len(self.names):
             print(f"  ignoring gait index {i} (valid 0..{len(self.names)-1})")
             return
@@ -142,10 +149,29 @@ class GaitSelector:
         if changed:
             print(f"  gait -> {self.names[i]} [{i}]{why}")
             if self.on_change is not None:
-                self.on_change(old, i, self.kind)
+                self.on_change(old, i, kind)
+
+
+class GaitSelector:
+    """One source of gait changes, writing to a shared GaitState."""
+
+    kind = "none"
+
+    def __init__(self, state):
+        self.state   = state
+        self.names   = state.names
+        self._stop   = threading.Event()
+        self._thread = None
+
+    @property
+    def index(self):
+        return self.state.index
+
+    def set_index(self, i, why=""):
+        self.state.set_index(i, self.kind, why)
 
     def describe(self):
-        return f"{self.kind}, starting on {self.names[self.index]}"
+        return self.kind
 
     def start(self):
         """Called once, after settling. Subclasses spawn their listener here."""
@@ -165,8 +191,8 @@ class ScheduledGait(GaitSelector):
 
     kind = "schedule"
 
-    def __init__(self, names, schedule, cycle_time):
-        super().__init__(names, schedule[0][1])
+    def __init__(self, state, schedule, cycle_time):
+        super().__init__(state)
         self.schedule, self.cycle_time = schedule, cycle_time
 
     def describe(self):
@@ -192,8 +218,8 @@ class KeyboardGait(GaitSelector):
 
     kind = "keyboard"
 
-    def __init__(self, names, base, initial=0):
-        super().__init__(names, initial)
+    def __init__(self, state, base):
+        super().__init__(state)
         self.base = base
         self.targets, missing = {}, []
         for key, suffix in WASD_SUFFIX.items():
@@ -241,73 +267,181 @@ class KeyboardGait(GaitSelector):
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
+
+# Gesture classification, from Hiwonder's hand_gesture.py demo on the robot.
+# Each finger's bend is the angle between two landmark vectors (MediaPipe hand
+# landmark indices; 0 = wrist, 4/8/12/16/20 = finger tips).  The demo took
+# abs() of a signed angle, which is exactly the unsigned angle used here.
+_ANGLE_A = ([3, 0, 0, 0, 0], [4, 6, 10, 14, 18])     # thumb, index, ..., pinky
+_ANGLE_B = ([0, 7, 11, 15, 19], [2, 8, 12, 16, 20])
+
+# B = bent, S = straight; the thumb uses its own bent threshold, and "one" only
+# needs the thumb above 5 degrees.  First match wins, in the demo's order.
+_GESTURES = (("fist", "BBBBB"), ("gun", "SSBBB"), ("hand_heart", "SBBBB"),
+             ("one", "xSBBB"), ("two", "BSSBB"), ("three", "BSSSB"),
+             ("OK", "BBSSS"), ("four", "BSSSS"), ("five", "SSSSS"),
+             ("six", "SBBBS"))
+
+
+def finger_angles(pts):
+    """(21, 2) landmarks in pixels -> (5,) bend angles in degrees."""
+    a = pts[_ANGLE_A[0]] - pts[_ANGLE_A[1]]
+    b = pts[_ANGLE_B[0]] - pts[_ANGLE_B[1]]
+    cross = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+    return np.degrees(np.arctan2(np.abs(cross), (a * b).sum(1)))
+
+
+def classify_gesture(angles, bent=65.0, bent_thumb=53.0, straight=49.0):
+    """Finger angles (thumb..pinky, degrees) -> gesture name, or "none"."""
+    ok = {"B": lambda a, i: a > (bent_thumb if i == 0 else bent),
+          "S": lambda a, i: a < straight,
+          "x": lambda a, i: a > 5.0}
+    for name, pattern in _GESTURES:
+        if all(ok[c](a, i) for i, (c, a) in enumerate(zip(pattern, angles))):
+            return name
+    return "none"
+
+
 class GestureGait(GaitSelector):
     """
-    MediaPipe + Gesture Detection. Can set either direction or gait type
-    Direction: One = Forward, Two = Right, Three = Backwards, Four = Left
-    Types: Fist = Stand, Gun = Tripod, Five = Ripple
+    Hand gestures from the robot camera, via MediaPipe. Nothing is displayed.
+    Direction (keeps the current base gait):
+        one = forward, two = right, three = backwards, four = left
+    Base gait (keeps the current direction if that gait has it, else plain):
+        fist = stand, gun = tripod, five = ripple
+    A gesture acts once it is seen on `confirm_frames` consecutive frames, and
+    not again until a different gesture is confirmed or the hand leaves view,
+    so a held hand does not keep overriding the other selectors.
     """
 
-    kind = "keyboard"
+    kind = "gesture"
 
-    def __init__(self, names, initial=0):
-        super().__init__(names, initial)
-        self.base = self.names[initial]
-        if "_" in self.base:
-            self.base = self.base[0:self.base.index("_")]
-        self.targets, missing = {}, []
-        for key, suffix in GESTURE_SUFFIX.items():
-            name = self.base + suffix
-            if name in self.names:
-                self.targets[key] = self.names.index(name)
-            else:
-                missing.append((key.upper(), name))
-        if not self.targets:
-            raise SystemExit(
-                f"--base_gait {self.base!r} yields no usable names. Config has: "
-                f"{self.names}")
+    def __init__(self, state, topic, confirm_frames=5):
+        super().__init__(state)
+        self.topic, self.confirm = topic, int(confirm_frames)
+        # Imported here rather than in the thread, so a missing package fails
+        # at start-up instead of silently leaving gestures dead.
+        import mediapipe as mp
+        import rclpy
+        from cv_bridge import CvBridge
+        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.node import Node
+        from sensor_msgs.msg import Image  # type: ignore
+        self._mp, self._rclpy, self._Node = mp, rclpy, Node
+        self._Executor, self._Image, self._bridge = (
+            SingleThreadedExecutor, Image, CvBridge())
+        self._last, self._run, self._fired = None, 0, None
+        bases = {split_gait(n)[0] for n in self.names}
+        missing = [f"{g}={b}" for g, b in GESTURE_BASE.items() if b not in bases]
         if missing:
-            print(f"  no gait for: " + ", ".join(f"{k}={n}" for k, n in missing)
-                  + " (those keys will do nothing)")
+            print(f"  no gait for: {', '.join(missing)} (those gestures will "
+                  f"do nothing)")
 
     def describe(self):
-        return f"{self.kind}: " + "  ".join(
-            f"{k.upper()}={self.names[i]}" for k, i in self.targets.items())
+        return (f"{self.kind} on {self.topic} ({self.confirm} frames): "
+                + "  ".join(f"{g}={b}" for g, b in GESTURE_BASE.items()) + "  | "
+                + "  ".join(f"{g}={s.lstrip('_') or 'forward'}"
+                            for g, s in GESTURE_SUFFIX.items()))
 
     def start(self):
-        print(f"  keys: " + "  ".join(f"{k.upper()}={self.names[i]}"
-                                     for k, i in self.targets.items()))
         self._spawn(self._loop)
 
     def _loop(self):
-        # import and setup mediapipe
+        rclpy = self._rclpy
+        owns_ros = not rclpy.ok()        # ServoPublisher inits unless --no_robot
+        if owns_ros:
+            rclpy.init()
+        node = self._Node("gesture_gait")
+        ex = self._Executor()
+        ex.add_node(node)
+        hands = self._mp.solutions.hands.Hands(
+            static_image_mode=False, max_num_hands=1,
+            min_tracking_confidence=0.4, min_detection_confidence=0.4)
+
+        def on_image(msg):
+            # "rgb8" converts from whatever the camera publishes. MediaPipe
+            # expects RGB; the demo passed it BGR.
+            rgb = self._bridge.imgmsg_to_cv2(msg, "rgb8")
+            res = hands.process(rgb)
+            if not res.multi_hand_landmarks:
+                self._observe(None)
+                return
+            h, w = rgb.shape[:2]
+            pts = np.array([(p.x * w, p.y * h)
+                            for p in res.multi_hand_landmarks[0].landmark])
+            self._observe(classify_gesture(finger_angles(pts)))
+
+        # Queue depth 1: frames that arrive while one is being processed are
+        # dropped, so recognition never lags behind the camera.
+        node.create_subscription(self._Image, self.topic, on_image, 1)
         try:
             while not self._stop.is_set():
-                # get gesture
-                gesture = "fist"
-                if gesture in self.targets:
-                    self.set_index(self.targets[ch], f"  [key {ch.upper()}]")
+                ex.spin_once(timeout_sec=0.1)
         finally:
-            # stop mediapipe if needed
-            pass
+            hands.close()
+            ex.shutdown()
+            node.destroy_node()
+            if owns_ros:
+                rclpy.shutdown()
+
+    def _observe(self, gesture):
+        """One frame's gesture (None = no hand)."""
+        if gesture == self._last:
+            self._run += 1
+        else:
+            self._last, self._run = gesture, 1
+        if gesture is None:
+            self._fired = None
+        elif self._run == self.confirm and gesture != self._fired:
+            self._fired = gesture
+            self._apply(gesture)
+
+    def _apply(self, gesture):
+        base, suffix = split_gait(self.names[self.index])
+        if gesture in GESTURE_BASE:
+            b = GESTURE_BASE[gesture]
+            candidates = [b + suffix, b]
+        elif gesture in GESTURE_SUFFIX:
+            candidates = [base + GESTURE_SUFFIX[gesture]]
+        else:
+            return                        # recognized, but mapped to nothing
+        for name in candidates:
+            if name in self.names:
+                self.set_index(self.names.index(name), f"  [gesture {gesture}]")
+                return
+        print(f"  gesture {gesture}: no gait "
+              + " or ".join(repr(n) for n in dict.fromkeys(candidates))
+              + " in this config")
 
 
-def make_gait_selector(kind, names, args):
-    if kind in ("gesture", "joystick"):
+def make_gait_selectors(kinds, names, args):
+    """-> (GaitState, [GaitSelector, ...]). 'none' adds no selector."""
+    kinds = [k for k in dict.fromkeys(kinds) if k != "none"]
+    if "joystick" in kinds:
         raise NotImplementedError(
-            f"--gait_switch {kind} is not implemented. Subclass GaitSelector, "
-            f"override start() to spawn a listener that calls set_index(), and "
-            f"register it in make_gait_selector -- the inference loop needs no "
-            f"changes.")
-    if kind == "schedule":
+            "--gait_switch joystick is not implemented. Subclass GaitSelector, "
+            "override start() to spawn a listener that calls set_index(), and "
+            "register it in make_gait_selectors -- the inference loop needs no "
+            "changes.")
+    schedule = None
+    if "schedule" in kinds:
         if not args.gait_schedule:
             raise SystemExit("--gait_switch schedule needs --gait_schedule")
-        return ScheduledGait(names, parse_schedule(args.gait_schedule, names),
-                             args.cycle_time)
-    if kind == "keyboard":
-        return KeyboardGait(names, args.base_gait,
-                            resolve_gait(args.gait, names))
-    return GaitSelector(names, resolve_gait(args.gait, names))
+        schedule = parse_schedule(args.gait_schedule, names)
+    # A schedule's cycle-0 gait is the starting gait, as it was before
+    # selectors could be combined; otherwise --gait.
+    state = GaitState(names, schedule[0][1] if schedule
+                      else resolve_gait(args.gait, names))
+    sels = []
+    for kind in kinds:
+        if kind == "schedule":
+            sels.append(ScheduledGait(state, schedule, args.cycle_time))
+        elif kind == "keyboard":
+            sels.append(KeyboardGait(state, args.base_gait))
+        elif kind == "gesture":
+            sels.append(GestureGait(state, args.gesture_topic,
+                                    args.gesture_frames))
+    return state, sels
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -353,7 +487,7 @@ class ServoPublisher:
 # ═══════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def run(model, cfg, pub, sel, viz, args, device):
+def run(model, cfg, pub, state, sels, viz, args, device):
     n_joints = int(cfg_get(cfg, "n_joints", 8))
     lo = float(cfg_get(cfg, "global_min", -124.0))
     hi = float(cfg_get(cfg, "global_max", 124.0))
@@ -371,7 +505,11 @@ def run(model, cfg, pub, sel, viz, args, device):
     print(f"  publishing every {args.publish_every} step(s) "
           f"({1.0/(dt*args.publish_every):.1f} Hz)")
 
-    print(f"  gait switching: {sel.describe()}")
+    print(f"  starting gait: {names[state.index]}")
+    for sel in sels:
+        print(f"  gait switching: {sel.describe()}")
+    if not sels:
+        print("  gait switching: none (gait stays fixed)")
 
     cpg = CPGSource(cfg)
     state = model.init_state(1, device)
@@ -386,9 +524,9 @@ def run(model, cfg, pub, sel, viz, args, device):
     t_start, step, started = time.perf_counter(), 0, False
     try:
         while n_steps < 0 or step < n_steps:
-            # Selection lives entirely in the selector's own thread; the loop
-            # just reads whatever is current.
-            gait_t.fill_(sel.index)
+            # Selection lives entirely in the selectors' own threads; the
+            # loop just reads whatever is current.
+            gait_t.fill_(state.index)
 
             x = torch.as_tensor(cpg.step(), dtype=torch.float32,
                                 device=device).unsqueeze(0)
@@ -403,7 +541,8 @@ def run(model, cfg, pub, sel, viz, args, device):
                     # Started here, not before settling, so schedule cycle 0
                     # means "first published cycle" rather than counting the
                     # settling steps.
-                    sel.start()
+                    for sel in sels:
+                        sel.start()
                     print(f"  settled -- publishing\n")
                 if step % args.publish_every == 0:
                     pub.publish(joints)
@@ -414,7 +553,7 @@ def run(model, cfg, pub, sel, viz, args, device):
                     spk_t = (aux[0][0].cpu().numpy() if aux
                              else np.zeros(0, np.float32))
                     t_v = time.perf_counter()
-                    viz.update(x[0].cpu().numpy(), spk_t, joints, sel.index)
+                    viz.update(x[0].cpu().numpy(), spk_t, joints, state.index)
                     vlat.append((time.perf_counter() - t_v) * 1e3)
 
             step += 1
@@ -426,7 +565,8 @@ def run(model, cfg, pub, sel, viz, args, device):
     except KeyboardInterrupt:
         print("\n  [INTERRUPT] stopping")
     finally:
-        sel.stop()
+        for sel in sels:
+            sel.stop()
 
     if vlat:
         v = np.array(vlat)
@@ -488,19 +628,27 @@ def main():
                          "visualize.py. Default '' = outputs/ itself.")
     ap.add_argument("--ckpt", type=str, default="best_model.pt")
     ap.add_argument("--cfg",  type=str, default="cpg_lif_snn_config.json")
-    ap.add_argument("--gait_switch", type=str, default="none",
+    ap.add_argument("--gait_switch", type=str, nargs="+", default=["none"],
                     choices=["none", "schedule", "keyboard", "gesture",
                              "joystick"],
-                    help="Where gait changes come from. 'none': hold --gait "
-                         "(index 0 by default). 'schedule': follow "
-                         "--gait_schedule. 'keyboard': WASD on stdin, using "
-                         "--base_gait plus a direction suffix. 'gesture' and "
-                         "'joystick' are placeholders and raise "
-                         "NotImplementedError.")
+                    help="Where gait changes come from; several can be given "
+                         "(e.g. 'keyboard gesture'), and the latest change "
+                         "from any of them wins. 'none': hold --gait (index 0 "
+                         "by default). 'schedule': follow --gait_schedule. "
+                         "'keyboard': WASD on stdin, using --base_gait plus a "
+                         "direction suffix. 'gesture': hand gestures from "
+                         "--gesture_topic (see GestureGait). 'joystick' is a "
+                         "placeholder and raises NotImplementedError.")
+    ap.add_argument("--gesture_topic", type=str,
+                    default="/depth_cam/rgb/image_raw",
+                    help="For --gait_switch gesture: ROS Image topic to read.")
+    ap.add_argument("--gesture_frames", type=int, default=5,
+                    help="For --gait_switch gesture: consecutive frames a "
+                         "gesture must be seen on before it acts.")
     ap.add_argument("--gait", type=str, default="0",
                     help="Starting gait, index or name from the config's "
-                         "gait_names. Used by 'none' and as the initial gait "
-                         "for 'keyboard'.")
+                         "gait_names. Ignored when 'schedule' is among the "
+                         "--gait_switch sources (its cycle-0 entry starts).")
     ap.add_argument("--gait_schedule", type=str, default=None,
                     help="For --gait_switch schedule: 'cycle:gait' pairs, e.g. "
                          "'0:tripod,8:ripple,16:0'. Cycles count from the "
@@ -606,7 +754,7 @@ def main():
     print("\n[2/3] Output + gait switching ...")
     pub = ServoPublisher(ids, enabled=not args.no_robot,
                          duration=args.duration)
-    sel = make_gait_selector(args.gait_switch,
+    state, sels = make_gait_selectors(args.gait_switch,
                              list(cfg_get(cfg, "gait_names", [])), args)
 
     viz = None
@@ -642,11 +790,11 @@ def main():
             viz = LiveVisualizer(cfg, this_dir / args.gaits_dir, **opts)
             print("  live visualization INLINE — redraws run inside the "
                   "control loop and will overrun the step budget")
-        sel.on_change = viz.notify_gait_switch
+        state.on_change = viz.notify_gait_switch
 
     print("\n[3/3] Running ...")
     try:
-        run(model, cfg, pub, sel, viz, args, device)
+        run(model, cfg, pub, state, sels, viz, args, device)
     finally:
         pub.close()
         if viz is not None:
